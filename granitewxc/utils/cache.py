@@ -61,7 +61,7 @@ class CachedDataset(IterableDataset):
             try:
                 with FileLock(lock_file_name, timeout=0):
                     if os.path.isfile(file_name):
-                        sample = torch.load(file_name)
+                        sample = torch.load(file_name, weights_only=False)
                     else:
                         sample = None
             except Timeout:

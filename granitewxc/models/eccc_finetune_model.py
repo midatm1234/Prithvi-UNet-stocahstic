@@ -2,7 +2,7 @@ import os
 import numpy as np
 import torch
 from torch import nn
-from typing import Optional
+from typing import Optional, Sequence
 
 from granitewxc.utils import distributed
 from granitewxc.utils.config import ExperimentConfig
@@ -41,10 +41,8 @@ class ClimateECCCFinetuneWrapper(FinetuneWrapper):
             print(f"Loading pre-trained model weights {weights_path}...")
 
         if os.path.isfile(weights_path):
-            if not torch.cuda.is_available():
-                checkpoint = torch.load(weights_path, map_location='cpu')
-            else:
-                checkpoint = torch.load(weights_path, map_location=f'cuda:{torch.cuda.current_device()}')
+            # Always load checkpoints on CPU to avoid exhausting GPU memory when loading.
+            checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
         else:
             raise ValueError(
                 f"Invalid checkpoint path: {weights_path}. Please provide a valid path to a checkpoint."
@@ -116,6 +114,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         """
 
         super().__init__(backbone, None)
+        self.skip_activation_devices: list[torch.device] = []
 
         #----------- From Config
 
@@ -301,11 +300,14 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             
         # Dowsampling step
         copy_activations = {}
-        #copy_activations[0] = self.covariate_embedding(covariates)
         copy_activations[0] = self.embedding_static(y_static)
-        
+        primary_device = x.device
+
         for step_idx in range(self.num_upsample):
-            copy_activations[step_idx+1] = self.downsampling_layers[step_idx](copy_activations[step_idx])
+            current_activation = self._ensure_on_device(copy_activations[step_idx], primary_device)
+            copy_activations[step_idx] = current_activation
+            copy_activations[step_idx + 1] = self.downsampling_layers[step_idx](current_activation)
+            copy_activations[step_idx] = self._maybe_offload_skip(copy_activations[step_idx], step_idx, primary_device)
         
         #------
         
@@ -318,7 +320,8 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             x_shallow_feats = x_embedded + static_embedded
 
         # ----- to be used in  UNET
-        x_shallow_feats = torch.cat([x_shallow_feats, copy_activations[self.num_upsample]], dim=1)
+        deepest_skip = self._ensure_on_device(copy_activations[self.num_upsample], x_shallow_feats.device)
+        x_shallow_feats = torch.cat([x_shallow_feats, deepest_skip], dim=1)
         x_shallow_feats = self.conv_before_backbone(x_shallow_feats)
 
         # calculate shapes to use in backbone
@@ -383,13 +386,50 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         # Upscaling
         out = x_deep_feats
         for step_idx in reversed(range(self.num_upsample)):
-            out = torch.cat((self.upsample_layers[step_idx](out), copy_activations[step_idx]), dim=1)
+            skip = self._ensure_on_device(copy_activations[step_idx], out.device)
+            out = torch.cat((self.upsample_layers[step_idx](out), skip), dim=1)
 
         x = self.output_conv_block(out)
 
         x_out = self.output_scalers_sigma * x + self.output_scalers_mu # [batch, 1, lat_high_res, lon_high_res]
         
         return x_out
+
+    # ----------------------
+    # Utility helpers
+    # ----------------------
+    def set_skip_activation_devices(self, devices: Optional[Sequence[torch.device | str]]):
+        """
+        Configure optional devices where skip activations can be cached.
+        Passing an empty sequence disables offloading.
+        """
+        if not devices:
+            self.skip_activation_devices = []
+            return
+
+        formatted_devices: list[torch.device] = []
+        for dev in devices:
+            formatted_devices.append(torch.device(dev))
+        self.skip_activation_devices = formatted_devices
+
+    def _maybe_offload_skip(
+        self, tensor: torch.Tensor, skip_idx: int, primary_device: torch.device
+    ) -> torch.Tensor:
+        if not self.skip_activation_devices:
+            return tensor
+
+        target_device = self.skip_activation_devices[skip_idx % len(self.skip_activation_devices)]
+        if target_device == primary_device:
+            return tensor
+
+        return tensor.to(target_device, non_blocking=True)
+
+    @staticmethod
+    def _ensure_on_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        if tensor.device == device:
+            return tensor
+
+        return tensor.to(device, non_blocking=True)
 
 
 class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):

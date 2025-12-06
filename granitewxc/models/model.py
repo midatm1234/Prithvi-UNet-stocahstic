@@ -19,14 +19,14 @@ def get_scalers(config: ExperimentConfig):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if config.data.type == 'eccc':
-        input_mu = torch.load(config.model.input_mu, map_location=device)
-        input_sigma = torch.load(config.model.input_sigma, map_location=device)
-        input_static_mu = torch.load(config.model.input_static_mu, map_location=device)
-        input_static_sigma = torch.load(config.model.input_static_sigma, map_location=device)
-        target_mu = torch.load(config.model.target_mu, map_location=device)
-        target_sigma = torch.load(config.model.target_sigma, map_location=device)
-        target_static_mu = torch.load(config.model.target_static_mu, map_location=device)
-        target_static_sigma = torch.load(config.model.target_static_sigma, map_location=device)
+        input_mu = torch.load(config.model.input_mu, map_location=device, weights_only=False)
+        input_sigma = torch.load(config.model.input_sigma, map_location=device, weights_only=False)
+        input_static_mu = torch.load(config.model.input_static_mu, map_location=device, weights_only=False)
+        input_static_sigma = torch.load(config.model.input_static_sigma, map_location=device, weights_only=False)
+        target_mu = torch.load(config.model.target_mu, map_location=device, weights_only=False)
+        target_sigma = torch.load(config.model.target_sigma, map_location=device, weights_only=False)
+        target_static_mu = torch.load(config.model.target_static_mu, map_location=device, weights_only=False)
+        target_static_sigma = torch.load(config.model.target_static_sigma, map_location=device, weights_only=False)
         
     else:
         raise ValueError(f'{config.data.type} is not a valid config.data.type')

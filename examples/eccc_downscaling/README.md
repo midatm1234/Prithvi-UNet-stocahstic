@@ -7,6 +7,8 @@ This repository includes two example notebooks located in the `notebooks` folder
 
 These notebooks demonstrate how to use the **Prithvi Weather Foundation Model** for a downscaling task on Canada’s operational Numerical Weather Prediction (NWP) systems. Specifically, the goal is to downscale forecasts from the **Global Deterministic Prediction System (GDPS)**—which provides 10-day forecasts at ~15 km resolution—to the **High-Resolution Deterministic Prediction System (HRDPS)**, which produces 48-hour forecasts at ~2.5 km resolution.
 
+> **GPU requirements:** By default the notebooks load `config_UNET_small.yaml`, a ~3 GB checkpoint that fits on a single 24 GB GPU. The full `config_UNET.yaml` checkpoint is ~17 GB and was trained with 4×24 GB GPUs; switching to it requires comparable resources.
+
 For more information about the dataset, see our preliminary work using GANs: [arxiv.org/pdf/2412.06958](https://arxiv.org/pdf/2412.06958)
 
 The notebooks walk through the full pipeline using a single GDPS-HRDPS data pair, covering preprocessing, training, and inference. We also provide links to the full dataset and configuration files so you can run your own experiments.
@@ -181,5 +183,4 @@ python3 compute_scalars.py --config_path <CONFIG> --save_dir <DIR>
 ### Training
 
 To train with your own dataset, refer to `eccc_downscaling_finetune.ipynb` for an example setup. You will likely need to adapt the code into your own training script to train beyond the example.
-
 

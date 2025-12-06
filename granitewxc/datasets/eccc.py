@@ -15,6 +15,7 @@ class EcccHrdpsGdpsDataset(Dataset):
     
     logger = logging.getLogger(__name__)
     logging.basicConfig(level=logging.DEBUG)
+    GIT_LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
     
     def __init__(
         self,
@@ -104,6 +105,77 @@ class EcccHrdpsGdpsDataset(Dataset):
     def _log_debug(self, message):
         """Accumulate debug messages to the buffer."""
         self.log_buffer.append(message)
+
+    def __open_dataset(self, path: str, preferred_engine: Optional[str] = None, **kwargs) -> xr.Dataset:
+        """Open a dataset trying multiple xarray engines when needed."""
+
+        normalized_path = self.__ensure_dataset_file_ready(path)
+
+        engines_to_try = []
+        seen = set()
+        for engine in (preferred_engine, None, "h5netcdf", "netcdf4", "scipy"):
+            if engine in seen:
+                continue
+            engines_to_try.append(engine)
+            seen.add(engine)
+
+        errors = []
+        for engine in engines_to_try:
+            open_kwargs = dict(kwargs)
+            try:
+                if engine is None:
+                    return xr.open_dataset(normalized_path, **open_kwargs)
+                return xr.open_dataset(normalized_path, engine=engine, **open_kwargs)
+            except ValueError as err:
+                errors.append(f"{engine or 'auto'}: {err}")
+                continue
+
+        raise ValueError(
+            f"Unable to open dataset {normalized_path} with xarray. "
+            f"Attempted engines: {', '.join('auto' if e is None else e for e in engines_to_try)}. "
+            f"Errors -> {' | '.join(errors)}"
+        )
+
+    def __ensure_dataset_file_ready(self, path: str) -> str:
+        """Validate dataset path, detect Git LFS placeholders, and return absolute path."""
+
+        abs_path = os.path.abspath(path)
+
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"Dataset file not found: {abs_path}")
+
+        try:
+            with open(abs_path, "rb") as fh:
+                prefix = fh.read(len(self.GIT_LFS_POINTER_PREFIX))
+        except OSError as err:
+            raise OSError(f"Unable to read dataset file {abs_path}: {err}") from err
+
+        if prefix.startswith(self.GIT_LFS_POINTER_PREFIX):
+            pointer_details = self.__read_git_lfs_pointer(abs_path)
+            raise RuntimeError(
+                f"{abs_path} is a Git LFS placeholder without the actual NetCDF data. "
+                "Run `git lfs install` once and `git lfs pull` (or download the sample "
+                "dataset) so the large files referenced in the JSON indices are available. "
+                f"Pointer details: {pointer_details}"
+            )
+
+        return abs_path
+
+    def __read_git_lfs_pointer(self, path: str) -> str:
+        """Return a concise description of a Git LFS pointer file."""
+        try:
+            with open(path, "r", encoding="utf-8") as pointer_file:
+                pointer_text = pointer_file.read().strip()
+        except UnicodeDecodeError:
+            return "Git LFS pointer detected"
+
+        info_lines = []
+        for line in pointer_text.splitlines():
+            line = line.strip()
+            if line.startswith(("oid", "size")):
+                info_lines.append(line)
+
+        return ", ".join(info_lines) if info_lines else pointer_text
 
     #@profile
     def __compute_temporal_features(self, idx:int, M):
@@ -233,14 +305,19 @@ class EcccHrdpsGdpsDataset(Dataset):
         index = 0 if data_type == 'gdps' else 1
 
         # open gdps or hrdps file
-        if self.type_loading == 'lazy':
-            xr_ds = xr.open_dataset(self.data_index_repo[str(id_key)][index], engine='h5netcdf')
-            xr_ds = xr_ds.isel(time=0)
-            static_ds_xr = xr.open_dataset(self.static_data_repo[static_key], engine='h5netcdf')
-            
-        else:
-            xr_ds = xr.open_dataset(self.data_index_repo[str(id_key)][index], decode_timedelta=False).isel(time=0)
-            static_ds_xr = xr.open_dataset(self.static_data_repo[static_key])
+        preferred_engine = 'h5netcdf' if self.type_loading == 'lazy' else None
+        open_kwargs = {} if self.type_loading == 'lazy' else dict(decode_timedelta=False)
+
+        xr_ds = self.__open_dataset(
+            self.data_index_repo[str(id_key)][index],
+            preferred_engine=preferred_engine,
+            **open_kwargs,
+        ).isel(time=0)
+
+        static_ds_xr = self.__open_dataset(
+            self.static_data_repo[static_key],
+            preferred_engine=preferred_engine,
+        )
         
         # delete unnecesary variables
         if 'rotated_pole' in xr_ds.data_vars:
