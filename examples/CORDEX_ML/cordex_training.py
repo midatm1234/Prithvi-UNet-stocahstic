@@ -1,0 +1,435 @@
+"""Utilities to train the CORDEX finetuning model in single- or multi-GPU mode."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Iterable, Sequence, Tuple
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.cuda.amp import GradScaler
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    ShardingStrategy,
+)
+from functools import partial
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+
+from cordex_dataset import CordexDownscaleDataset
+from granitewxc.models.loss import rmse_loss
+from granitewxc.models.model import get_finetune_model_UNET
+from granitewxc.utils.config import ExperimentConfig
+from granitewxc.utils.distributed import init_ddp
+from granitewxc.utils.trainer import train_model
+from torch.multiprocessing.spawn import ProcessRaisedException, ProcessExitedException
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _should_use_gpu(config: ExperimentConfig) -> bool:
+    target = getattr(config, "device_target", None)
+    if target:
+        normalized = str(target).lower()
+        if normalized == "cpu":
+            return False
+        if normalized in {"cuda", "gpu"}:
+            if not torch.cuda.is_available():
+                raise RuntimeError("device_target set to 'cuda' but no CUDA device is available.")
+            return True
+    return torch.cuda.is_available()
+
+
+def _resolve_paths(paths: Iterable[str]) -> list[str]:
+    resolved: list[str] = []
+    for path in paths:
+        path_obj = Path(path)
+        if path_obj.is_absolute():
+            resolved.append(str(path_obj))
+        else:
+            resolved.append(str((REPO_ROOT / path_obj).resolve()))
+    return resolved
+
+
+def _resolve_path(path: str) -> str:
+    return _resolve_paths([path])[0]
+
+
+def _level_suffix(level) -> str:
+    value = str(level)
+    return value[:-2] if value.endswith(".0") else value
+
+
+def build_predictor_names(config: ExperimentConfig) -> list[str]:
+    return [
+        f"{var}_{_level_suffix(level)}"
+        for var in config.data.input_vars
+        for level in config.data.input_levels
+    ]
+
+
+def _build_base_dataset(
+    config: ExperimentConfig,
+    predictor_paths: Sequence[str],
+    target_paths: Sequence[str],
+    *,
+    crop_size: Tuple[int, int],
+    random_crop: bool,
+):
+    predictor_vars = build_predictor_names(config)
+    target_variables = list(config.data.output_vars)
+    return CordexDownscaleDataset(
+        predictor_files=predictor_paths,
+        target_files=target_paths,
+        orography_file=_resolve_path(config.data.static_path),
+        predictor_variables=predictor_vars,
+        target_variables=target_variables,
+        crop_size=crop_size,
+        random_crop=random_crop,
+    )
+
+
+def _fsdp_enabled(config: ExperimentConfig) -> bool:
+    strategy = getattr(config, "distributed_strategy", None)
+    if isinstance(strategy, str) and strategy.lower() == "fsdp":
+        return True
+    return bool(getattr(config, "use_fsdp", False))
+
+
+def _build_fsdp_precision(config: ExperimentConfig) -> MixedPrecision | None:
+    precision = getattr(config, "fsdp_precision", None)
+    if not precision:
+        precision = "bf16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else None
+
+    if not precision:
+        return None
+
+    precision = precision.lower()
+    if precision in {"bf16", "bfloat16"} and torch.cuda.is_bf16_supported():
+        dtype = torch.bfloat16
+    elif precision in {"fp16", "float16", "half"}:
+        dtype = torch.float16
+    else:
+        return None
+
+    return MixedPrecision(
+        param_dtype=dtype,
+        reduce_dtype=dtype,
+        buffer_dtype=dtype,
+    )
+
+
+def _wrap_model_with_fsdp(
+    model: torch.nn.Module, local_rank: int, config: ExperimentConfig
+) -> torch.nn.Module:
+    min_params = getattr(config, "fsdp_min_num_params", None)
+    auto_wrap_policy = None
+    if min_params:
+        auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=int(min_params))
+
+    sharding = getattr(config, "fsdp_sharding_strategy", "full_shard")
+    sharding = sharding.lower() if isinstance(sharding, str) else "full_shard"
+    if sharding == "shard_grad_op":
+        strategy = ShardingStrategy.SHARD_GRAD_OP
+    else:
+        strategy = ShardingStrategy.FULL_SHARD
+
+    mixed_precision = _build_fsdp_precision(config)
+
+    return FSDP(
+        model,
+        device_id=local_rank,
+        sharding_strategy=strategy,
+        mixed_precision=mixed_precision,
+        auto_wrap_policy=auto_wrap_policy,
+        limit_all_gathers=True,
+        use_orig_params=True,
+    )
+
+
+class CordexWrappedDataset(torch.utils.data.Dataset):
+    def __init__(self, base_dataset: CordexDownscaleDataset):
+        self.base = base_dataset
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int):
+        sample = self.base[idx]
+        x = sample["x"]
+        dynamic = x[:-1]
+        static = x[-1:].clone()
+        return {"x": dynamic, "y": sample["y"], "static_x": static, "static_y": static}
+
+
+def build_dataloader(
+    config: ExperimentConfig,
+    predictor_paths: Sequence[str],
+    target_paths: Sequence[str],
+    *,
+    shuffle: bool,
+    use_gpu: bool,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+    crop_size: Tuple[int, int],
+    random_crop: bool,
+) -> DataLoader:
+    predictor_paths = _resolve_paths(predictor_paths)
+    target_paths = _resolve_paths(target_paths)
+    base_dataset = _build_base_dataset(
+        config,
+        predictor_paths,
+        target_paths,
+        crop_size=crop_size,
+        random_crop=random_crop,
+    )
+    dataset = CordexWrappedDataset(base_dataset)
+
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
+        shuffle = False
+
+    return DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=shuffle,
+        sampler=sampler,
+        num_workers=config.dl_num_workers,
+        pin_memory=use_gpu,
+    )
+
+
+def get_dataloaders(
+    config: ExperimentConfig, use_gpu: bool, rank: int = 0, world_size: int = 1
+) -> Tuple[DataLoader, DataLoader]:
+    distributed = world_size > 1
+    crop_size = (
+        int(config.data.target_size_lat),
+        int(config.data.target_size_lon),
+    )
+    train_loader = build_dataloader(
+        config,
+        config.data.training_predictor_paths,
+        config.data.training_target_paths,
+        shuffle=True,
+        use_gpu=use_gpu,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+        crop_size=crop_size,
+        random_crop=True,
+    )
+    val_loader = build_dataloader(
+        config,
+        config.data.validation_predictor_paths,
+        config.data.validation_target_paths,
+        shuffle=False,
+        use_gpu=use_gpu,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+        crop_size=crop_size,
+        random_crop=False,
+    )
+    return train_loader, val_loader
+
+
+def load_pretrained_weights(model: torch.nn.Module, weights_path: str) -> Tuple[int, int]:
+    checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
+
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        weights = checkpoint["model"]
+    else:
+        weights = checkpoint
+
+    if not isinstance(weights, dict):
+        weights = weights.state_dict() if hasattr(weights, "state_dict") else dict(weights)
+
+    model_state = model.state_dict()
+    weights_have_module_prefix = all(key.startswith("module.") for key in weights.keys())
+    model_expects_module_prefix = all(key.startswith("module.") for key in model_state.keys())
+
+    if model_expects_module_prefix and not weights_have_module_prefix:
+        weights = weights.__class__((f"module.{key}", value) for key, value in weights.items())
+    elif weights_have_module_prefix and not model_expects_module_prefix:
+        prefix_len = len("module.")
+        weights = weights.__class__((key[prefix_len:], value) for key, value in weights.items())
+
+    compatible = {}
+    skipped = 0
+    for key, value in weights.items():
+        target = model_state.get(key)
+        if target is None or target.shape != value.shape:
+            skipped += 1
+            continue
+        compatible[key] = value
+
+    model_state.update(compatible)
+    model.load_state_dict(model_state, strict=False)
+    return len(compatible), skipped
+
+
+def create_finetune_model(config: ExperimentConfig, verbose: bool = True) -> torch.nn.Module:
+    model = get_finetune_model_UNET(config)
+    loaded, skipped = load_pretrained_weights(model, _resolve_path(config.path_model_weights))
+    if verbose:
+        print(
+            f"Loaded {loaded} tensors from {config.path_model_weights}. "
+            f"Skipped {skipped} mismatched entries."
+        )
+    return model
+
+
+def build_optimizer_scheduler(
+    config: ExperimentConfig, model: torch.nn.Module, train_loader_length: int, use_gpu: bool
+):
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+    scaler = GradScaler(enabled=use_gpu and torch.cuda.is_available())
+    total_steps = config.num_epochs * max(1, min(train_loader_length, config.limit_steps_train))
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps,
+        eta_min=config.min_lr,
+    )
+    return optimizer, scaler, scheduler
+
+
+def _distributed_worker(rank: int, world_size: int, config: ExperimentConfig, save_every: int, return_dict):
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    local_rank, global_rank = init_ddp(use_gpu=True)
+    device = torch.device(f"cuda:{local_rank}")
+
+    train_loader, val_loader = get_dataloaders(
+        config, use_gpu=True, rank=global_rank, world_size=world_size
+    )
+
+    model = create_finetune_model(config, verbose=(global_rank == 0))
+    model = model.to(device)
+    _configure_skip_offload(model, config)
+    if _fsdp_enabled(config):
+        model = _wrap_model_with_fsdp(model, local_rank, config)
+    else:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
+
+    optimizer, scaler, scheduler = build_optimizer_scheduler(
+        config, model, len(train_loader), use_gpu=True
+    )
+
+    train_losses, val_losses = train_model(
+        config,
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        scaler,
+        local_rank,
+        True,
+        save_every,
+        rmse_loss,
+    )
+
+    if global_rank == 0:
+        return_dict["train_losses"] = train_losses
+        return_dict["val_losses"] = val_losses
+
+    dist.destroy_process_group()
+
+
+def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_every: int = 5):
+    use_gpu = _should_use_gpu(config)
+
+    if num_gpus is None:
+        num_gpus = torch.cuda.device_count() if use_gpu else 0
+    else:
+        num_gpus = min(num_gpus, torch.cuda.device_count() if use_gpu else 0)
+    num_gpus = max(1, num_gpus)
+
+    if (not use_gpu) or num_gpus == 1:
+        device = torch.device("cuda", 0) if use_gpu else torch.device("cpu")
+        train_loader, val_loader = get_dataloaders(config, use_gpu=use_gpu, rank=0, world_size=1)
+        model = create_finetune_model(config).to(device)
+        _configure_skip_offload(model, config)
+        optimizer, scaler, scheduler = build_optimizer_scheduler(
+            config, model, len(train_loader), use_gpu=use_gpu
+        )
+        train_losses, val_losses = train_model(
+            config,
+            model,
+            train_loader,
+            val_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            local_rank=0,
+            use_gpu=use_gpu,
+            save_every=save_every,
+            loss_func=rmse_loss,
+        )
+        return train_losses, val_losses
+
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "2468")
+
+    mp.set_start_method("spawn", force=True)
+    manager = mp.Manager()
+    return_dict = manager.dict()
+
+    torch.cuda.empty_cache()
+
+    try:
+        mp.spawn(
+            _distributed_worker,
+            args=(num_gpus, config, save_every, return_dict),
+            nprocs=num_gpus,
+            join=True,
+        )
+    except ProcessRaisedException as exc:
+        message = str(exc).lower()
+        if "out of memory" in message and num_gpus > 1:
+            if not _fsdp_enabled(config):
+                print("Encountered CUDA OOM with DDP; enabling FSDP retry.")
+                setattr(config, "distributed_strategy", "fsdp")
+                if not getattr(config, "fsdp_precision", None):
+                    setattr(
+                        config,
+                        "fsdp_precision",
+                        "bf16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "fp16",
+                    )
+                return run_training(config, num_gpus=num_gpus, save_every=save_every)
+
+            reduced = max(1, num_gpus // 2)
+            if reduced == num_gpus:
+                reduced = num_gpus - 1
+            print(
+                f"Encountered CUDA OOM during multi-GPU setup; retrying with {reduced} GPU(s)."
+            )
+            return run_training(config, num_gpus=reduced, save_every=save_every)
+        raise
+    except ProcessExitedException as exc:
+        print(f"Distributed training failed with signal/exit ({exc}); retrying on a single GPU.")
+        return run_training(config, num_gpus=1, save_every=save_every)
+
+    return return_dict.get("train_losses"), return_dict.get("val_losses")
+def _configure_skip_offload(model: torch.nn.Module, config: ExperimentConfig):
+    if not getattr(config, "skip_activation_offload", False):
+        return
+    if hasattr(model, "set_skip_activation_devices"):
+        model.set_skip_activation_devices([torch.device("cpu")])

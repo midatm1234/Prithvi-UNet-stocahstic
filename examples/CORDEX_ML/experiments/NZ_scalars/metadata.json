@@ -1,0 +1,33 @@
+{
+  "created_at": "2025-12-11T06:21:25.058544Z",
+  "args": {
+    "predictor_files": [
+      "/mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980.nc"
+    ],
+    "target_files": [
+      "/mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc"
+    ],
+    "orography_file": "/mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc",
+    "predictor_vars": null,
+    "target_vars": [
+      "pr",
+      "tasmax"
+    ],
+    "orography_var": "orog",
+    "time_dim": null,
+    "regrid_method": "bilinear",
+    "dtype": "float32",
+    "progress_interval": 50
+  },
+  "num_samples": 7300,
+  "input_channels": 16,
+  "target_channels": 2,
+  "input_pixel_count": 119603200,
+  "target_pixel_count": 119603200,
+  "files": {
+    "inputs_mean": "./experiments/NZ_scalars/inputs_mean.npy",
+    "inputs_std": "./experiments/NZ_scalars/inputs_std.npy",
+    "targets_mean": "./experiments/NZ_scalars/targets_mean.npy",
+    "targets_std": "./experiments/NZ_scalars/targets_std.npy"
+  }
+}

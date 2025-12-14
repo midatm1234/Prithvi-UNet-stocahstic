@@ -1,0 +1,9 @@
+# Large or generated artifacts (keep notebooks/scripts light)
+__pycache__/
+runs/
+examples/
+notebooks/.ipynb_checkpoints/
+experiments/**/weights/
+*.pt
+*.ckpt
+*.pkl
