@@ -1,0 +1,224 @@
+"""Shared parameter helpers for the NZ CORDEX fine-tune notebooks."""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence, Tuple
+
+
+def _coerce_path(value: Any) -> Path:
+    if isinstance(value, Path):
+        return value.expanduser()
+    return Path(str(value)).expanduser()
+
+
+def _coerce_sequence(values: Sequence[Any] | None) -> list[Path]:
+    if values is None:
+        return []
+    return [_coerce_path(item) for item in values]
+
+
+@dataclass
+class UserParams:
+    """User-editable parameters shared across NZ CORDEX notebooks."""
+
+    repo_root: Path
+    project_dir: Path
+    runs_root: Path
+    config_path: Path
+    run_name: str | None = None
+    inference_run_name: str | None = None
+    inference_output_root: Path | None = None
+    inference_predictor_root: Path | None = None
+    inference_target_root: Path | None = None
+    checkpoint_path: Path | None = None
+    preferred_checkpoint: str = "best"
+    train_predictor_paths: Sequence[Path] | None = None
+    train_target_paths: Sequence[Path] | None = None
+    val_predictor_paths: Sequence[Path] | None = None
+    val_target_paths: Sequence[Path] | None = None
+    test_predictor_paths: Sequence[Path] | None = None
+    test_target_paths: Sequence[Path] | None = None
+    device_target: str = "cuda"
+    batch_size: int | None = None
+    num_workers: int | None = None
+    env_run_name_var: str = "NZ_RUN_NAME"
+    env_inference_run_var: str = "NZ_FINETUNE_RUN"
+    notes: str | None = None
+
+    def summary(self) -> str:
+        """Return a human-readable summary of the resolved parameters."""
+
+        def _count(values: Sequence[Any] | None) -> int:
+            return len(values or [])
+
+        lines = [
+            f"Repo root: {self.repo_root}",
+            f"Project dir: {self.project_dir}",
+            f"Runs root: {self.runs_root}",
+            f"Config: {self.config_path}",
+            f"Run name override: {self.run_name or '<auto>'}",
+            f"Inference run override: {self.inference_run_name or '<latest>'}",
+            f"Preferred checkpoint: {self.preferred_checkpoint}",
+            f"Device target: {self.device_target}",
+            f"Batch size override: {self.batch_size if self.batch_size is not None else '<config>'}",
+            f"Dataloader workers override: {self.num_workers if self.num_workers is not None else '<config>'}",
+            f"Train predictors: {_count(self.train_predictor_paths)} file(s)",
+            f"Validation predictors: {_count(self.val_predictor_paths)} file(s)",
+            f"Test predictors: {_count(self.test_predictor_paths)} file(s)",
+            f"Checkpoint path override: {self.checkpoint_path or '<auto>'}",
+        ]
+        if self.inference_output_root:
+            lines.append(f"Inference output root: {self.inference_output_root}")
+        if self.inference_predictor_root:
+            lines.append(f"Inference predictor root: {self.inference_predictor_root}")
+        if self.notes:
+            lines.append(f"Notes: {self.notes}")
+        return "\n".join(lines)
+
+
+def validate_paths(params: UserParams, *, require_inference: bool = False) -> None:
+    """Verify that critical filesystem locations exist."""
+
+    repo_root = _coerce_path(params.repo_root)
+    project_dir = _coerce_path(params.project_dir)
+    runs_root = _coerce_path(params.runs_root)
+    config_path = _coerce_path(params.config_path)
+
+    for path, desc, must_exist in (
+        (repo_root, "repo_root", True),
+        (project_dir, "project_dir", True),
+        (config_path, "config_path", True),
+    ):
+        if must_exist and not path.exists():
+            raise FileNotFoundError(f"{desc} does not exist: {path}")
+
+    runs_root.mkdir(parents=True, exist_ok=True)
+
+    def _check_sequence(name: str, values: Sequence[Path] | None) -> None:
+        for path in _coerce_sequence(values):
+            if not path.exists():
+                raise FileNotFoundError(f"{name} entry does not exist: {path}")
+
+    _check_sequence("train_predictor_paths", params.train_predictor_paths)
+    _check_sequence("train_target_paths", params.train_target_paths)
+    _check_sequence("val_predictor_paths", params.val_predictor_paths)
+    _check_sequence("val_target_paths", params.val_target_paths)
+    _check_sequence("test_predictor_paths", params.test_predictor_paths)
+    _check_sequence("test_target_paths", params.test_target_paths)
+
+    if require_inference:
+        if params.inference_predictor_root and not _coerce_path(
+            params.inference_predictor_root
+        ).exists():
+            raise FileNotFoundError(
+                f"inference_predictor_root does not exist: {params.inference_predictor_root}"
+            )
+
+
+def resolve_run_dir(
+    params: UserParams, config: Any, *, timestamp: datetime | None = None
+) -> Tuple[str, Path]:
+    """Determine a run name/root for a new fine-tune run."""
+
+    runs_root = _coerce_path(params.runs_root)
+    env_override = os.environ.get(params.env_run_name_var or "")
+    run_name = env_override or params.run_name
+    if not run_name:
+        job_id = getattr(config, "job_id", "nz_finetune")
+        stamp = (timestamp or datetime.utcnow()).strftime("%Y%m%d-%H%M%S")
+        run_name = f"{job_id}_{stamp}"
+    run_dir = runs_root / run_name
+    return run_name, run_dir
+
+
+def resolve_existing_run_dir(params: UserParams) -> Tuple[str, Path]:
+    """Locate an existing fine-tune run directory for inference."""
+
+    runs_root = _coerce_path(params.runs_root)
+    env_override = os.environ.get(params.env_inference_run_var or "")
+    run_name = env_override or params.inference_run_name
+    if run_name:
+        run_dir = runs_root / run_name
+        manifest = run_dir / "run_manifest.json"
+        if not manifest.exists():
+            raise FileNotFoundError(
+                f"Requested run '{run_name}' not found or missing manifest under {runs_root}"
+            )
+        return run_name, run_dir
+
+    candidates: list[Path] = []
+    for path in runs_root.iterdir():
+        if not path.is_dir():
+            continue
+        if not (path / "run_manifest.json").exists():
+            continue
+        candidates.append(path)
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"No fine-tune runs with manifests found under {runs_root}")
+    run_dir = candidates[0]
+    return run_dir.name, run_dir
+
+
+def resolve_checkpoint(params: UserParams, run_dir: Path) -> Path:
+    """Resolve which checkpoint file to load for inference."""
+
+    if params.checkpoint_path:
+        checkpoint = _coerce_path(params.checkpoint_path)
+        if not checkpoint.exists():
+            raise FileNotFoundError(f"Explicit checkpoint not found: {checkpoint}")
+        return checkpoint
+
+    checkpoint_dir = _coerce_path(run_dir) / "checkpoints"
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+    preference = (params.preferred_checkpoint or "best").lower()
+    ordered_patterns: list[str] = []
+    if preference == "best":
+        ordered_patterns = ["*best*.ckpt", "*last*.ckpt"]
+    elif preference == "last":
+        ordered_patterns = ["*last*.ckpt", "*best*.ckpt"]
+    else:
+        ordered_patterns = ["*best*.ckpt", "*last*.ckpt"]
+
+    for pattern in ordered_patterns:
+        matches = sorted(checkpoint_dir.glob(pattern))
+        if matches:
+            return matches[0]
+
+    remaining = sorted(
+        checkpoint_dir.glob("*.ckpt"), key=lambda path: path.stat().st_mtime, reverse=True
+    )
+    if remaining:
+        return remaining[0]
+    raise FileNotFoundError(f"No checkpoints found under {checkpoint_dir}")
+
+
+def export_params(
+    params: UserParams, destination: Path, *, extra: Mapping[str, Any] | None = None
+) -> Path:
+    """Write the resolved parameter set to JSON for traceability."""
+
+    destination = _coerce_path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    def _serialize(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return [_serialize(item) for item in value]
+        return value
+
+    payload = {key: _serialize(value) for key, value in asdict(params).items()}
+    if extra:
+        payload.update(extra)
+
+    with open(destination, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return destination
