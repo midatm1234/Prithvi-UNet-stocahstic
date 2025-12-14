@@ -64,3 +64,16 @@ jupyter lab examples/CORDEX_ML/notebooks/NZ_downscaling_inference.ipynb
   - `tasmax`: daily max 2 m air temperature, NZ high-resolution grid (°C).
 
 Both notebooks expect predictors/targets to follow the CORDEX-ML benchmark naming and will emit NetCDFs with these same `pr` and `tasmax` variables.
+
+## Model Loading
+- The inference notebook (`NZ_downscaling_inference.ipynb`) now enumerates the fine-tune runs under `examples/CORDEX_ML/runs/nz_finetune`, picks the latest (or the one set via `NZ_FINETUNE_RUN`), and stores the resolved checkpoint path in `CHECKPOINT_PATH`.
+- When `CHECKPOINT_PATH` is loaded the notebook prints the location, trainable parameter count, and a quick checksum (mean/std of the first tensor) so you can confirm the fine-tuned weights—not the generic base encoder—are active before running inference.
+
+## Outputs
+- Both notebooks assert that `config.data.output_vars` provides `['pr', 'tasmax']` and that the dataloaders emit two-channel targets before training/inference begins.
+- Generated NetCDFs therefore always include `pr` and `tasmax` variables, matching the CORDEX-ML benchmark naming and order.
+
+## Time Handling
+- The inference writer inspects the predictor NetCDF(s) used for inference to build the `time` coordinate and now raises if the predicted sequence length differs from the predictor timestamps.
+- The resulting NetCDF inherits the predictor time metadata verbatim, so e.g. `ACCESS-CM2_1981-2000_regridded.nc` yields a 1981–2000 `time` axis rather than reusing the training (1961–1980) window.
+- The notebook logs the detected start/end times to make it obvious which forcing period produced a set of predictions.
