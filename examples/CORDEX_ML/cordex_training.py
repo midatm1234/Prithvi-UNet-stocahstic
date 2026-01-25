@@ -85,14 +85,19 @@ def _build_base_dataset(
 ):
     predictor_vars = build_predictor_names(config)
     target_variables = list(config.data.output_vars)
+    use_static = bool(getattr(config.data, "use_static", getattr(config, "finetune_w_static", True)))
+    orography_path = None
+    if use_static:
+        orography_path = _resolve_path(config.data.static_path)
     return CordexDownscaleDataset(
         predictor_files=predictor_paths,
         target_files=target_paths,
-        orography_file=_resolve_path(config.data.static_path),
+        orography_file=orography_path,
         predictor_variables=predictor_vars,
         target_variables=target_variables,
         crop_size=crop_size,
         random_crop=random_crop,
+        use_static=use_static,
     )
 
 
@@ -164,6 +169,8 @@ class CordexWrappedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int):
         sample = self.base[idx]
         x = sample["x"]
+        if not getattr(self.base, "use_static", True):
+            return {"x": x, "y": sample["y"]}
         dynamic = x[:-1]
         static = x[-1:].clone()
         return {"x": dynamic, "y": sample["y"], "static_x": static, "static_y": static}
@@ -279,6 +286,8 @@ def load_pretrained_weights(model: torch.nn.Module, weights_path: str) -> Tuple[
 
 
 def create_finetune_model(config: ExperimentConfig, verbose: bool = True) -> torch.nn.Module:
+    if not hasattr(config.data, "input_static_surface_vars"):
+        config.data.input_static_surface_vars = []
     model = get_finetune_model_UNET(config)
     loaded, skipped = load_pretrained_weights(model, _resolve_path(config.path_model_weights))
     if verbose:

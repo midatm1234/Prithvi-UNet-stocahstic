@@ -43,6 +43,7 @@ class UserParams:
     val_target_paths: Sequence[Path] | None = None
     test_predictor_paths: Sequence[Path] | None = None
     test_target_paths: Sequence[Path] | None = None
+    use_static: bool | None = None
     device_target: str = "cuda"
     batch_size: int | None = None
     num_workers: int | None = None
@@ -64,6 +65,7 @@ class UserParams:
             f"Run name override: {self.run_name or '<auto>'}",
             f"Inference run override: {self.inference_run_name or '<latest>'}",
             f"Preferred checkpoint: {self.preferred_checkpoint}",
+            f"Use static inputs: {self.use_static if self.use_static is not None else '<config>'}",
             f"Device target: {self.device_target}",
             f"Batch size override: {self.batch_size if self.batch_size is not None else '<config>'}",
             f"Dataloader workers override: {self.num_workers if self.num_workers is not None else '<config>'}",

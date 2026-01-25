@@ -5,7 +5,7 @@ from granitewxc.utils.config import ExperimentConfig
 from granitewxc.utils.distributed import is_main_process
 from granitewxc.decoders.downscaling import ConvEncoderDecoder
 from granitewxc.models.finetune_model import PatchEmbed
-from granitewxc.models.eccc_finetune_model import ClimateDownscaleFinetuneUNETModel, ClimateDownscaleFinetuneModel
+from granitewxc.models.cordex_finetune_model import ClimateDownscaleFinetuneUNETModel, ClimateDownscaleFinetuneModel
 from PrithviWxC.model import PrithviWxCEncoderDecoder
 
 
@@ -27,7 +27,48 @@ def get_scalers(config: ExperimentConfig):
         target_sigma = torch.load(config.model.target_sigma, map_location=device, weights_only=False)
         target_static_mu = torch.load(config.model.target_static_mu, map_location=device, weights_only=False)
         target_static_sigma = torch.load(config.model.target_static_sigma, map_location=device, weights_only=False)
-        
+    elif config.data.type == 'cordex':
+        def load_array(path: str) -> torch.Tensor:
+            array = np.load(path)
+            tensor = torch.from_numpy(array).to(device)
+            if tensor.dtype != torch.float32:
+                tensor = tensor.float()
+            return tensor
+
+        input_mu_full = load_array(config.model.input_mu)
+        input_sigma_full = load_array(config.model.input_sigma)
+        target_mu = load_array(config.model.target_mu)
+        target_sigma = load_array(config.model.target_sigma)
+
+        static_channels = int(getattr(config.model, "num_static_channels", 1))
+        # number of dynamic predictor channels (time * vars * levels)
+        n_dynamic = (
+            len(config.data.input_vars)
+            * len(config.data.input_levels)
+            * max(1, int(getattr(config.data, "n_input_timestamps", 1)))
+        )
+
+        if static_channels <= 0:
+            input_mu = input_mu_full[:n_dynamic]
+            input_sigma = input_sigma_full[:n_dynamic]
+            input_static_mu = torch.zeros(0, device=device)
+            input_static_sigma = torch.ones(0, device=device)
+            target_static_mu = torch.zeros(0, device=device)
+            target_static_sigma = torch.ones(0, device=device)
+        elif input_mu_full.shape[0] == n_dynamic + static_channels:
+            input_mu = input_mu_full[:n_dynamic]
+            input_sigma = input_sigma_full[:n_dynamic]
+            input_static_mu = input_mu_full[-static_channels:]
+            input_static_sigma = input_sigma_full[-static_channels:]
+            target_static_mu = input_static_mu.clone()
+            target_static_sigma = input_static_sigma.clone()
+        else:
+            input_mu = input_mu_full
+            input_sigma = input_sigma_full
+            input_static_mu = torch.zeros(static_channels, device=device)
+            input_static_sigma = torch.ones(static_channels, device=device)
+            target_static_mu = torch.zeros(static_channels, device=device)
+            target_static_sigma = torch.ones(static_channels, device=device)
     else:
         raise ValueError(f'{config.data.type} is not a valid config.data.type')
 
@@ -61,15 +102,27 @@ def get_eccc_embedding_module(config: ExperimentConfig):
         embed_dim=config.model.downscaling_embed_dim,
     )
 
-    n_static_parameters = config.model.num_static_channels + len(config.data.input_static_surface_vars)
-    if config.model.residual == 'climate':
-        n_static_parameters += n_parameters
+    use_static = bool(getattr(config.data, "use_static", getattr(config, "finetune_w_static", True)))
+    static_surface_vars = getattr(config.data, "input_static_surface_vars", [])
+    static_channels = int(getattr(config.model, "num_static_channels", 1))
+    data_type = getattr(config.data, "type", None)
+    if data_type == "cordex":
+        # CORDEX static predictors are already appended in the dataset; avoid double-counting.
+        static_surface_vars = []
+    if not use_static:
+        n_static_parameters = 0
+    else:
+        n_static_parameters = static_channels + len(static_surface_vars)
+        if config.model.residual == 'climate':
+            n_static_parameters += n_parameters
 
-    patch_embedding_static = PatchEmbed(
-        patch_size=config.model.downscaling_patch_size,
-        channels=n_static_parameters,
-        embed_dim=config.model.downscaling_embed_dim,
-    ) 
+    patch_embedding_static = None
+    if n_static_parameters > 0:
+        patch_embedding_static = PatchEmbed(
+            patch_size=config.model.downscaling_patch_size,
+            channels=n_static_parameters,
+            embed_dim=config.model.downscaling_embed_dim,
+        ) 
         
     return patch_embedding, patch_embedding_static
 
@@ -105,7 +158,7 @@ def get_finetune_model_UNET(config: ExperimentConfig) -> torch.nn.Module:
     #########################################################
     # 1. Patch Embedding/Shallow Feature Extraction
     #########################################################
-    if config.data.type == 'eccc':  # eccc
+    if config.data.type in ('eccc', 'cordex'):  # eccc + cordex share embedding setup
         embedding, embedding_static = get_eccc_embedding_module(config)
     else:
         raise ValueError(f'{config.data.type} is not a valid config.data.type')
@@ -185,7 +238,7 @@ def get_finetune_model(config: ExperimentConfig) -> torch.nn.Module:
     #########################################################
     # 1. Patch Embedding/Shallow Feature Extraction
     #########################################################
-    if config.data.type == 'eccc':  # eccc
+    if config.data.type in ('eccc', 'cordex'):  # eccc + cordex share embedding setup
         embedding, embedding_static = get_eccc_embedding_module(config)
     else:
         raise ValueError(f'{config.data.type} is not a valid config.data.type')

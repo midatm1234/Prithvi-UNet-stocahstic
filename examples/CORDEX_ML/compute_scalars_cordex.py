@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--orography-file",
-        required=True,
+        required=False,
         help="Static orography NetCDF file on the fine grid or coarse grid",
     )
     parser.add_argument(
@@ -52,6 +52,16 @@ def parse_args() -> argparse.Namespace:
         "--orography-var",
         default="orog",
         help="Variable name that stores the static orography field",
+    )
+    parser.add_argument(
+        "--use-static",
+        action="store_true",
+        help="Include static orography as an input channel",
+    )
+    parser.add_argument(
+        "--no-static",
+        action="store_true",
+        help="Disable static orography inputs (overrides --use-static)",
     )
     parser.add_argument(
         "--time-dim",
@@ -148,16 +158,20 @@ def main() -> None:
     args = parse_args()
 
     dtype = getattr(torch, args.dtype)
+    use_static = bool(args.use_static) and not bool(args.no_static)
+    if use_static and not args.orography_file:
+        raise SystemExit("--orography-file is required when --use-static is set")
     dataset = CordexDownscaleDataset(
         predictor_files=args.predictor_files,
         target_files=args.target_files,
-        orography_file=args.orography_file,
+        orography_file=args.orography_file if use_static else None,
         predictor_variables=args.predictor_vars,
         target_variables=args.target_vars,
         orography_variable=args.orography_var,
         time_dim=args.time_dim,
         regrid_method=args.regrid_method,
         dtype=dtype,
+        use_static=use_static,
     )
 
     print(f"Loaded {len(dataset)} samples from {len(args.predictor_files)} predictor files")
@@ -217,4 +231,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -99,8 +99,9 @@ def validate_one_epoch(
             benchmark_total[1] += 1
             benchmark_timer, benchmark_timer_total = time(), time()
 
-    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
-    val_loss = ddp_loss[0] / ddp_loss[1]
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+    val_loss = ddp_loss[0] / max(ddp_loss[1], 1)
 
     if is_main_process():
         inner_pbar.close()
@@ -231,9 +232,10 @@ def train_one_epoch(
         benchmark_total[1] += 1
         benchmark_timer, benchmark_timer_total = time(), time()
 
-    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
-    train_loss = ddp_loss[0] / ddp_loss[1]
-    dist.all_reduce(node_count, op=dist.ReduceOp.SUM)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(node_count, op=dist.ReduceOp.SUM)
+    train_loss = ddp_loss[0] / max(ddp_loss[1], 1)
 
     if is_main_process():
         inner_pbar.close()
@@ -254,40 +256,57 @@ def train_one_epoch(
     return train_loss, metrics
 
 
-def save_checkpoint(config: dict, 
-                    epoch: int, 
-                    model: torch.nn.Module,
-                    optimizer: torch.optim.Optimizer,
-                    train_loss: float, 
-                    curr_val_loss: float,
-                    scheduler: torch.optim.lr_scheduler._LRScheduler = None):
-    
-    checkpoint_name = f'checkpoint_{epoch}.pt'
-    checkpoint_file = os.path.join(config.path_experiment, 'weights', checkpoint_name)
-    
-    os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True) 
-    
-    sche_dict = {k: v for k, v in scheduler.state_dict().items() if k != 'anneal_func'} # hack to fix OneCycleLR serialization bug
+def save_checkpoint(
+    config: dict,
+    epoch: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    train_loss: float,
+    curr_val_loss: float,
+    scheduler: torch.optim.lr_scheduler._LRScheduler = None,
+    checkpoint_dir: str | None = None,
+    is_best: bool = False,
+):
+    checkpoint_dir = checkpoint_dir or getattr(config, "checkpoint_dir", None)
+    if checkpoint_dir is None:
+        checkpoint_dir = os.path.join(config.path_experiment, "weights")
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    sche_dict = None
+    if scheduler is not None:
+        sche_state = scheduler.state_dict()
+        sche_dict = {k: v for k, v in sche_state.items() if k != "anneal_func"}  # fix OneCycleLR serialization bug
 
     state_dict = {
-        'model': model.state_dict(),  # Save only model weights here
-        'optimizer': optimizer.state_dict(),
-        'scheduler': sche_dict,
-        'epoch': epoch,
-        'loss': train_loss,
-        'val_loss': curr_val_loss,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "loss": train_loss,
+        "val_loss": curr_val_loss,
     }
-    
-    torch.save(state_dict, checkpoint_file)
-    print(f"--> saved {checkpoint_file}")
+    if sche_dict is not None:
+        state_dict["scheduler"] = sche_dict
+
+    last_checkpoint = os.path.join(checkpoint_dir, "last.ckpt")
+    torch.save(state_dict, last_checkpoint)
+    if is_best:
+        best_checkpoint = os.path.join(checkpoint_dir, "best.ckpt")
+        torch.save(state_dict, best_checkpoint)
+        print(f"--> saved {best_checkpoint}")
+    else:
+        print(f"--> saved {last_checkpoint}")
     
 
 def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, local_rank, use_gpu, save_every, loss_func):
     train_loss = []
     val_loss = []
+    best_val_loss = None
+    checkpoint_dir = getattr(config, "checkpoint_dir", None)
 
     for epoch in range(config.num_epochs):  
-        torch.distributed.barrier()
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
         print(f"Learning rate: {scheduler.get_last_lr()[0]}")
         print(f"Rank {local_rank} starting epoch {epoch + 1}...")
@@ -319,7 +338,17 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
         train_loss.append(curr_train_loss.tolist())
         val_loss.append(curr_val_loss.tolist())
 
-        if (epoch + 1) % 5 == 0:
+        is_best = best_val_loss is None or curr_val_loss < best_val_loss
+        if is_best:
+            best_val_loss = curr_val_loss
+
+        save_now = (
+            ((epoch + 1) % max(1, save_every) == 0)
+            or is_best
+            or (epoch + 1 == config.num_epochs)
+        )
+        should_save = (not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0)
+        if save_now and should_save:
             save_checkpoint(
                 config=config,
                 scheduler=scheduler,
@@ -328,7 +357,8 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
                 optimizer=optimizer,
                 train_loss=train_loss,
                 curr_val_loss=curr_val_loss,
+                checkpoint_dir=checkpoint_dir,
+                is_best=is_best,
             )
-        
 
     return train_loss, val_loss

@@ -23,6 +23,8 @@ class DataConfig:
         self.levels = levels
         self.time_range_train = time_range_train
         self.time_range_valid = time_range_valid
+        if not hasattr(self, "input_static_surface_vars"):
+            self.input_static_surface_vars = []
 
     def to_dict(self):
         return self.__dict__

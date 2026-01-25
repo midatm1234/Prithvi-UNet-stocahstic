@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
+import warnings
 from bisect import bisect_right
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 import xarray as xr
-import xesmf as xe
 from torch.utils.data import Dataset
+
+try:
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+        io.StringIO()
+    ):
+        import xesmf as xe
+except Exception as exc:  # pragma: no cover - depends on optional dep
+    xe = None
+    _XESMF_IMPORT_ERROR = exc
+else:  # pragma: no cover - optional import
+    _XESMF_IMPORT_ERROR = None
 
 
 PathLike = Union[str, os.PathLike[str]]
@@ -25,8 +38,9 @@ class CordexDownscaleDataset(Dataset):
         NetCDF files that contain the coarse-resolution predictors.
     target_files : Sequence[PathLike]
         NetCDF files that contain the matching high-resolution targets.
-    orography_file : PathLike
-        NetCDF file containing a static orography field.
+    orography_file : PathLike | None
+        NetCDF file containing a static orography field. Required when
+        ``use_static`` is True.
     predictor_variables : Sequence[str], optional
         Predictor variable names. Defaults to the canonical u/v/q/t/z at
         850/700/500 hPa.
@@ -70,7 +84,7 @@ class CordexDownscaleDataset(Dataset):
         self,
         predictor_files: Sequence[PathLike],
         target_files: Sequence[PathLike],
-        orography_file: PathLike,
+        orography_file: PathLike | None,
         predictor_variables: Optional[Sequence[str]] = None,
         target_variables: Optional[Sequence[str]] = None,
         orography_variable: Optional[str] = "orog",
@@ -80,6 +94,7 @@ class CordexDownscaleDataset(Dataset):
         crop_size: Optional[Tuple[int, int]] = None,
         random_crop: bool = True,
         seed: Optional[int] = None,
+        use_static: bool = True,
     ) -> None:
         predictor_paths = [os.fspath(p) for p in predictor_files]
         target_paths = [os.fspath(p) for p in target_files]
@@ -91,7 +106,13 @@ class CordexDownscaleDataset(Dataset):
 
         self.predictor_paths = predictor_paths
         self.target_paths = target_paths
-        self.orography_path = os.fspath(orography_file)
+        self.use_static = bool(use_static)
+        if self.use_static:
+            if orography_file is None:
+                raise ValueError("orography_file is required when use_static=True")
+            self.orography_path = os.fspath(orography_file)
+        else:
+            self.orography_path = None
         self.predictor_vars = list(predictor_variables or self.DEFAULT_PREDICTORS)
         self.target_vars = list(target_variables) if target_variables else None
         self.orography_var = orography_variable
@@ -114,8 +135,8 @@ class CordexDownscaleDataset(Dataset):
             grid_out,
         ) = self._inspect_target_template(self.target_paths[0])
 
-        self.regridder = xe.Regridder(grid_in, grid_out, method=regrid_method, periodic=False)
-        self._orography_tensor = self._prepare_orography()
+        self.regridder = self._build_regridder(grid_in, grid_out, regrid_method)
+        self._orography_tensor = self._prepare_orography() if self.use_static else None
 
         if crop_size is None:
             self.crop_size = self.fine_shape
@@ -259,6 +280,9 @@ class CordexDownscaleDataset(Dataset):
         stacked = np.stack(tensors, axis=0)[..., lat_slice, lon_slice]
         stacked_tensor = torch.from_numpy(stacked).to(self.dtype)
 
+        if not self.use_static:
+            return stacked_tensor
+
         static = self._get_orography_crop(lat_slice, lon_slice)
         return torch.cat([stacked_tensor, static], dim=0)
 
@@ -281,6 +305,8 @@ class CordexDownscaleDataset(Dataset):
 
     # ------------------------------------------------------------------
     def _prepare_orography(self) -> torch.Tensor:
+        if self.orography_path is None:
+            raise ValueError("Static orography path is not set.")
         with xr.open_dataset(self.orography_path) as ds:
             if self.orography_var and self.orography_var in ds.data_vars:
                 da = ds[self.orography_var]
@@ -311,6 +337,8 @@ class CordexDownscaleDataset(Dataset):
         return torch.from_numpy(arr).unsqueeze(0).to(self.dtype)
 
     def _get_orography_crop(self, lat_slice: slice, lon_slice: slice) -> torch.Tensor:
+        if self._orography_tensor is None:
+            raise ValueError("Static orography tensor is not initialized.")
         return self._orography_tensor[..., lat_slice, lon_slice]
 
     def _select_crop(self) -> Tuple[slice, slice]:
@@ -328,6 +356,27 @@ class CordexDownscaleDataset(Dataset):
         lat_slice = slice(lat_start, lat_start + self.crop_size[0])
         lon_slice = slice(lon_start, lon_start + self.crop_size[1])
         return lat_slice, lon_slice
+
+    def _build_regridder(
+        self, grid_in: xr.Dataset, grid_out: xr.Dataset, method: str
+    ):
+        if xe is not None:
+            try:
+                return xe.Regridder(grid_in, grid_out, method=method, periodic=False)
+            except Exception as exc:
+                warnings.warn(
+                    "xESMF regridding failed to initialize; falling back to "
+                    f"xarray interpolation. Error: {exc}",
+                    RuntimeWarning,
+                )
+        elif _XESMF_IMPORT_ERROR is not None:
+            warnings.warn(
+                "xESMF could not be imported; falling back to xarray interpolation "
+                f"({type(_XESMF_IMPORT_ERROR).__name__}: {_XESMF_IMPORT_ERROR}).",
+                RuntimeWarning,
+            )
+
+        return _XarrayRegridder(grid_out, target_shape=self.fine_shape, method=method)
 
     # ------------------------------------------------------------------
     def _infer_coord_name(self, ds: xr.Dataset, candidates: Iterable[str]) -> str:
@@ -393,8 +442,61 @@ class CordexDownscaleDataset(Dataset):
                 return int(ds.sizes[self.time_dim])
         return 1
 
-    def _to_numpy(self, data: xr.DataArray) -> np.ndarray:
-        array = data.to_numpy()
+    def _to_numpy(self, data: Union[xr.DataArray, np.ndarray]) -> np.ndarray:
+        if isinstance(data, xr.DataArray):
+            array = data.to_numpy()
+        else:
+            array = np.asarray(data)
         if array.dtype != np.float32:
             array = array.astype(np.float32, copy=False)
         return array
+
+
+class _XarrayRegridder:
+    """Small fallback regridder when xESMF isn't available."""
+
+    def __init__(
+        self,
+        grid_out: xr.Dataset,
+        target_shape: Tuple[int, int],
+        method: str = "bilinear",
+    ) -> None:
+        self.target_shape = target_shape
+        self.method = "linear" if method in {"bilinear", "linear"} else "nearest"
+        self._lat = grid_out["lat"]
+        self._lon = grid_out["lon"]
+        self._template = xr.Dataset({"lat": self._lat, "lon": self._lon})
+
+        if self._lat.ndim == 1 and self._lon.ndim == 1:
+            self._dims = ("lat", "lon")
+            self._coords = {"lat": self._lat, "lon": self._lon}
+        else:
+            # Retain any higher-dimensional coordinate definitions.
+            self._dims = self._lat.dims
+            self._coords = {
+                "lat": (self._lat.dims, self._lat.to_numpy()),
+                "lon": (self._lon.dims, self._lon.to_numpy()),
+            }
+
+    def __call__(self, data: xr.DataArray) -> Union[xr.DataArray, np.ndarray]:
+        try:
+            return data.interp(lat=self._lat, lon=self._lon, method=self.method)
+        except Exception:
+            pass
+
+        try:
+            return data.interp_like(self._template, method=self.method)
+        except Exception:
+            pass
+
+        # Fall back to plain bilinear resize in numpy/torch.
+        array = data.to_numpy()
+        tensor = torch.from_numpy(array.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0)
+        resized = torch.nn.functional.interpolate(  # type: ignore[attr-defined]
+            tensor,
+            size=self.target_shape,
+            mode="bilinear" if self.method == "linear" else "nearest",
+            align_corners=False,
+        )
+        upsampled = resized.squeeze(0).squeeze(0).cpu().numpy()
+        return xr.DataArray(upsampled, dims=self._dims, coords=self._coords)

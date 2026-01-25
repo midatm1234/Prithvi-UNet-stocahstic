@@ -22,10 +22,16 @@ This folder hosts the CORDEX-ML benchmark workflows for the New Zealand domain, 
 - **Outputs**: Writes `predictions/*.nc` and matching `.pkl` files under the fine-tune run directory; the NetCDFs contain `pr` and `tasmax` grids on the high-resolution NZ domain.
 
 ## Workflow
-1. **Preprocess / regrid** – Use `preproc_cordex.py` to interpolate the coarse CORDEX predictors and static orography onto the NZ high-resolution grid.
-2. **Compute scalars** – Run `compute_scalars_cordex.py` to derive per-channel mean/std values for predictors and targets; stash them under `experiments/NZ_scalars/`.
-3. **Fine-tune** – Point `cordex_config_small.yaml` (or your own YAML) at the preprocessed samples and scalars, then launch the training steps in `NZ_downscaling_finetune.ipynb` to produce checkpoints.
-4. **Inference + write NetCDF** – Open `NZ_downscaling_inference.ipynb`, select the fine-tune manifest, and run the final section to save predicted `pr`/`tasmax` NetCDF files.
+1. **Normalization (compute_scalars.py)** – Run `compute_scalars_cordex.py` to derive per-channel mean/std values for predictors and targets. Use `--use-static` for orography-inclusive scalars (e.g., `experiments/NZ_T1_ACCESS-CM2_static_scalars/`) or `--no-static` for dynamic-only scalars (e.g., `experiments/NZ_T1_ACCESS-CM2_no_static_scalars/`).
+2. **Regridding (preproc_cordex.py)** – Use `preproc_cordex.py` to interpolate the coarse CORDEX predictors and static orography onto the NZ high-resolution grid. The `*_wrapper` script (e.g., `preproc_cordex_nz_wrapper.py`) batches this over multiple predictor files to target the high-res grid in one go.
+3. **Prepare YAML configs** – Create `NZ_T1_{ModelName}_{static|no_static}.yaml` or `NZ_T2_{ModelName}_{static|no_static}.yaml`:
+   - **T1** uses `ESD_pseudo_reality` splits.
+   - **T2** uses `Emulator_hist_future` splits.
+   - **static/no_static** toggles orography (with/without `Static_fields.nc`).
+4. **Fine-tune** – Run `notebooks/NZ_downscaling_finetune_T1(T2)_{ModelName}_{static|no_static}.ipynb` to train and save checkpoints for the chosen config/model.
+5. **Inference (12 runs)** – Run `notebooks/NZ_downscaling_inference_T1(T2)_{ModelName}_{static|no_static}.py`:
+   - Executes 12 predictor configurations (perfect/imperfect × ACCESS-CM2 & EC-Earth3).
+   - Time periods: historical (1981–2000), mid-century (2041–2060), end-century (2080–2099).
 
 ## Quickstart
 ```bash
@@ -44,12 +50,20 @@ python examples/CORDEX_ML/preproc_cordex.py \
   --orography-file ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc \
   --output-dir ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors
 
-# Compute normalization scalars for tasmax/pr fine-tuning
+# Compute normalization scalars for tasmax/pr fine-tuning (static/orography included)
 python examples/CORDEX_ML/compute_scalars_cordex.py \
   --predictor-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/*_regridded.nc \
   --target-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_*.nc \
+  --use-static \
   --orography-file ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc \
-  --output-dir ./examples/CORDEX_ML/experiments/NZ_scalars
+  --output-dir ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_scalars
+
+# For no-static scalars, drop orography and use a separate output dir:
+# python examples/CORDEX_ML/compute_scalars_cordex.py \
+#   --predictor-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/*_regridded.nc \
+#   --target-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_*.nc \
+#   --no-static \
+#   --output-dir ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars
 
 # Launch notebooks (Jupyter or VS Code works)
 jupyter lab examples/CORDEX_ML/notebooks/NZ_downscaling_finetune.ipynb

@@ -2,6 +2,8 @@ import os
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from typing import Optional, Sequence
 
 from granitewxc.utils import distributed
@@ -127,6 +129,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         self.backbone_use = config.backbone_use 
         self.mask_unit_size_px_backbone = config.mask_unit_size
         self.encoder_decoder_scale_per_stage = config.model.encoder_decoder_scale_per_stage
+        self.use_static = bool(getattr(config.data, "use_static", getattr(config, "finetune_w_static", True)))
         #-----------
 
         self.n_input_timestamps = n_input_timestamps
@@ -137,6 +140,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         self.embedding = embedding
         self.embedding_static = embedding_static
         self.downscaling_embed_dim = config.model.downscaling_embed_dim
+        self.embed_dim_backbone = embed_dim_backbone
 
 
         self.conv_after_backbone = nn.Conv2d(
@@ -147,6 +151,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             padding='same',
             padding_mode='replicate'
         )
+        self.backbone_gradient_checkpointing = getattr(config, "backbone_gradient_checkpointing", False)
 
         self.conv_before_backbone = nn.Conv2d(
             2 * self.downscaling_embed_dim, 
@@ -256,12 +261,24 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
+    def _expand_static(self, tensor: torch.Tensor, batch: dict[str, torch.tensor], H: int, W: int) -> torch.Tensor:
+        return tensor.to(device=batch["x"].device, dtype=batch["x"].dtype).expand(
+            batch["x"].shape[0], -1, H, W
+        )
+
+    def _resolve_static(self, batch: dict[str, torch.tensor], H: int, W: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.use_static and "static_x" in batch and "static_y" in batch:
+            return batch["static_x"], batch["static_y"]
+        static_x = self._expand_static(self.static_input_scalers_mu, batch, H, W)
+        static_y = self._expand_static(self.static_output_scalers_mu, batch, H, W)
+        return static_x, static_y
+
 
     #@profile
     def forward(self, batch: dict[str, torch.tensor]):
         """
         Args:
-            batch: Dictionary containing the keys 'x', 'y', and 'static'.
+            batch: Dictionary containing the keys 'x', 'y', and optional 'static_x'/'static_y'.
                 The associated torch tensors have the following shapes:
                 x: Tensor of shape [batch, time x parameter, lat, lon]
                 y: Tensor of shape [batch, parameter, lat, lon]
@@ -272,61 +289,78 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         """
 
         B, _, H, W = batch['x'].shape
-
         # Scale inputs
         x_sep_time = batch['x'].view(B, self.n_input_timestamps, -1, H, W) # [batch, time x parameter, lat, lon] -> [batch, time, parameter, lat, lon]
         x_scale = (x_sep_time - self.input_scalers_mu.view(1, 1, -1, 1, 1)) / ( 
                 self.input_scalers_sigma.view(1, 1, -1, 1, 1) + self.input_scalers_epsilon)
         x = x_scale.view(B, -1, H, W) # [batch, time, parameter, lat, lon] -> [batch, time x parameter, lat, lon]
-        
-        x_static = (batch['static_x'] - self.static_input_scalers_mu) / (
-            self.static_input_scalers_sigma + self.static_input_scalers_epsilon
-        )
+        use_static = self.use_static and self.embedding_static is not None
 
-        if self.residual == 'climate':
-            # Scale climatology
-            climate = (batch['climate_x'] - self.input_scalers_mu) / (
-                self.input_scalers_sigma + self.input_scalers_epsilon
+        if use_static:
+            static_x, static_y = self._resolve_static(batch, H, W)
+            x_static = (static_x - self.static_input_scalers_mu) / (
+                self.static_input_scalers_sigma + self.static_input_scalers_epsilon
             )
 
-            # concat with static in channels dimension
-            x_static = torch.cat([x_static, climate], dim=1)
+            if self.residual == 'climate':
+                # Scale climatology
+                climate = (batch['climate_x'] - self.input_scalers_mu) / (
+                    self.input_scalers_sigma + self.input_scalers_epsilon
+                )
 
+                # concat with static in channels dimension
+                x_static = torch.cat([x_static, climate], dim=1)
 
-        # ----- to be used in  UNET
-        # Embedding and dowsampling of static HRDPS covariates
-        y_static = (batch['static_y'] - self.static_output_scalers_mu) / (
-            self.static_output_scalers_sigma + self.static_input_scalers_epsilon) # self.static_input_scalers_epsilon is a constant small number
-            
-        # Dowsampling step
-        copy_activations = {}
-        copy_activations[0] = self.embedding_static(y_static)
-        primary_device = x.device
+            # ----- to be used in  UNET
+            # Embedding and dowsampling of static HRDPS covariates
+            y_static = (static_y - self.static_output_scalers_mu) / (
+                self.static_output_scalers_sigma + self.static_input_scalers_epsilon) # self.static_input_scalers_epsilon is a constant small number
 
-        for step_idx in range(self.num_upsample):
-            current_activation = self._ensure_on_device(copy_activations[step_idx], primary_device)
-            copy_activations[step_idx] = current_activation
-            copy_activations[step_idx + 1] = self.downsampling_layers[step_idx](current_activation)
-            copy_activations[step_idx] = self._maybe_offload_skip(copy_activations[step_idx], step_idx, primary_device)
-        
-        #------
-        
-        if self.embedding_static is None:
-            x = torch.cat([x, x_static], dim=1) # combine the inputs and static in channel dimension
-            x_shallow_feats = self.embedding(x)  # [batch, time x parameter, lat, lon] -> [batch, emb, lat*scale[0], lon*scale[0]]
-        else:
+            # Dowsampling step
+            copy_activations = {}
+            copy_activations[0] = self.embedding_static(y_static)
+            primary_device = x.device
+
+            for step_idx in range(self.num_upsample):
+                current_activation = self._ensure_on_device(copy_activations[step_idx], primary_device)
+                copy_activations[step_idx] = current_activation
+                copy_activations[step_idx + 1] = self.downsampling_layers[step_idx](current_activation)
+                copy_activations[step_idx] = self._maybe_offload_skip(copy_activations[step_idx], step_idx, primary_device)
+
             x_embedded = self.embedding(x) # [batch, time x parameter, lat, lon] -> [batch, emb, lat*scale[0], lon*scale[0]]
             static_embedded = self.embedding_static(x_static)
             x_shallow_feats = x_embedded + static_embedded
 
-        # ----- to be used in  UNET
-        deepest_skip = self._ensure_on_device(copy_activations[self.num_upsample], x_shallow_feats.device)
+            # ----- to be used in  UNET
+            deepest_skip = self._ensure_on_device(copy_activations[self.num_upsample], x_shallow_feats.device)
+            if deepest_skip.shape[-2:] != x_shallow_feats.shape[-2:]:
+                deepest_skip = F.interpolate(
+                    deepest_skip,
+                    size=x_shallow_feats.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+        else:
+            x_shallow_feats = self.embedding(x)
+            deepest_skip = torch.zeros_like(x_shallow_feats)
+            primary_device = x_shallow_feats.device
+            copy_activations = {}
+            current_skip = torch.zeros(
+                (B, self.downscaling_embed_dim, x_shallow_feats.shape[-2], x_shallow_feats.shape[-1]),
+                device=primary_device,
+                dtype=x_shallow_feats.dtype,
+            )
+            for step_idx in range(self.num_upsample):
+                copy_activations[step_idx] = self._maybe_offload_skip(current_skip, step_idx, primary_device)
+                if step_idx < self.num_upsample - 1:
+                    current_skip = F.max_pool2d(current_skip, kernel_size=2)
+
         x_shallow_feats = torch.cat([x_shallow_feats, deepest_skip], dim=1)
         x_shallow_feats = self.conv_before_backbone(x_shallow_feats)
 
-        # calculate shapes to use in backbone
-        n_lats_px_backbone = int(H * np.prod(self.encoder_decoder_scale_per_stage[0]))
-        n_lons_px_backbone = int(W * np.prod(self.encoder_decoder_scale_per_stage[0]))
+        # calculate shapes to use in backbone (use current spatial resolution)
+        n_lats_px_backbone = int(H)
+        n_lons_px_backbone = int(W)
         
         assert n_lats_px_backbone % self.mask_unit_size_px_backbone[0] == 0
         assert n_lons_px_backbone % self.mask_unit_size_px_backbone[1] == 0
@@ -347,7 +381,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             x_tokens = (
                 x_shallow_feats.reshape(
                     B,
-                    -1,
+                    self.embed_dim_backbone,
                     global_shape_mu[0],
                     local_shape_mu[0],
                     global_shape_mu[1],
@@ -358,7 +392,10 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 .flatten(1, 2)
             )  # [batch, embed, lat//patch_size, lon//patch_size] -> [batch, global seq, local seq, embed]
 
-            x_deep_feats = self.backbone(x_tokens)  # [batch, global seq, local seq, embed]
+            if self.backbone_gradient_checkpointing and self.training:
+                x_deep_feats = checkpoint(self.backbone, x_tokens)
+            else:
+                x_deep_feats = self.backbone(x_tokens)  # [batch, global seq, local seq, embed]
     
             x_deep_feats = x_deep_feats.reshape(
                 B,
@@ -387,11 +424,27 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         out = x_deep_feats
         for step_idx in reversed(range(self.num_upsample)):
             skip = self._ensure_on_device(copy_activations[step_idx], out.device)
-            out = torch.cat((self.upsample_layers[step_idx](out), skip), dim=1)
+            upsampled = self.upsample_layers[step_idx](out)
+            if skip.shape[-2:] != upsampled.shape[-2:]:
+                skip = F.interpolate(
+                    skip,
+                    size=upsampled.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            out = torch.cat((upsampled, skip), dim=1)
 
         x = self.output_conv_block(out)
 
         x_out = self.output_scalers_sigma * x + self.output_scalers_mu # [batch, 1, lat_high_res, lon_high_res]
+        expected_hw = batch["y"].shape[-2:]
+        if x_out.shape[-2:] != expected_hw:
+            x_out = F.interpolate(
+                x_out,
+                size=expected_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
         
         return x_out
 
@@ -492,10 +545,12 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
         self.embedding_static = embedding_static
         self.encoder_decoder_scale_per_stage = encoder_decoder_scale_per_stage
         self.mask_unit_size_px_backbone = mask_unit_size_px_backbone
+        self.embed_dim_backbone = embed_dim_backbone
 
         self.upscale = upscale
 
         self.backbone_use = backbone_use
+        self.use_static = bool(getattr(config.data, "use_static", getattr(config, "finetune_w_static", True)))
 
         self.conv_after_backbone = nn.Conv2d(
             embed_dim_backbone, 
@@ -542,6 +597,16 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
                 kernel_size=1,
             )
 
+    def _expand_static(self, tensor: torch.Tensor, batch: dict[str, torch.tensor], H: int, W: int) -> torch.Tensor:
+        return tensor.to(device=batch["x"].device, dtype=batch["x"].dtype).expand(
+            batch["x"].shape[0], -1, H, W
+        )
+
+    def _resolve_static(self, batch: dict[str, torch.tensor], H: int, W: int) -> torch.Tensor:
+        if self.use_static and "static_x" in batch:
+            return batch["static_x"]
+        return self._expand_static(self.static_input_scalers_mu, batch, H, W)
+
     def swap_masking(self) -> None:
         return  
 
@@ -549,7 +614,7 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
     def forward(self, batch: dict[str, torch.tensor]):
         """
         Args:
-            batch: Dictionary containing the keys 'x', 'y', and 'static'.
+            batch: Dictionary containing the keys 'x', 'y', and optional 'static_x'.
                 The associated torch tensors have the following shapes:
                 x: Tensor of shape [batch, time x parameter, lat, lon]
                 y: Tensor of shape [batch, parameter, lat, lon]
@@ -560,41 +625,40 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
         """
 
         B, _, H, W = batch['x'].shape
-        
         # Scale inputs
         x_sep_time = batch['x'].view(B, self.n_input_timestamps, -1, H, W) # [batch, time x parameter, lat, lon] -> [batch, time, parameter, lat, lon]
         x_scale = (x_sep_time - self.input_scalers_mu.view(1, 1, -1, 1, 1)) / ( 
                 self.input_scalers_sigma.view(1, 1, -1, 1, 1) + self.input_scalers_epsilon)
         x = x_scale.view(B, -1, H, W) # [batch, time, parameter, lat, lon] -> [batch, time x parameter, lat, lon]
-        
-        x_static = (batch['static_x'] - self.static_input_scalers_mu) / (
-            self.static_input_scalers_sigma + self.static_input_scalers_epsilon
-        )
 
-        if self.residual == 'climate':
-            # Scale climatology
-            climate = (batch['climate_x'] - self.input_scalers_mu) / (
-                self.input_scalers_sigma + self.input_scalers_epsilon
+        use_static = self.use_static and self.embedding_static is not None
+        if use_static:
+            static_x = self._resolve_static(batch, H, W)
+            x_static = (static_x - self.static_input_scalers_mu) / (
+                self.static_input_scalers_sigma + self.static_input_scalers_epsilon
             )
 
-            # concat with static in channels dimension
-            x_static = torch.cat([x_static, climate], dim=1)
+            if self.residual == 'climate':
+                # Scale climatology
+                climate = (batch['climate_x'] - self.input_scalers_mu) / (
+                    self.input_scalers_sigma + self.input_scalers_epsilon
+                )
 
-        # tokenization
-        if self.embedding_static is None:
-            x = torch.cat([x, x_static], dim=1) # combine the inputs and static in channel dimension
-            x_shallow_feats = self.embedding(x)  # [batch, time x parameter, lat, lon] -> [batch, emb, lat*scale[0], lon*scale[0]]
-        else:
+                # concat with static in channels dimension
+                x_static = torch.cat([x_static, climate], dim=1)
+
             x_embedded = self.embedding(x) # [batch, time x parameter, lat, lon] -> [batch, emb, lat*scale[0], lon*scale[0]]
             static_embedded = self.embedding_static(x_static)
             x_shallow_feats = x_embedded + static_embedded
+        else:
+            x_shallow_feats = self.embedding(x)
 
         x_upscale = self.upscale(x_shallow_feats)
 
-        # calculate shapes to use in backbone
+        # calculate shapes to use in backbone (use current spatial resolution)
         H, W = batch['x'].shape[2:]
-        n_lats_px_backbone = int(H * np.prod(self.encoder_decoder_scale_per_stage[0]))
-        n_lons_px_backbone = int(W * np.prod(self.encoder_decoder_scale_per_stage[0]))
+        n_lats_px_backbone = int(H)
+        n_lons_px_backbone = int(W)
 
         assert n_lats_px_backbone % self.mask_unit_size_px_backbone[0] == 0
         assert n_lons_px_backbone % self.mask_unit_size_px_backbone[1] == 0
@@ -614,7 +678,7 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
             x_tokens = (
                 x_upscale.reshape(
                     B,
-                    -1,
+                    self.embed_dim_backbone,
                     self.global_shape_mu[0],
                     self.local_shape_mu[0],
                     self.global_shape_mu[1],

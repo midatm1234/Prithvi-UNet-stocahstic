@@ -52,6 +52,8 @@ class CordexWrappedDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         sample = self.base[idx]
         x = sample["x"]
+        if not getattr(self.base, "use_static", True):
+            return {"x": x, "y": sample["y"]}
         dynamic = x[:-1]
         static = x[-1:].clone()
         return {"x": dynamic, "y": sample["y"], "static_x": static, "static_y": static}
@@ -71,8 +73,9 @@ def build_inference_dataset(
     if len(predictor_files) != len(target_files):
         raise ValueError("predictor_paths and target_paths must be the same length")
 
+    use_static = bool(getattr(config.data, "use_static", getattr(config, "finetune_w_static", True)))
     static_path = getattr(config.data, "static_path", None)
-    if not static_path:
+    if use_static and not static_path:
         raise ValueError("config.data.static_path is required for inference datasets")
 
     predictor_variables = build_predictor_names(config)
@@ -81,10 +84,11 @@ def build_inference_dataset(
     return CordexDownscaleDataset(
         predictor_files=predictor_files,
         target_files=target_files,
-        orography_file=_coerce_path(static_path),
+        orography_file=_coerce_path(static_path) if use_static else None,
         predictor_variables=predictor_variables,
         target_variables=target_variables,
         crop_size=crop_size,
         random_crop=False,
         seed=None,
+        use_static=use_static,
     )
