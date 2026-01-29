@@ -31,9 +31,13 @@ This repository contains code and examples to apply the [Prithvi WxC foundation 
       This notebook will download model weights as well as sample data for basic illustration from [Hugging Face](https://huggingface.co/ibm-granite/granite-geospatial-wxc-downscaling).
    - [ECCC example](examples/eccc_downscaling/):
          This directory contains notebooks for both fine-tuning and inference. It also includes instructions for downloading and setting up the data, model and the required files from [Hugging Face](https://huggingface.co/ibm-granite/granite-geospatial-wxc-downscaling/tree/main/ECCC).
+   - [CORDEX ML example](examples/CORDEX_ML/):
+         This directory demonstrates fine-tuning and inference on regional climate data for the CORDEX Machine Learning Task Force benchmark (https://github.com/WCRP-CORDEX/ml-benchmark). It includes workflows for multiple domains (European Alps, New Zealand, and South Africa). Detailed documentation can be found in [examples/CORDEX_ML/README.md](examples/CORDEX_ML/README.md).
 
 ## Fine-tuned model
 
-The fine-tuned model for MERRA-2 2m temperature data is available via [Hugging Face](https://huggingface.co/ibm-granite/granite-geospatial-wxc-downscaling). For an application to EURO-CORDEX data please refer to the paper.
+The fine-tuned model for MERRA-2 2m temperature data is available via [Hugging Face](https://huggingface.co/ibm-granite/granite-geospatial-wxc-downscaling).
 
 The fine-tuned model for ECCC v10 and u10 wind component data is available via [Hugging Face](https://huggingface.co/ibm-granite/granite-geospatial-wxc-downscaling/tree/main/ECCC).
+
+For applications to CORDEX regional climate data, please refer to the [CORDEX ML example](examples/CORDEX_ML/README.md), which demonstrates fine-tuning on the [CORDEX Machine Learning Task Force benchmark](https://github.com/WCRP-CORDEX/ml-benchmark) for multiple regional domains.
