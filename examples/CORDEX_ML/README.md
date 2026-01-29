@@ -9,9 +9,20 @@ This folder hosts the CORDEX-ML benchmark workflows for multiple regional domain
 - **Targets**: Downscaled `tasmax` and `pr` fields packaged alongside the predictors in the benchmark `target` NetCDF files for each domain.
 - **Setup**: Download the needed predictor/target tiles for your region of interest plus `Static_fields.nc`, then update the YAML/config paths (e.g., `ALPS_T1_*.yaml`, `NZ_T1_*.yaml`, `SA_T1_*.yaml`) to match your local layout.
 
-## Notebooks
-### Regional Downscaling Notebooks
-The repository provides domain-specific notebooks for each region:
+### End-to-end workflow (explicit files)
+1. **Normalization (compute_scalars.py)** – Run `compute_scalars.py` (this repo: `compute_scalars_cordex.py`) to compute predictors/targets mean and std for `{Region}`.
+2. **Regridding (preproc_cordex.py)** – Use `preproc_cordex.py` to regrid coarse `{Region}` predictors; `*_wrapper` scripts regrid multiple predictor files to the target high-res grids in batch.
+3. **Prepare YAML configs** – Create `{Region}_T1` (or `{Region}_T2`) config files:
+  - `{Region}_T1(or T2)_{ModelName}_{static|no_static}.yaml`
+  - **T1**: `ESD_pseudo_reality`
+  - **T2**: `Emulator_hist_future`
+  - **static/no_static**: with or without orography
+4. **Fine-tune** – Run the domain-specific `{Region}` notebooks:
+  - `notebooks/{Region}_downscaling_finetune_T1(T2)_{ModelName}_{static|no_static}.ipynb`
+5. **Inference** – Run the `{Region}` inference drivers:
+  - `notebooks/{Region}_downscaling_inference_T1(T2)_{ModelName}_{static|no_static}.py`
+  - Run 12 predictor configurations (perfect/imperfect; two models).
+  - Time periods: hist (1981–2000), mid (2041–2060), end (2080–2099).
 
 #### ALPS (European Alps)
 - **`ALPS_downscaling_finetune.ipynb`** – Fine-tune on the ALPS training split starting from a generic checkpoint.
@@ -39,32 +50,9 @@ The repository provides domain-specific notebooks for each region:
   - **Data loader paths**: Configure `predictor_root` to `granite-geospatial-wxc-downscaling/CORDEX/SA_domain/test/historical_perfect/predictors`.
   - **Outputs**: Writes `predictions/*.nc` files containing `pr` and `tasmax` on the high-resolution SA domain.
 
-## Workflow
-1. **Normalization (compute_scalars.py)** – Run `compute_scalars.py` (this repo: `compute_scalars_cordex.py`) to derive per-channel mean/std values for predictors and targets. Supports `--use-static` for orography-inclusive scalars (e.g., `experiments/{REGION}_T1_{ModelName}_static_scalars/`) or `--no-static` for dynamic-only scalars. Works for all domains (ALPS, NZ, SA).
-2. **Regridding (preproc_cordex.py)** – Use `preproc_cordex.py` to interpolate the coarse CORDEX predictors and static orography onto the domain's high-resolution grid. Domain-specific `*_wrapper` scripts (e.g., `preproc_cordex_nz_wrapper.py`, `preproc_cordex_alps_wrapper.py`, `preproc_cordex_sa_wrapper.py`) batch this over multiple predictor files and target high-res grids.
-3. **Prepare YAML configs** – Create domain-specific YAML configurations (e.g., `ALPS_T1_{ModelName}_{static|no_static}.yaml`, `NZ_T1_{ModelName}_{static|no_static}.yaml`, `SA_T1_{ModelName}_{static|no_static}.yaml`):
-   - **T1** uses `ESD_pseudo_reality` splits.
-   - **T2** uses `Emulator_hist_future` splits.
-   - **static/no_static** toggles orography (with/without `Static_fields.nc`).
-4. **Fine-tune** – Run domain-specific fine-tuning notebooks (e.g., `notebooks/ALPS_downscaling_finetune.ipynb`, `notebooks/NZ_downscaling_finetune.ipynb`, `notebooks/SA_downscaling_finetune.ipynb`) to train and save checkpoints for the chosen config/model.
-5. **Inference** – Run domain-specific inference notebooks to generate downscaled forecasts:
-   - Executes multiple predictor configurations (perfect/imperfect × different climate models).
-   - Time periods: historical, mid-century, end-century.
-
-### NZ end-to-end workflow (explicit files)
-1. **Normalization (compute_scalars.py)** – Run `compute_scalars.py` (this repo: `compute_scalars_cordex.py`) to compute predictors/targets mean and std for NZ.
-2. **Regridding (preproc_cordex.py)** – Use `preproc_cordex.py` to regrid coarse NZ predictors; `*_wrapper` scripts regrid multiple predictor files to the target high-res grids in batch.
-3. **Prepare YAML configs** – Create `NZ_T1` (or `NZ_T2`) config files:
-   - `NZ_T1(or T2)_{ModelName}_{static|no_static}.yaml`
-   - **T1**: `ESD_pseudo_reality`
-   - **T2**: `Emulator_hist_future`
-   - **static/no_static**: with or without orography
-4. **Fine-tune** – Run the domain-specific NZ notebooks:
-   - `notebooks/NZ_downscaling_finetune_T1(T2)_{ModelName}_{static|no_static}.ipynb`
-5. **Inference** – Run the NZ inference drivers:
-   - `notebooks/NZ_downscaling_inference_T1(T2)_{ModelName}_{static|no_static}.py`
-   - Run 12 predictor configurations (perfect/imperfect; two models).
-   - Time periods: hist (1981–2000), mid (2041–2060), end (2080–2099).
+## Notebooks
+### Regional Downscaling Notebooks
+The repository provides domain-specific notebooks for each region:
 
 ## Quickstart
 ```bash
