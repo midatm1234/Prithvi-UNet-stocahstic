@@ -24,6 +24,10 @@ This folder hosts the CORDEX-ML benchmark workflows for multiple regional domain
   - Run 12 predictor configurations (perfect/imperfect; two models).
   - Time periods: hist (1981–2000), mid (2041–2060), end (2080–2099).
 
+## Notebooks
+### Regional Downscaling Notebooks
+The repository provides domain-specific notebooks for each region:
+
 #### ALPS (European Alps)
 - **`ALPS_downscaling_finetune.ipynb`** – Fine-tune on the ALPS training split starting from a generic checkpoint.
   - **Inputs/targets**: Regridded CORDEX predictors from `granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/ESD_pseudo_reality/predictors/*_regridded.nc` and targets from `.../target/pr_tasmax_*.nc`.
@@ -49,10 +53,6 @@ This folder hosts the CORDEX-ML benchmark workflows for multiple regional domain
 - **`SA_downscaling_inference.ipynb`** – Load a fine-tuned checkpoint and generate downscaled forecasts on the SA test split.
   - **Data loader paths**: Configure `predictor_root` to `granite-geospatial-wxc-downscaling/CORDEX/SA_domain/test/historical_perfect/predictors`.
   - **Outputs**: Writes `predictions/*.nc` files containing `pr` and `tasmax` on the high-resolution SA domain.
-
-## Notebooks
-### Regional Downscaling Notebooks
-The repository provides domain-specific notebooks for each region:
 
 ## Quickstart
 ```bash
