@@ -65,6 +65,7 @@ def build_inference_dataset(
     target_paths: Sequence[Any],
     *,
     crop_size: tuple[int, int] | None = None,
+    allow_time_mismatch: bool = True,
 ) -> CordexDownscaleDataset:
     predictor_files = _coerce_paths(predictor_paths)
     target_files = _coerce_paths(target_paths)
@@ -91,4 +92,5 @@ def build_inference_dataset(
         random_crop=False,
         seed=None,
         use_static=use_static,
+        allow_time_mismatch=allow_time_mismatch,
     )

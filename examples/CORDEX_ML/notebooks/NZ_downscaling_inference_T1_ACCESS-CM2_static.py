@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import subprocess
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
@@ -103,6 +104,9 @@ DEVICE_TARGET = "cuda"
 NUM_WORKERS = 2
 BATCH_SIZE = None
 PREFERRED_CHECKPOINT = "best"
+MIN_FREE_GB = 8  # minimum free GPU memory to consider "idle"
+MAX_GPUS = None  # set to an int to cap how many GPUs to expose
+RESPECT_CUDA_VISIBLE_DEVICES = False  # ignore preset CUDA_VISIBLE_DEVICES when auto-selecting idle GPUs
 
 # ================================================================
 
@@ -121,6 +125,52 @@ def _check_list_lengths() -> None:
 
 def _resolve_inputs(values):
     return [str(Path(p).resolve()) for p in values]
+
+
+def _select_idle_gpus(min_free_gb=8, max_gpus=None, respect_visible_devices=True):
+    visible = None
+    visible_env = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_env and respect_visible_devices:
+        visible = [int(v) for v in visible_env.split(",") if v.strip() != ""]
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+    except Exception as exc:
+        print(f"GPU auto-selection skipped (nvidia-smi unavailable): {exc}")
+        return None
+    rows = []
+    for line in out.strip().splitlines():
+        if not line.strip():
+            continue
+        idx_str, free_str = line.split(",")
+        idx = int(idx_str.strip())
+        free_mb = int(free_str.strip())
+        rows.append((idx, free_mb))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    if visible is not None:
+        rows = [row for row in rows if row[0] in visible]
+    selected = [idx for idx, free_mb in rows if free_mb >= min_free_gb * 1024]
+    if max_gpus is not None:
+        selected = selected[:max_gpus]
+    if not selected and visible is not None:
+        return visible
+    return selected
+
+
+def _configure_idle_gpus() -> None:
+    selected = _select_idle_gpus(MIN_FREE_GB, MAX_GPUS, RESPECT_CUDA_VISIBLE_DEVICES)
+    if selected:
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in selected)
+        print(f"Using idle GPUs (CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})")
+    else:
+        print("Using default CUDA_VISIBLE_DEVICES (no idle GPU filter applied).")
 
 
 def _select_device() -> torch.device:
@@ -268,6 +318,8 @@ def main() -> None:
     warnings.simplefilter(action="ignore", category=FutureWarning)
 
     _check_list_lengths()
+
+    _configure_idle_gpus()
 
     torch.jit.enable_onednn_fusion(True)
     if torch.cuda.is_available():

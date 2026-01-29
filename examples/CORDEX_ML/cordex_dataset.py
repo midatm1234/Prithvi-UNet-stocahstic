@@ -95,6 +95,7 @@ class CordexDownscaleDataset(Dataset):
         random_crop: bool = True,
         seed: Optional[int] = None,
         use_static: bool = True,
+        allow_time_mismatch: bool = False,
     ) -> None:
         predictor_paths = [os.fspath(p) for p in predictor_files]
         target_paths = [os.fspath(p) for p in target_files]
@@ -117,6 +118,7 @@ class CordexDownscaleDataset(Dataset):
         self.target_vars = list(target_variables) if target_variables else None
         self.orography_var = orography_variable
         self.dtype = dtype
+        self.allow_time_mismatch = bool(allow_time_mismatch)
 
         (
             self.time_dim,
@@ -148,7 +150,7 @@ class CordexDownscaleDataset(Dataset):
         self.random_crop = random_crop and self.crop_size != self.fine_shape
         self._rng = np.random.default_rng(seed)
 
-        self._time_lengths = self._compute_time_lengths()
+        self._time_lengths, self._target_time_lengths = self._compute_time_lengths()
         self._cumulative_sizes = self._build_cumulative_sizes(self._time_lengths)
 
     # ------------------------------------------------------------------
@@ -161,7 +163,14 @@ class CordexDownscaleDataset(Dataset):
         lat_slice, lon_slice = self._select_crop()
 
         x = self._load_predictors(self.predictor_paths[file_idx], time_idx, lat_slice, lon_slice)
-        y = self._load_targets(self.target_paths[file_idx], time_idx, lat_slice, lon_slice)
+        target_lengths = getattr(self, "_target_time_lengths", self._time_lengths)
+        y = self._load_targets(
+            self.target_paths[file_idx],
+            time_idx,
+            lat_slice,
+            lon_slice,
+            target_len=target_lengths[file_idx],
+        )
 
         return {"x": x, "y": y}
 
@@ -226,20 +235,30 @@ class CordexDownscaleDataset(Dataset):
 
         return lat_name, lon_name, spatial_shape, tuple(spatial_dims), self.target_vars, grid_out
 
-    def _compute_time_lengths(self) -> List[int]:
+    def _compute_time_lengths(self) -> Tuple[List[int], List[int]]:
         lengths: List[int] = []
+        target_lengths: List[int] = []
         for predictor_path, target_path in zip(self.predictor_paths, self.target_paths):
             predictor_len = self._read_time_length(predictor_path)
             target_len = self._read_time_length(target_path)
+            target_lengths.append(target_len)
 
             if predictor_len != target_len:
-                raise ValueError(
-                    f"Time dimension mismatch between {predictor_path} and {target_path}"
+                if not self.allow_time_mismatch:
+                    raise ValueError(
+                        f"Time dimension mismatch between {predictor_path} and {target_path}"
+                    )
+                warnings.warn(
+                    "Time dimension mismatch between "
+                    f"{predictor_path} (len={predictor_len}) and "
+                    f"{target_path} (len={target_len}); "
+                    "using predictor length for indexing targets.",
+                    RuntimeWarning,
                 )
 
             lengths.append(predictor_len)
 
-        return lengths
+        return lengths, target_lengths
 
     def _build_cumulative_sizes(self, lengths: Sequence[int]) -> List[int]:
         cumulative: List[int] = []
@@ -287,14 +306,27 @@ class CordexDownscaleDataset(Dataset):
         return torch.cat([stacked_tensor, static], dim=0)
 
     def _load_targets(
-        self, path: str, time_index: int, lat_slice: slice, lon_slice: slice
+        self,
+        path: str,
+        time_index: int,
+        lat_slice: slice,
+        lon_slice: slice,
+        *,
+        target_len: Optional[int] = None,
     ) -> torch.Tensor:
         tensors: List[np.ndarray] = []
         with xr.open_dataset(path) as ds:
+            resolved_index = time_index
+            if self.allow_time_mismatch and self.time_dim:
+                effective_len = target_len if target_len is not None else self._read_time_length(path)
+                if effective_len <= 0:
+                    raise ValueError(f"Target file {path} has no time dimension.")
+                if time_index >= effective_len:
+                    resolved_index = effective_len - 1
             for var in self.target_vars:
                 da = ds[var]
                 if self.time_dim and self.time_dim in da.dims:
-                    da = da.isel({self.time_dim: time_index}, drop=True)
+                    da = da.isel({self.time_dim: resolved_index}, drop=True)
                 arrays = np.nan_to_num(
                     self._to_numpy(da), nan=0.0, posinf=0.0, neginf=0.0
                 )

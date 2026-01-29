@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Python version of NZ_downscaling_inference_T1_ACCESS-CM2_static.ipynb.
+"""Python version of NZ_downscaling_inference_T2_ACCESS-CM2_static.ipynb.
 
 Fill in the parameter lists below (length NUM_RUNS) to loop over multiple
 inference runs without editing the script each time.
@@ -71,33 +71,33 @@ PREDICTION_OUTPUT_NAMES = ["Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc", "Pre
         "Predictions_pr_tasmax_ACCESS-CM2_2080-2099.nc", "Predictions_pr_tasmax_EC-Earth3_2080-2099.nc"
 ]
 
-INFERENCE_OUTPUT_ROOTS = ["/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/end-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_no_static_train/predictions/end-century/imperfect/"
+INFERENCE_OUTPUT_ROOTS = ["/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/historical/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/historical/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/historical/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/historical/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/imperfect/"
 ]
 
 # Fixed config for the fine-tuned model
 REPO_ROOT = REPO_ROOT.resolve()
 PROJECT_DIR = PROJECT_DIR.resolve()
 DATASET_ROOT = REPO_ROOT / "granite-geospatial-wxc-downscaling/CORDEX/NZ_domain"
-RUNS_ROOT = PROJECT_DIR / "runs/NZ_T1_ACCESS-CM2_no_static_train"
-CONFIG_PATH = PROJECT_DIR / "NZ_T1_ACCESS-CM2_no_static.yaml"
+RUNS_ROOT = PROJECT_DIR / "runs/NZ_T2_ACCESS-CM2_static_train"
+CONFIG_PATH = PROJECT_DIR / "NZ_T2_ACCESS-CM2_static.yaml"
 
-TRAIN_SPLIT = "train/ESD_pseudo_reality"
-TARGET_TEMPLATE_FILE = "pr_tasmax_ACCESS-CM2_1961-1980.nc"
+TRAIN_SPLIT = "train/Emulator_hist_future"
+TARGET_TEMPLATE_FILE = "pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc"
 TRAIN_TARGETS = [DATASET_ROOT / TRAIN_SPLIT / "target" / TARGET_TEMPLATE_FILE]
 
-FINETUNE_RUN_NAME = "NZ_T1_ACCESS-CM2_no_static"  # set None to auto-pick latest
-USE_STATIC = False
+FINETUNE_RUN_NAME = "NZ_T2_ACCESS-CM2_static"  # set None to auto-pick latest
+USE_STATIC = True
 STATIC_PATH = None  # e.g., DATASET_ROOT / TRAIN_SPLIT / "predictors" / "Static_fields.nc"
 
 DEVICE_TARGET = "cuda"
