@@ -30,7 +30,9 @@ for path in (REPO_ROOT, PROJECT_DIR):
         sys.path.insert(0, str(path))
 os.chdir(PROJECT_DIR)
 
-from cordex_inference import CordexWrappedDataset, build_inference_dataset  # noqa: E402
+from cordex_inference import CordexWrappedDataset, build_inference_dataset, build_predictor_names  # noqa: E402
+from utils.nearest_fill import repair_invalid_by_nearest_xr, summarize_invalid_counts_xr  # noqa: E402
+from utils.postprocess_outputs import enforce_pr_nonnegative_xr  # noqa: E402
 from granitewxc.models.model import get_finetune_model_UNET  # noqa: E402
 from granitewxc.utils.config import get_config  # noqa: E402
 from alps_params import (  # noqa: E402
@@ -99,6 +101,9 @@ TRAIN_TARGETS = [DATASET_ROOT / TRAIN_SPLIT / "target" / TARGET_TEMPLATE_FILE]
 FINETUNE_RUN_NAME = "ALPS_T2_CNRM-CM5_no_static"  # set None to auto-pick latest
 USE_STATIC = False
 STATIC_PATH = None  # e.g., DATASET_ROOT / TRAIN_SPLIT / "predictors" / "Static_fields.nc"
+
+REPAIR_INVALID_INPUTS = True
+CLAMP_PR_NONNEGATIVE = True
 
 DEVICE_TARGET = "cuda"
 NUM_WORKERS = 2
@@ -229,6 +234,57 @@ def _concat_time_coordinate(paths, time_key):
         combined.encoding.update(encoding)
     return combined.load()
 
+
+
+def _repair_predictor_files_if_needed(
+    predictor_paths,
+    *,
+    output_root: Path,
+    predictor_var_names,
+    run_index: int,
+):
+    resolved_paths = [str(Path(path).resolve()) for path in predictor_paths]
+    if not REPAIR_INVALID_INPUTS:
+        print("[repair] Predictor invalid-value repair disabled by REPAIR_INVALID_INPUTS=False")
+        return resolved_paths
+
+    repaired_dir = output_root / "_repaired_predictors" / f"run_{run_index:02d}"
+    repaired_dir.mkdir(parents=True, exist_ok=True)
+
+    final_paths: list[str] = []
+    for predictor_path in resolved_paths:
+        source_path = Path(predictor_path)
+        with xr.open_dataset(source_path, engine="netcdf4") as ds:
+            predictor_ds = ds.load()
+
+        before_counts = summarize_invalid_counts_xr(predictor_ds, var_names=predictor_var_names)
+        invalid_before_total = sum(before_counts.values())
+
+        if invalid_before_total > 0:
+            print("Invalid predictor values detected (NaN/inf/fill). Auto-repair enabled.")
+            predictor_ds.encoding["source"] = str(source_path)
+            repaired_ds = repair_invalid_by_nearest_xr(
+                predictor_ds,
+                var_names=predictor_var_names,
+            )
+            after_counts = summarize_invalid_counts_xr(repaired_ds, var_names=predictor_var_names)
+
+            repaired_path = repaired_dir / source_path.name
+            repaired_ds.to_netcdf(repaired_path, engine="h5netcdf")
+            final_paths.append(str(repaired_path.resolve()))
+        else:
+            after_counts = before_counts
+            final_paths.append(str(source_path))
+
+        keys = sorted(set(before_counts) | set(after_counts))
+        for key in keys:
+            print(
+                f"[repair] {source_path.name} {key}: "
+                f"invalid_count_before={before_counts.get(key, 0)} "
+                f"invalid_count_after={after_counts.get(key, 0)}"
+            )
+
+    return final_paths
 
 def _build_dataloader(config, predictor_paths, target_paths, device):
     base_dataset = build_inference_dataset(config, predictor_paths, target_paths)
@@ -372,11 +428,19 @@ def main() -> None:
         if not test_predictor_paths:
             raise FileNotFoundError("No inference predictor files configured in USER PARAMETERS.")
 
-        config.data.test_predictor_paths = test_predictor_paths
-        config.data.test_target_paths = _resolve_inputs(params.test_target_paths)
-
         output_root = Path(params.inference_output_root or (run_dir / "predictions"))
         output_root.mkdir(parents=True, exist_ok=True)
+
+        predictor_var_names = build_predictor_names(config)
+        test_predictor_paths = _repair_predictor_files_if_needed(
+            test_predictor_paths,
+            output_root=output_root,
+            predictor_var_names=predictor_var_names,
+            run_index=idx + 1,
+        )
+
+        config.data.test_predictor_paths = test_predictor_paths
+        config.data.test_target_paths = _resolve_inputs(params.test_target_paths)
 
         prediction_output_stub = Path(
             prediction_output_name or f"{run_name}_predictions_{idx + 1:02d}.nc"
@@ -440,6 +504,11 @@ def main() -> None:
                 coords=coords,
                 attrs=target_attrs.get(name, {}),
             )
+
+        if CLAMP_PR_NONNEGATIVE:
+            prediction_ds = enforce_pr_nonnegative_xr(prediction_ds)
+        else:
+            print("[clamp] Precipitation clamp disabled by CLAMP_PR_NONNEGATIVE=False")
 
         prediction_ds.attrs.update(template_attrs)
         prediction_output_path = output_root / prediction_output_stub

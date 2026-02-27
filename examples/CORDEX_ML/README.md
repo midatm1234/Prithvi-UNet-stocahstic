@@ -123,6 +123,17 @@ Domain-specific notebooks expect predictors/targets to follow the CORDEX-ML benc
 - The resulting NetCDF inherits the predictor time metadata verbatim, so e.g. `ACCESS-CM2_1981-2000_regridded.nc` yields a 1981–2000 `time` axis rather than reusing the training (1961–1980) window.
 - The notebook logs the detected start/end times to make it obvious which forcing period produced a set of predictions.
 
+## Inference Safety Defaults
+- All `*_downscaling_inference_*` scripts now automatically repair invalid predictor values (`NaN`, `inf`, and `_FillValue`/`missing_value`) by nearest-valid replacement in lat/lon space before dataloader normalization.
+- All `*_downscaling_inference_*` scripts now automatically clamp precipitation output to nonnegative values (`pr >= 0`) before writing NetCDF outputs.
+- The same default behavior is enabled in `*_downscaling_inference_*.ipynb` notebooks.
+- Two toggles are available in inference entrypoints (default `True`):
+  - `REPAIR_INVALID_INPUTS`
+  - `CLAMP_PR_NONNEGATIVE`
+- Inference runs print diagnostics for:
+  - Invalid predictor counts before/after repair (per predictor variable).
+  - Negative precipitation counts and minimum values before/after clamping.
+
 ## Model Information
 
 ### Foundation Model
