@@ -393,7 +393,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             )  # [batch, embed, lat//patch_size, lon//patch_size] -> [batch, global seq, local seq, embed]
 
             if self.backbone_gradient_checkpointing and self.training:
-                x_deep_feats = checkpoint(self.backbone, x_tokens)
+                x_deep_feats = checkpoint(self.backbone, x_tokens, use_reentrant=False)
             else:
                 x_deep_feats = self.backbone(x_tokens)  # [batch, global seq, local seq, embed]
     

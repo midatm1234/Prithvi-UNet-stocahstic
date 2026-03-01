@@ -10,13 +10,32 @@ from PrithviWxC.model import PrithviWxCEncoderDecoder
 
 
 
+def _resolve_scaler_device(config: ExperimentConfig) -> torch.device:
+    requested = getattr(config, "scalers_device", None)
+    if requested is None:
+        requested = getattr(getattr(config, "model", object()), "scalers_device", None)
+
+    # Default to CPU to avoid early CUDA allocations during model construction.
+    if requested is None:
+        return torch.device("cpu")
+
+    try:
+        device = torch.device(str(requested))
+    except (RuntimeError, TypeError, ValueError):
+        return torch.device("cpu")
+
+    if device.type == "cuda" and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return device
+
+
 def get_scalers(config: ExperimentConfig):
     """
     calls assemble scalers func. 
     """    
 
-    # Input and target scalers
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Keep scalers on CPU by default; they move with model.to(device) later.
+    device = _resolve_scaler_device(config)
 
     if config.data.type == 'eccc':
         input_mu = torch.load(config.model.input_mu, map_location=device, weights_only=False)
@@ -30,9 +49,11 @@ def get_scalers(config: ExperimentConfig):
     elif config.data.type == 'cordex':
         def load_array(path: str) -> torch.Tensor:
             array = np.load(path)
-            tensor = torch.from_numpy(array).to(device)
+            tensor = torch.from_numpy(array)
             if tensor.dtype != torch.float32:
                 tensor = tensor.float()
+            if tensor.device != device:
+                tensor = tensor.to(device)
             return tensor
 
         input_mu_full = load_array(config.model.input_mu)

@@ -68,7 +68,8 @@ def validate_one_epoch(
             desc="Validation Epoch",
         )
 
-    with torch.no_grad():
+    # Inference mode further reduces autograd metadata/memory compared to no_grad.
+    with torch.inference_mode():
         benchmark_timer, benchmark_timer_total = time(), time()
         for i, batch in enumerate(validation_loader):
             if 0 < limit_steps <= i:
@@ -325,6 +326,10 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
             num_epochs=config.num_epochs,
         )
 
+        # Free cached training allocations before validation to reduce fragmentation/OOM risk.
+        if use_gpu and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         curr_val_loss, _ = validate_one_epoch(
             model=model,
             local_rank=local_rank,
@@ -334,6 +339,9 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
             gpu=use_gpu,
             limit_steps=config.limit_steps_valid,
         )
+
+        if use_gpu and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         train_loss.append(curr_train_loss.tolist())
         val_loss.append(curr_val_loss.tolist())

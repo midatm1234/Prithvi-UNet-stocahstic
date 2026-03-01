@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# NZ_T1_ACCESS-CM2_static
+python compute_scalars_cordex.py \
+  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980.nc \
+  --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc \
+  --use-static \
+  --orography-file /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc \
+  --output-dir ./experiments/NZ_T1_ACCESS-CM2_static_scalars
+
+python preproc_cordex.py \
+  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980.nc \
+  --target-sample /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc \
+  --orography-file /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc \
+  --output-dir /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors \
+  --input-vars u v q t z \
+  --input-levels 850 700 500 \
+  --regrid-method bilinear
+
+# NZ_T1_ACCESS-CM2_no_static
+python compute_scalars_cordex.py \
+  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980.nc \
+  --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc \
+  --no-static \
+  --output-dir ./experiments/NZ_T1_ACCESS-CM2_no_static_scalars
+
+# NZ_T2_ACCESS-CM2_static
+python compute_scalars_cordex.py \
+  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099.nc \
+  --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc \
+  --use-static \
+  --orography-file /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/Emulator_hist_future/predictors/Static_fields.nc \
+  --output-dir ./experiments/NZ_T2_ACCESS-CM2_static_scalars
+
+python preproc_cordex.py \
+  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099.nc \
+  --target-sample /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc \
+  --orography-file /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/Emulator_hist_future/predictors/Static_fields.nc \
+  --output-dir /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/Emulator_hist_future/predictors \
+  --input-vars u v q t z \
+  --input-levels 850 700 500 \
+  --regrid-method bilinear
+
+# NZ_T2_ACCESS-CM2_no_static
+python compute_scalars_cordex.py \
+  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099.nc \
+  --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc \
+  --no-static \
+  --output-dir ./experiments/NZ_T2_ACCESS-CM2_no_static_scalars

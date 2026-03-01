@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import sys
+import subprocess
+import socket
 from pathlib import Path
 from typing import Iterable, Sequence, Tuple
 
@@ -23,7 +26,20 @@ from functools import partial
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
 from cordex_dataset import CordexDownscaleDataset
-from granitewxc.models.loss import rmse_loss
+
+# Notebook workflows execute from examples/CORDEX_ML, so ensure local package
+# imports resolve to this repository instead of an older site-packages install.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from granitewxc.models.loss import rmse_loss
+except ModuleNotFoundError:
+    # Fallback for environments where the installed granitewxc package
+    # does not expose granitewxc.models.loss.
+    def rmse_loss(y_hat: torch.Tensor, y: dict[torch.Tensor]) -> torch.Tensor:
+        return torch.sqrt(torch.mean((y_hat - y["y"]) ** 2))
 from granitewxc.models.model import get_finetune_model_UNET
 from granitewxc.utils.config import ExperimentConfig
 from granitewxc.utils.distributed import init_ddp
@@ -31,7 +47,18 @@ from granitewxc.utils.trainer import train_model
 from torch.multiprocessing.spawn import ProcessRaisedException, ProcessExitedException
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+def _ensure_expandable_cuda_segments() -> None:
+    """Request expandable CUDA allocator segments to reduce fragmentation OOMs."""
+    desired = "expandable_segments:True"
+    current = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "").strip()
+    if not current:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = desired
+        return
+
+    entries = [item.strip() for item in current.split(",") if item.strip()]
+    keys = {item.split(":", 1)[0].strip().lower() for item in entries if ":" in item}
+    if "expandable_segments" not in keys:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = f"{current},{desired}"
 
 
 def _should_use_gpu(config: ExperimentConfig) -> bool:
@@ -45,6 +72,68 @@ def _should_use_gpu(config: ExperimentConfig) -> bool:
                 raise RuntimeError("device_target set to 'cuda' but no CUDA device is available.")
             return True
     return torch.cuda.is_available()
+
+
+def _query_gpu_stats() -> list[dict[str, int]]:
+    """Return GPU stats from nvidia-smi (indices are original physical IDs)."""
+    query = "index,memory.total,memory.used,utilization.gpu"
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+            text=True,
+        )
+    except Exception:
+        return []
+
+    stats: list[dict[str, int]] = []
+    for raw in out.strip().splitlines():
+        if not raw.strip():
+            continue
+        idx_str, total_str, used_str, util_str = [part.strip() for part in raw.split(",")]
+        util_digits = "".join(ch for ch in util_str if ch.isdigit())
+        total_mb = int(total_str)
+        used_mb = int(used_str)
+        util = int(util_digits) if util_digits else 100
+        stats.append(
+            {
+                "index": int(idx_str),
+                "total_mb": total_mb,
+                "used_mb": used_mb,
+                "free_mb": max(total_mb - used_mb, 0),
+                "util": util,
+            }
+        )
+    return stats
+
+
+def _single_gpu_retry_order() -> list[int]:
+    """
+    Return physical GPU IDs in retry order: current visible GPU first, then most idle.
+    """
+    stats = _query_gpu_stats()
+    if not stats:
+        return [0]
+
+    current_ids = []
+    current_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if current_visible:
+        current_ids = [int(part.strip()) for part in current_visible.split(",") if part.strip()]
+    current_id = current_ids[0] if current_ids else stats[0]["index"]
+
+    ranked = sorted(stats, key=lambda g: (-g["free_mb"], g["util"], g["used_mb"], g["index"]))
+    others = [g["index"] for g in ranked if g["index"] != current_id]
+    return [current_id, *others]
+
+
+def _pick_free_master_port() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return str(sock.getsockname()[1])
+
+
+def _is_addr_in_use_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "eaddrinuse" in text or "address already in use" in text
 
 
 def _resolve_paths(paths: Iterable[str]) -> list[str]:
@@ -205,14 +294,32 @@ def build_dataloader(
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
         shuffle = False
 
-    return DataLoader(
-        dataset,
+    num_workers = int(getattr(config, "dl_num_workers", 0))
+    # Pinning can trigger CUDA allocator pressure for large CORDEX tensors when
+    # using worker processes. Keep it opt-in for multi-worker loaders.
+    default_pin_memory = bool(use_gpu and num_workers == 0)
+    pin_memory = bool(
+        getattr(
+            config,
+            "dl_pin_memory",
+            getattr(config, "pin_memory", default_pin_memory),
+        )
+    )
+
+    loader_kwargs = dict(
+        dataset=dataset,
         batch_size=config.batch_size,
         shuffle=shuffle,
         sampler=sampler,
-        num_workers=config.dl_num_workers,
-        pin_memory=use_gpu,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
+    if num_workers > 0:
+        prefetch_factor = int(getattr(config, "dl_prefetch_size", 0) or 0)
+        if prefetch_factor > 0:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+
+    return DataLoader(**loader_kwargs)
 
 
 def get_dataloaders(
@@ -288,6 +395,9 @@ def load_pretrained_weights(model: torch.nn.Module, weights_path: str) -> Tuple[
 def create_finetune_model(config: ExperimentConfig, verbose: bool = True) -> torch.nn.Module:
     if not hasattr(config.data, "input_static_surface_vars"):
         config.data.input_static_surface_vars = []
+    target = str(getattr(config, "device_target", "") or "").lower()
+    if target != "cpu" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     model = get_finetune_model_UNET(config)
     loaded, skipped = load_pretrained_weights(model, _resolve_path(config.path_model_weights))
     if verbose:
@@ -363,6 +473,7 @@ def _distributed_worker(rank: int, world_size: int, config: ExperimentConfig, sa
 
 
 def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_every: int = 5):
+    _ensure_expandable_cuda_segments()
     use_gpu = _should_use_gpu(config)
 
     if num_gpus is None:
@@ -371,13 +482,13 @@ def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_eve
         num_gpus = min(num_gpus, torch.cuda.device_count() if use_gpu else 0)
     num_gpus = max(1, num_gpus)
 
-    if (not use_gpu) or num_gpus == 1:
-        device = torch.device("cuda", 0) if use_gpu else torch.device("cpu")
-        train_loader, val_loader = get_dataloaders(config, use_gpu=use_gpu, rank=0, world_size=1)
+    if not use_gpu:
+        device = torch.device("cpu")
+        train_loader, val_loader = get_dataloaders(config, use_gpu=False, rank=0, world_size=1)
         model = create_finetune_model(config).to(device)
         _configure_skip_offload(model, config)
         optimizer, scaler, scheduler = build_optimizer_scheduler(
-            config, model, len(train_loader), use_gpu=use_gpu
+            config, model, len(train_loader), use_gpu=False
         )
         train_losses, val_losses = train_model(
             config,
@@ -388,14 +499,73 @@ def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_eve
             scheduler,
             scaler,
             local_rank=0,
-            use_gpu=use_gpu,
+            use_gpu=False,
             save_every=save_every,
             loss_func=rmse_loss,
         )
         return train_losses, val_losses
 
+    if num_gpus == 1:
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        mp.set_start_method("spawn", force=True)
+
+        tried: list[int] = []
+        oom_errors: list[str] = []
+        for gpu_id in _single_gpu_retry_order():
+            if gpu_id in tried:
+                continue
+            tried.append(gpu_id)
+            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            print(f"Single-GPU attempt on physical GPU {gpu_id}.")
+
+            manager = mp.Manager()
+            return_dict = manager.dict()
+            torch.cuda.empty_cache()
+            try:
+                for attempt in range(5):
+                    os.environ["MASTER_PORT"] = _pick_free_master_port()
+                    try:
+                        mp.spawn(
+                            _distributed_worker,
+                            args=(1, config, save_every, return_dict),
+                            nprocs=1,
+                            join=True,
+                        )
+                        break
+                    except ProcessRaisedException as exc:
+                        if attempt < 4 and _is_addr_in_use_error(exc):
+                            print(
+                                "DDP rendezvous port collision detected; "
+                                f"retrying with a new port (attempt {attempt + 2}/5)."
+                            )
+                            continue
+                        raise
+                return return_dict.get("train_losses"), return_dict.get("val_losses")
+            except ProcessRaisedException as exc:
+                message = str(exc).lower()
+                if "out of memory" in message or "cuda oom" in message:
+                    oom_errors.append(str(exc))
+                    print(
+                        f"CUDA OOM on physical GPU {gpu_id}; "
+                        "retrying on a different idle GPU if available."
+                    )
+                    continue
+                raise
+            except ProcessExitedException as exc:
+                print(
+                    f"Single-GPU run on physical GPU {gpu_id} exited unexpectedly ({exc}); "
+                    "trying another idle GPU if available."
+                )
+                continue
+
+        if oom_errors:
+            raise RuntimeError(
+                "Single-GPU training encountered CUDA OOM on all available GPU candidates."
+            )
+        raise RuntimeError("Single-GPU training failed on all available GPU candidates.")
+
     os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "2468")
 
     mp.set_start_method("spawn", force=True)
     manager = mp.Manager()
@@ -404,12 +574,24 @@ def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_eve
     torch.cuda.empty_cache()
 
     try:
-        mp.spawn(
-            _distributed_worker,
-            args=(num_gpus, config, save_every, return_dict),
-            nprocs=num_gpus,
-            join=True,
-        )
+        for attempt in range(5):
+            os.environ["MASTER_PORT"] = _pick_free_master_port()
+            try:
+                mp.spawn(
+                    _distributed_worker,
+                    args=(num_gpus, config, save_every, return_dict),
+                    nprocs=num_gpus,
+                    join=True,
+                )
+                break
+            except ProcessRaisedException as exc:
+                if attempt < 4 and _is_addr_in_use_error(exc):
+                    print(
+                        "DDP rendezvous port collision detected; "
+                        f"retrying with a new port (attempt {attempt + 2}/5)."
+                    )
+                    continue
+                raise
     except ProcessRaisedException as exc:
         message = str(exc).lower()
         if "out of memory" in message and num_gpus > 1:
