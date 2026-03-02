@@ -46,8 +46,8 @@ predictands:
       method: softplus
     scaling:
       method: divide_only
-      scale_stat: p95
-      fixed_scale: null
+      scale_stat: fixed
+      fixed_scale: 100.0
   tasmax:
     name: tasmax
     allow_negative_value: false
