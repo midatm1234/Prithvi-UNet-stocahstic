@@ -10,7 +10,7 @@ This folder hosts the CORDEX-ML benchmark workflows for multiple regional domain
 - **Setup**: Download the needed predictor/target tiles for your region of interest plus `Static_fields.nc`, then update the YAML/config paths (e.g., `ALPS_T1_*.yaml`, `NZ_T1_*.yaml`, `SA_T1_*.yaml`) to match your local layout.
 
 ### End-to-end workflow (explicit files)
-1. **Normalization (compute_scalars.py)** – Run `compute_scalars.py` (this repo: `compute_scalars_cordex.py`) to compute predictors/targets mean and std for `{Region}`.
+1. **Normalization (compute_scalars.py)** – Run `compute_scalars.py` (this repo: `compute_scalars_cordex.py`) to compute predictor stats plus per-predictand target scalars for `{Region}` (for example, `zscore` mean/std for `tasmax`, and `divide_only` scale for `pr`).
 2. **Regridding (preproc_cordex.py)** – Use `preproc_cordex.py` to regrid coarse `{Region}` predictors; `*_wrapper` scripts regrid multiple predictor files to the target high-res grids in batch.
 3. **Prepare YAML configs** – Create `{Region}_T1` (or `{Region}_T2`) config files:
   - `{Region}_T1(or T2)_{ModelName}_{static|no_static}.yaml`
@@ -89,6 +89,7 @@ python examples/CORDEX_ML/compute_scalars_cordex.py \
 
 # For no-static scalars, drop orography and use a separate output dir:
 # python examples/CORDEX_ML/compute_scalars_cordex.py \
+#   --config ./examples/CORDEX_ML/NZ_T1_ACCESS-CM2_no_static.yaml \
 #   --predictor-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/*_regridded.nc \
 #   --target-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_*.nc \
 #   --no-static \
@@ -102,6 +103,8 @@ jupyter lab examples/CORDEX_ML/notebooks/NZ_downscaling_inference.ipynb
 # For ALPS or SA domains, similarly use ALPS_downscaling_*.ipynb or SA_downscaling_*.ipynb
 ```
 > Tip: set `distributed_strategy: fsdp` in the YAML when fine-tuning on multiple GPUs; switch `device_target: cpu` when only CPUs are available.
+> Tip: use the provided wrapper scripts (`examples/CORDEX_ML/ALPS_preprocess`, `NZ_preprocess`, `SA_preprocess`) for batch pre-processing and scalar generation; they now pass `--config` to `compute_scalars_cordex.py` automatically.
+> Tip: if scalar logs print `[predictands] no --config provided; using defaults (pr -> divide_only + p95, others -> zscore)`, your run is not using the intended YAML predictand settings.
 
 ## I/O Variables
 - **Predictor channels**: CORDEX coarse atmospheric fields referenced in the domain-specific YAML config files (`u`, `v`, `q`, `t`, `z` across multiple pressure levels) plus static orography.
@@ -132,6 +135,7 @@ Domain-specific notebooks expect predictors/targets to follow the CORDEX-ML benc
 - Inference runs print diagnostics for:
   - Invalid predictor counts before/after repair (per predictor variable).
   - Non-negativity checks (min/max) for predictands with `nonnegativity.enabled: true`.
+  - A failed non-negativity assertion now indicates a configuration/decoding bug (rather than being silently clipped).
 
 ## Tasmax Quantization Note
 - **Root cause found**: inference was using CUDA autocast (`fp16/bf16`) by default and writing outputs without explicit float encoding. For `tasmax` near ~280–320 K, half precision introduces coarse increments that can appear as histogram spikes.
@@ -254,11 +258,12 @@ The model accepts multi-level atmospheric predictors from CORDEX regional climat
 
 ### Normalization Scheme
 Target scaling is now configured per predictand in YAML:
-- `pr` defaults: `allow_negative_value: false`, `nonnegativity.enabled: true`, `nonnegativity.method: softplus`, `scaling.method: divide_only`, `scale_stat: p95`.
+- `pr` defaults in example CORDEX YAMLs: `allow_negative_value: false`, `nonnegativity.enabled: true`, `nonnegativity.method: softplus`, `scaling.method: divide_only`, `scale_stat: fixed`, `fixed_scale: 100.0`.
 - `tasmax` defaults: `allow_negative_value: false`, `nonnegativity.enabled: false`, `scaling.method: zscore`.
 - `divide_only` means no centering (`target_mu=0`) and scale-only inverse (`y = y_scaled * scale`), which preserves non-negativity when combined with a positive link.
 - `zscore` keeps the usual inverse (`y = y_scaled * std + mean`).
 - Inputs remain channel-wise standardized with pre-computed `input_mu` and `input_sigma`.
+- If you change predictand scaling/nonnegativity settings in YAML, recompute scalars and then rerun fine-tuning before inference.
 
 ### `allow_negative_value` Semantics
 - `allow_negative_value: false` is the default for every predictand.
@@ -367,6 +372,7 @@ Different global or regional climate models provide the coarse predictors (e.g.,
 When extending this workflow to new regions or datasets:
 1. Ensure predictors and targets are co-located and temporally aligned
 2. Compute and store normalization scalars using `compute_scalars_cordex.py`
+   - Always pass `--config <your_yaml>` (or run one of the `*_preprocess` wrappers, which already pass it).
 3. Create domain-specific YAML configs with correct file paths and variable names
 4. Verify that `input_vars`, `input_levels`, `output_vars`, and `static_path` match your data
 5. Optionally adjust `batch_size`, `num_epochs`, `learning_rate`, and step limits based on GPU memory and desired iteration speed
