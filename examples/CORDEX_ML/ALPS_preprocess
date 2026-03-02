@@ -6,6 +6,7 @@ cd "$SCRIPT_DIR"
 
 # ALPS_T1_CNRM-CM5_static
 python compute_scalars_cordex.py \
+  --config ./ALPS_T1_CNRM-CM5_static.yaml \
   --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/ESD_pseudo_reality/predictors/CNRM-CM5_1961-1980.nc \
   --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/ESD_pseudo_reality/target/pr_tasmax_CNRM-CM5_1961-1980.nc \
   --use-static \
@@ -23,6 +24,7 @@ python preproc_cordex.py \
 
 # ALPS_T1_CNRM-CM5_no_static
 python compute_scalars_cordex.py \
+  --config ./ALPS_T1_CNRM-CM5_no_static.yaml \
   --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/ESD_pseudo_reality/predictors/CNRM-CM5_1961-1980.nc \
   --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/ESD_pseudo_reality/target/pr_tasmax_CNRM-CM5_1961-1980.nc \
   --no-static \
@@ -30,6 +32,7 @@ python compute_scalars_cordex.py \
 
 # ALPS_T2_CNRM-CM5_static
 python compute_scalars_cordex.py \
+  --config ./ALPS_T2_CNRM-CM5_static.yaml \
   --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/Emulator_hist_future/predictors/CNRM-CM5_1961-1980_2080-2099.nc \
   --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/Emulator_hist_future/target/pr_tasmax_CNRM-CM5_1961-1980_2080-2099.nc \
   --use-static \
@@ -47,6 +50,7 @@ python preproc_cordex.py \
 
 # ALPS_T2_CNRM-CM5_no_static
 python compute_scalars_cordex.py \
+  --config ./ALPS_T2_CNRM-CM5_no_static.yaml \
   --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/Emulator_hist_future/predictors/CNRM-CM5_1961-1980_2080-2099.nc \
   --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/Emulator_hist_future/target/pr_tasmax_CNRM-CM5_1961-1980_2080-2099.nc \
   --no-static \
