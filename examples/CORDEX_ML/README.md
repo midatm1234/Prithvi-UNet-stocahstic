@@ -80,6 +80,7 @@ python examples/CORDEX_ML/preproc_cordex.py \
 
 # Compute normalization scalars for tasmax/pr fine-tuning (static/orography included)
 python examples/CORDEX_ML/compute_scalars_cordex.py \
+  --config ./examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static.yaml \
   --predictor-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/*_regridded.nc \
   --target-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_*.nc \
   --use-static \
@@ -125,14 +126,80 @@ Domain-specific notebooks expect predictors/targets to follow the CORDEX-ML benc
 
 ## Inference Safety Defaults
 - All `*_downscaling_inference_*` scripts now automatically repair invalid predictor values (`NaN`, `inf`, and `_FillValue`/`missing_value`) by nearest-valid replacement in lat/lon space before dataloader normalization.
-- All `*_downscaling_inference_*` scripts now automatically clamp precipitation output to nonnegative values (`pr >= 0`) before writing NetCDF outputs.
-- The same default behavior is enabled in `*_downscaling_inference_*.ipynb` notebooks.
-- Two toggles are available in inference entrypoints (default `True`):
-  - `REPAIR_INVALID_INPUTS`
-  - `CLAMP_PR_NONNEGATIVE`
+- `pr` non-negativity is now enforced by model decoding (`softplus` + divide-only scaling) when configured via YAML `predictands.pr`.
+- No clamp-based precipitation post-processing is required.
+- The same behavior is enabled in `*_downscaling_inference_*.ipynb` notebooks.
 - Inference runs print diagnostics for:
   - Invalid predictor counts before/after repair (per predictor variable).
-  - Negative precipitation counts and minimum values before/after clamping.
+  - Non-negativity checks (min/max) for predictands with `nonnegativity.enabled: true`.
+
+## Tasmax Quantization Note
+- **Root cause found**: inference was using CUDA autocast (`fp16/bf16`) by default and writing outputs without explicit float encoding. For `tasmax` near ~280–320 K, half precision introduces coarse increments that can appear as histogram spikes.
+- **What changed**:
+  - Added stage diagnostics in all `*_downscaling_inference_*.py` scripts for:
+    - raw predictors (pre-normalization)
+    - normalized predictors (fed to model)
+    - model outputs before inverse scaling (reconstructed)
+    - inverse-transformed outputs (`pr`, `tasmax`)
+  - Added quantization detector (`5` timesteps × `20x20` spatial subset), compact stats table printing, and per-run diagnostics JSON export.
+  - Added distribution plot export (`target`, `predicted`, `predicted pre-inverse`) with histograms and Q-Q plots for `tasmax` and `pr`.
+  - Set inference defaults to keep output continuous:
+    - `ENABLE_MIXED_PRECISION = False`
+    - `FORCE_OUTPUT_FLOAT32 = True`
+    - NetCDF write encoding uses explicit floating point dtype (`float32`) and no integer packing.
+- **How to verify**:
+  1. Run one inference script with `NUM_RUNS = 1` (or a single small split/file).
+  2. Check printed diagnostic table in the script/notebook output (`approx_min_nonzero_step` and `approx_unique_count`).
+  3. Inspect generated artifacts next to the prediction file:
+     - `*.diagnostics.json`
+     - `*.distribution.png`
+  4. Confirm `tasmax` `approx_min_nonzero_step` is no longer close to fixed coarse steps (`0.25`, `0.5`, `1.0`) unless the model itself truly learns discrete modes.
+
+### Notebook Cell (Distribution Check)
+```python
+import json
+import pickle
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+import xarray as xr
+
+diag_path = Path(".../Predictions_pr_tasmax_*.diagnostics.json")
+pred_path = Path(".../Predictions_pr_tasmax_*.nc")
+pred_pre_inverse_path = Path(".../Predictions_pr_tasmax_*.pre_inverse.pkl")
+
+diag = json.loads(diag_path.read_text())
+print(json.dumps(diag["quantization_detector"]["inverse_outputs"]["tasmax"], indent=2))
+
+with open(pred_pre_inverse_path, "rb") as f:
+    pred_pre_inverse = pickle.load(f)  # shape: [time, channel, lat, lon]
+
+ds_pred = xr.open_dataset(pred_path)
+target_path = Path(diag["target_template_paths"][0])
+ds_target = xr.open_dataset(target_path)
+
+pred_tasmax = ds_pred["tasmax"].values.ravel()
+pred_tasmax_raw = pred_pre_inverse[:, 1].ravel()  # assumes [pr, tasmax]
+n_time = ds_pred.sizes["time"]
+tgt_tasmax = ds_target["tasmax"].isel(time=slice(0, n_time)).values.ravel()
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].hist(tgt_tasmax, bins=100, alpha=0.4, density=True, label="target tasmax")
+axes[0].hist(pred_tasmax, bins=100, alpha=0.4, density=True, label="pred tasmax")
+axes[0].hist(pred_tasmax_raw, bins=100, alpha=0.3, density=True, label="pred tasmax (pre-inverse)")
+axes[0].legend()
+axes[0].set_title("tasmax distribution")
+
+q = np.linspace(0.01, 0.99, 199)
+axes[1].scatter(np.quantile(tgt_tasmax, q), np.quantile(pred_tasmax, q), s=6, alpha=0.5)
+mn = min(tgt_tasmax.min(), pred_tasmax.min())
+mx = max(tgt_tasmax.max(), pred_tasmax.max())
+axes[1].plot([mn, mx], [mn, mx], "k--", lw=1)
+axes[1].set_title("tasmax Q-Q (pred vs target)")
+axes[1].set_xlabel("target quantiles")
+axes[1].set_ylabel("pred quantiles")
+plt.tight_layout()
+```
 
 ## Model Information
 
@@ -186,10 +253,17 @@ The model accepts multi-level atmospheric predictors from CORDEX regional climat
 - **Output shape**: 256×256 pixels per variable (2 channels total)
 
 ### Normalization Scheme
-The model uses channel-wise standardization with pre-computed statistics:
-- **Mean normalization** (`input_mu`, `target_mu`): Per-channel mean values computed on training data
-- **Standard deviation normalization** (`input_sigma`, `target_sigma`): Per-channel standard deviation values
-- **Normalization method**: `(x - mean) / (std + epsilon)` where epsilon is typically 1e-6
+Target scaling is now configured per predictand in YAML:
+- `pr` defaults: `allow_negative_value: false`, `nonnegativity.enabled: true`, `nonnegativity.method: softplus`, `scaling.method: divide_only`, `scale_stat: p95`.
+- `tasmax` defaults: `allow_negative_value: false`, `nonnegativity.enabled: false`, `scaling.method: zscore`.
+- `divide_only` means no centering (`target_mu=0`) and scale-only inverse (`y = y_scaled * scale`), which preserves non-negativity when combined with a positive link.
+- `zscore` keeps the usual inverse (`y = y_scaled * std + mean`).
+- Inputs remain channel-wise standardized with pre-computed `input_mu` and `input_sigma`.
+
+### `allow_negative_value` Semantics
+- `allow_negative_value: false` is the default for every predictand.
+- For physically non-negative predictands (at minimum `pr`), `allow_negative_value: false` enables nonnegative decoding by construction (`softplus` + divide-only scaling) unless explicitly overridden.
+- For temperature-like predictands (for example `tasmax` in degC), nonnegativity remains disabled by default even when `allow_negative_value: false`; this is intentional and logged as a warning.
 - **Scalars are computed separately** for static and dynamic inputs when applicable
 - Normalization files are stored as `.npy` arrays (NumPy format) with shape `[num_channels]`
 

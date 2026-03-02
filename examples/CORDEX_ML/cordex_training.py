@@ -42,6 +42,7 @@ except ModuleNotFoundError:
         return torch.sqrt(torch.mean((y_hat - y["y"]) ** 2))
 from granitewxc.models.model import get_finetune_model_UNET
 from granitewxc.utils.config import ExperimentConfig
+from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.distributed import init_ddp
 from granitewxc.utils.trainer import train_model
 from torch.multiprocessing.spawn import ProcessRaisedException, ProcessExitedException
@@ -395,6 +396,17 @@ def load_pretrained_weights(model: torch.nn.Module, weights_path: str) -> Tuple[
 def create_finetune_model(config: ExperimentConfig, verbose: bool = True) -> torch.nn.Module:
     if not hasattr(config.data, "input_static_surface_vars"):
         config.data.input_static_surface_vars = []
+    predictand_specs = build_predictand_specs(
+        config, output_vars=list(getattr(config.data, "output_vars", []))
+    )
+    if verbose:
+        print("[predictands] resolved training output configuration:")
+        for spec in predictand_specs:
+            print(
+                f"  - {spec.name}: allow_negative_value={spec.allow_negative_value}, "
+                f"nonnegativity=({spec.nonnegativity.enabled}, {spec.nonnegativity.method}), "
+                f"scaling=({spec.scaling.method}, {spec.scaling.scale_stat})"
+            )
     target = str(getattr(config, "device_target", "") or "").lower()
     if target != "cpu" and torch.cuda.is_available():
         torch.cuda.empty_cache()

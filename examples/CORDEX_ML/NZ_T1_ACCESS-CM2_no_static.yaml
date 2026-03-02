@@ -37,6 +37,28 @@ data:
     inputs_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/inputs_std.npy
     targets_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/targets_mean.npy
     targets_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/targets_std.npy
+predictands:
+  pr:
+    name: pr
+    allow_negative_value: false
+    nonnegativity:
+      enabled: true
+      method: softplus
+    scaling:
+      method: divide_only
+      scale_stat: p95
+      fixed_scale: null
+  tasmax:
+    name: tasmax
+    allow_negative_value: false
+    nonnegativity:
+      enabled: false
+      method: none
+    scaling:
+      method: zscore
+      scale_stat: mean
+      fixed_scale: null
+
 model:
   input_mu: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/inputs_mean.npy
   input_sigma: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/inputs_std.npy
@@ -63,7 +85,7 @@ model:
 job_id: cordex_nz_small
 type_training: full_dataset
 batch_size: 1
-num_epochs: 5
+num_epochs: 10
 dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 5.0e-05

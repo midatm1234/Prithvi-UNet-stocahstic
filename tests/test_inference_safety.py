@@ -12,8 +12,11 @@ PROJECT_DIR = REPO_ROOT / "examples" / "CORDEX_ML"
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
+from types import SimpleNamespace
+
+from granitewxc.utils.predictands import build_predictand_specs  # noqa: E402
 from utils.nearest_fill import repair_invalid_by_nearest_xr  # noqa: E402
-from utils.postprocess_outputs import enforce_pr_nonnegative_xr  # noqa: E402
+from utils.predictand_runtime import assert_nonnegative_outputs  # noqa: E402
 
 
 def test_repair_invalid_by_nearest_fills_nans_xr():
@@ -38,15 +41,24 @@ def test_repair_invalid_by_nearest_fills_nans_xr():
     assert not np.any(values == -9999.0)
 
 
-def test_enforce_pr_nonnegative_clamps_xr():
-    ds = xr.Dataset(
-        {
-            "pr": xr.DataArray(np.array([[[-1.5, 0.5], [2.0, -0.2]]], dtype=np.float32), dims=("time", "lat", "lon")),
-            "tasmax": xr.DataArray(np.array([[[280.0, 281.0], [282.0, 283.0]]], dtype=np.float32), dims=("time", "lat", "lon")),
-        }
+def test_nonnegative_assertion_for_predictands():
+    config = SimpleNamespace(
+        data=SimpleNamespace(output_vars=["pr", "tasmax"]),
+        predictands={},
     )
+    specs = {spec.name: spec for spec in build_predictand_specs(config, ["pr", "tasmax"])}
 
-    clamped = enforce_pr_nonnegative_xr(ds)
-    assert float(clamped["pr"].min()) >= 0.0
-    assert np.allclose(clamped["tasmax"].values, ds["tasmax"].values)
+    positive_outputs = {
+        "pr": np.array([[[0.0, 1.0], [2.0, 3.0]]], dtype=np.float32),
+        "tasmax": np.array([[[280.0, 281.0], [282.0, 283.0]]], dtype=np.float32),
+    }
+    assert_nonnegative_outputs(positive_outputs, specs, eps=1e-8)
 
+    negative_outputs = dict(positive_outputs)
+    negative_outputs["pr"] = np.array([[[-1e-2, 0.0], [1.0, 2.0]]], dtype=np.float32)
+    try:
+        assert_nonnegative_outputs(negative_outputs, specs, eps=1e-8)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("Expected assertion failure for negative pr outputs.")

@@ -8,6 +8,8 @@ from typing import Optional, Sequence
 
 from granitewxc.utils import distributed
 from granitewxc.utils.config import ExperimentConfig
+from granitewxc.utils.predictands import build_predictand_specs
+from granitewxc.utils.target_transforms import PositivePrecipLink
 from granitewxc.models.finetune_model import FinetuneWrapper
 
 
@@ -253,8 +255,115 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 out_channels=n_bins,
                 kernel_size=1,
             )
-            
-        
+        self._configure_predictand_decoding(config)
+
+    def _configure_predictand_decoding(self, config: ExperimentConfig | None) -> None:
+        n_outputs = int(self.output_scalers_sigma.shape[1])
+        output_vars = list(getattr(getattr(config, "data", None), "output_vars", []))
+        if len(output_vars) < n_outputs:
+            output_vars.extend(f"var_{idx}" for idx in range(len(output_vars), n_outputs))
+        else:
+            output_vars = output_vars[:n_outputs]
+
+        if config is not None:
+            specs = build_predictand_specs(config, output_vars=output_vars)
+        else:
+            specs = []
+        if not specs:
+            class _Spec:
+                def __init__(self, name: str):
+                    self.name = name
+                    self.scaling = type("Scaling", (), {"method": "zscore"})
+                    self.nonnegativity = type(
+                        "NonNeg", (), {"enabled": False, "method": "none"}
+                    )
+
+            specs = [_Spec(name) for name in output_vars]
+
+        scaling_codes = []
+        nonneg_enabled = []
+        nonneg_codes = []
+        scaling_to_code = {"zscore": 0, "divide_only": 1, "log1p_zscore": 2}
+        nonneg_to_code = {"none": 0, "softplus": 1, "exp": 2}
+        for idx, spec in enumerate(specs):
+            scaling_method = spec.scaling.method
+            nonneg_method = spec.nonnegativity.method if spec.nonnegativity.enabled else "none"
+            scaling_codes.append(scaling_to_code[scaling_method])
+            nonneg_enabled.append(bool(spec.nonnegativity.enabled))
+            nonneg_codes.append(nonneg_to_code[nonneg_method])
+
+            if scaling_method == "divide_only" and hasattr(self, "output_scalers_mu"):
+                mu_val = float(self.output_scalers_mu[0, idx, 0, 0].item())
+                if abs(mu_val) > 1e-6:
+                    raise ValueError(
+                        f"predictands.{spec.name}.scaling.method=divide_only requires zero target_mu, "
+                        f"but loaded target_mu[{idx}]={mu_val:.6g}. Recompute scalers or use legacy config."
+                    )
+
+        self.output_var_names = output_vars
+        self.register_buffer(
+            "predictand_scaling_method_codes",
+            torch.tensor(scaling_codes, dtype=torch.int64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "predictand_nonneg_enabled_mask",
+            torch.tensor(nonneg_enabled, dtype=torch.bool),
+            persistent=False,
+        )
+        self.register_buffer(
+            "predictand_nonneg_method_codes",
+            torch.tensor(nonneg_codes, dtype=torch.int64),
+            persistent=False,
+        )
+        self._precip_softplus_link = PositivePrecipLink()
+
+    def _apply_output_constraints(self, raw_out: torch.Tensor) -> torch.Tensor:
+        if not bool(self.predictand_nonneg_enabled_mask.any().item()):
+            return raw_out
+
+        constrained = raw_out.clone()
+        indices = torch.nonzero(self.predictand_nonneg_enabled_mask, as_tuple=False).flatten()
+        for channel_idx in indices.tolist():
+            method_code = int(self.predictand_nonneg_method_codes[channel_idx].item())
+            if method_code == 1:
+                constrained[:, channel_idx, ...] = self._precip_softplus_link(
+                    constrained[:, channel_idx, ...]
+                )
+            elif method_code == 2:
+                constrained[:, channel_idx, ...] = torch.exp(
+                    constrained[:, channel_idx, ...]
+                )
+            else:
+                raise ValueError(
+                    f"Invalid nonnegativity method code {method_code} for channel {channel_idx}"
+                )
+        return constrained
+
+    def _decode_outputs(self, raw_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        constrained = self._apply_output_constraints(raw_out)
+        sigma = self.output_scalers_sigma.to(device=constrained.device, dtype=constrained.dtype)
+        if hasattr(self, "output_scalers_mu"):
+            mu = self.output_scalers_mu.to(device=constrained.device, dtype=constrained.dtype)
+        else:
+            mu = torch.zeros_like(sigma)
+        decoded = constrained * sigma + mu
+
+        method_codes = self.predictand_scaling_method_codes.to(device=constrained.device)
+        divide_mask = method_codes == 1
+        if bool(divide_mask.any().item()):
+            decoded[:, divide_mask, ...] = constrained[:, divide_mask, ...] * sigma[:, divide_mask, ...]
+
+        log1p_mask = method_codes == 2
+        if bool(log1p_mask.any().item()):
+            decoded[:, log1p_mask, ...] = torch.expm1(
+                constrained[:, log1p_mask, ...] * sigma[:, log1p_mask, ...]
+                + mu[:, log1p_mask, ...]
+            )
+
+        return decoded, constrained
+
+
     def _init_weights(self, m):
         if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=.02)
@@ -275,7 +384,12 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
 
     #@profile
-    def forward(self, batch: dict[str, torch.tensor]):
+    def forward(
+        self,
+        batch: dict[str, torch.tensor],
+        return_pre_inverse: bool = False,
+        return_raw_output: bool = False,
+    ):
         """
         Args:
             batch: Dictionary containing the keys 'x', 'y', and optional 'static_x'/'static_y'.
@@ -436,7 +550,8 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
         x = self.output_conv_block(out)
 
-        x_out = self.output_scalers_sigma * x + self.output_scalers_mu # [batch, 1, lat_high_res, lon_high_res]
+        raw_out = x
+        x_out, x_pre_inverse = self._decode_outputs(raw_out)
         expected_hw = batch["y"].shape[-2:]
         if x_out.shape[-2:] != expected_hw:
             x_out = F.interpolate(
@@ -445,7 +560,25 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 mode="bilinear",
                 align_corners=False,
             )
-        
+            x_pre_inverse = F.interpolate(
+                x_pre_inverse,
+                size=expected_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+            raw_out = F.interpolate(
+                raw_out,
+                size=expected_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        if return_pre_inverse and return_raw_output:
+            return x_out, x_pre_inverse, raw_out
+        if return_pre_inverse:
+            return x_out, x_pre_inverse
+        if return_raw_output:
+            return x_out, raw_out
         return x_out
 
     # ----------------------
@@ -512,6 +645,7 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
             residual: str = None,
             residual_connection: bool = False,
             backbone_use = True, 
+            config: ExperimentConfig | None = None,
         ):
         """ Climate Downscaling Model based on pre-trained backbone. 
         Args:
@@ -550,7 +684,12 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
         self.upscale = upscale
 
         self.backbone_use = backbone_use
-        self.use_static = bool(getattr(config.data, "use_static", getattr(config, "finetune_w_static", True)))
+        if config is not None:
+            self.use_static = bool(
+                getattr(config.data, "use_static", getattr(config, "finetune_w_static", True))
+            )
+        else:
+            self.use_static = True
 
         self.conv_after_backbone = nn.Conv2d(
             embed_dim_backbone, 
@@ -596,6 +735,114 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
                 out_channels=n_bins,
                 kernel_size=1,
             )
+        self._configure_predictand_decoding(config)
+
+    def _configure_predictand_decoding(self, config: ExperimentConfig | None) -> None:
+        n_outputs = int(self.output_scalers_sigma.shape[1])
+        output_vars = list(getattr(getattr(config, "data", None), "output_vars", []))
+        if len(output_vars) < n_outputs:
+            output_vars.extend(f"var_{idx}" for idx in range(len(output_vars), n_outputs))
+        else:
+            output_vars = output_vars[:n_outputs]
+
+        if config is not None:
+            specs = build_predictand_specs(config, output_vars=output_vars)
+        else:
+            specs = []
+        if not specs:
+            class _Spec:
+                def __init__(self, name: str):
+                    self.name = name
+                    self.scaling = type("Scaling", (), {"method": "zscore"})
+                    self.nonnegativity = type(
+                        "NonNeg", (), {"enabled": False, "method": "none"}
+                    )
+
+            specs = [_Spec(name) for name in output_vars]
+
+        scaling_codes = []
+        nonneg_enabled = []
+        nonneg_codes = []
+        scaling_to_code = {"zscore": 0, "divide_only": 1, "log1p_zscore": 2}
+        nonneg_to_code = {"none": 0, "softplus": 1, "exp": 2}
+        for idx, spec in enumerate(specs):
+            scaling_method = spec.scaling.method
+            nonneg_method = spec.nonnegativity.method if spec.nonnegativity.enabled else "none"
+            scaling_codes.append(scaling_to_code[scaling_method])
+            nonneg_enabled.append(bool(spec.nonnegativity.enabled))
+            nonneg_codes.append(nonneg_to_code[nonneg_method])
+
+            if scaling_method == "divide_only" and hasattr(self, "output_scalers_mu"):
+                mu_val = float(self.output_scalers_mu[0, idx, 0, 0].item())
+                if abs(mu_val) > 1e-6:
+                    raise ValueError(
+                        f"predictands.{spec.name}.scaling.method=divide_only requires zero target_mu, "
+                        f"but loaded target_mu[{idx}]={mu_val:.6g}. Recompute scalers or use legacy config."
+                    )
+
+        self.output_var_names = output_vars
+        self.register_buffer(
+            "predictand_scaling_method_codes",
+            torch.tensor(scaling_codes, dtype=torch.int64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "predictand_nonneg_enabled_mask",
+            torch.tensor(nonneg_enabled, dtype=torch.bool),
+            persistent=False,
+        )
+        self.register_buffer(
+            "predictand_nonneg_method_codes",
+            torch.tensor(nonneg_codes, dtype=torch.int64),
+            persistent=False,
+        )
+        self._precip_softplus_link = PositivePrecipLink()
+
+    def _apply_output_constraints(self, raw_out: torch.Tensor) -> torch.Tensor:
+        if not bool(self.predictand_nonneg_enabled_mask.any().item()):
+            return raw_out
+
+        constrained = raw_out.clone()
+        indices = torch.nonzero(self.predictand_nonneg_enabled_mask, as_tuple=False).flatten()
+        for channel_idx in indices.tolist():
+            method_code = int(self.predictand_nonneg_method_codes[channel_idx].item())
+            if method_code == 1:
+                constrained[:, channel_idx, ...] = self._precip_softplus_link(
+                    constrained[:, channel_idx, ...]
+                )
+            elif method_code == 2:
+                constrained[:, channel_idx, ...] = torch.exp(
+                    constrained[:, channel_idx, ...]
+                )
+            else:
+                raise ValueError(
+                    f"Invalid nonnegativity method code {method_code} for channel {channel_idx}"
+                )
+        return constrained
+
+    def _decode_outputs(self, raw_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        constrained = self._apply_output_constraints(raw_out)
+        sigma = self.output_scalers_sigma.to(device=constrained.device, dtype=constrained.dtype)
+        if hasattr(self, "output_scalers_mu"):
+            mu = self.output_scalers_mu.to(device=constrained.device, dtype=constrained.dtype)
+        else:
+            mu = torch.zeros_like(sigma)
+
+        decoded = constrained * sigma + mu
+
+        method_codes = self.predictand_scaling_method_codes.to(device=constrained.device)
+        divide_mask = method_codes == 1
+        if bool(divide_mask.any().item()):
+            decoded[:, divide_mask, ...] = constrained[:, divide_mask, ...] * sigma[:, divide_mask, ...]
+
+        log1p_mask = method_codes == 2
+        if bool(log1p_mask.any().item()):
+            decoded[:, log1p_mask, ...] = torch.expm1(
+                constrained[:, log1p_mask, ...] * sigma[:, log1p_mask, ...]
+                + mu[:, log1p_mask, ...]
+            )
+
+        return decoded, constrained
 
     def _expand_static(self, tensor: torch.Tensor, batch: dict[str, torch.tensor], H: int, W: int) -> torch.Tensor:
         return tensor.to(device=batch["x"].device, dtype=batch["x"].dtype).expand(
@@ -611,7 +858,12 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
         return  
 
     #@profile
-    def forward(self, batch: dict[str, torch.tensor]):
+    def forward(
+        self,
+        batch: dict[str, torch.tensor],
+        return_pre_inverse: bool = False,
+        return_raw_output: bool = False,
+    ):
         """
         Args:
             batch: Dictionary containing the keys 'x', 'y', and optional 'static_x'.
@@ -716,12 +968,21 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
             x = x_deep_feats
 
         x = self.head(x)  # [batch, out_channels, lat*scale[0]*scale[1], lon*scale[0]*scale[1]]
+        raw_out = x
 
         if self.return_logits:
             x_out = self.to_logits(x)
+            x_pre_inverse = x_out
         elif self.residual == 'climate':
             x_out = self.output_scalers_sigma * x + batch['climate_y']
+            x_pre_inverse = x
         else:
-            x_out = self.output_scalers_sigma * x + self.output_scalers_mu # [batch, 1, lat_high_res, lon_high_res]
-        
+            x_out, x_pre_inverse = self._decode_outputs(raw_out)
+
+        if return_pre_inverse and return_raw_output:
+            return x_out, x_pre_inverse, raw_out
+        if return_pre_inverse:
+            return x_out, x_pre_inverse
+        if return_raw_output:
+            return x_out, raw_out
         return x_out

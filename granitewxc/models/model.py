@@ -6,6 +6,7 @@ from granitewxc.utils.distributed import is_main_process
 from granitewxc.decoders.downscaling import ConvEncoderDecoder
 from granitewxc.models.finetune_model import PatchEmbed
 from granitewxc.models.cordex_finetune_model import ClimateDownscaleFinetuneUNETModel, ClimateDownscaleFinetuneModel
+from granitewxc.utils.predictands import build_predictand_specs
 from PrithviWxC.model import PrithviWxCEncoderDecoder
 
 
@@ -47,6 +48,8 @@ def get_scalers(config: ExperimentConfig):
         target_static_mu = torch.load(config.model.target_static_mu, map_location=device, weights_only=False)
         target_static_sigma = torch.load(config.model.target_static_sigma, map_location=device, weights_only=False)
     elif config.data.type == 'cordex':
+        specs = build_predictand_specs(config, output_vars=list(config.data.output_vars))
+
         def load_array(path: str) -> torch.Tensor:
             array = np.load(path)
             tensor = torch.from_numpy(array)
@@ -60,6 +63,20 @@ def get_scalers(config: ExperimentConfig):
         input_sigma_full = load_array(config.model.input_sigma)
         target_mu = load_array(config.model.target_mu)
         target_sigma = load_array(config.model.target_sigma)
+        if target_mu.numel() < len(specs) or target_sigma.numel() < len(specs):
+            raise ValueError(
+                "Loaded target scalers have fewer channels than config.data.output_vars. "
+                "Check scaler files and output_vars ordering."
+            )
+
+        for idx, spec in enumerate(specs):
+            if spec.scaling.method == "divide_only":
+                mu_value = float(target_mu[idx].item())
+                if abs(mu_value) > 1e-6:
+                    raise ValueError(
+                        f"predictands.{spec.name}.scaling.method='divide_only' requires "
+                        f"target_mu[{idx}] == 0, got {mu_value:.6g}. Recompute scalers."
+                    )
 
         static_channels = int(getattr(config.model, "num_static_channels", 1))
         # number of dynamic predictor channels (time * vars * levels)
@@ -331,7 +348,8 @@ def get_finetune_model(config: ExperimentConfig) -> torch.nn.Module:
         return_logits=config.model.__dict__.get('loss_type')=='cross_entropy',
         residual=config.model.__dict__.get('residual', None),
         residual_connection=config.model.__dict__.get('residual_connection', False),
-        backbone_use = config.backbone_use
+        backbone_use = config.backbone_use,
+        config=config,
     )
 
     if is_main_process():
