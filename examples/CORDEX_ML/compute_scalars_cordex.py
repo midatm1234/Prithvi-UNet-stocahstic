@@ -318,6 +318,13 @@ def main() -> None:
     args = parse_args()
 
     config, target_vars, target_specs = _resolve_config_and_predictands(args)
+    if args.config:
+        print(f"[predictands] using config: {os.path.abspath(args.config)}")
+    else:
+        print(
+            "[predictands] no --config provided; using defaults "
+            "(pr -> divide_only + p95, others -> zscore)."
+        )
 
     dtype = getattr(torch, args.dtype)
     if args.no_static:
