@@ -265,6 +265,26 @@ Target scaling is now configured per predictand in YAML:
 - Inputs remain channel-wise standardized with pre-computed `input_mu` and `input_sigma`.
 - If you change predictand scaling/nonnegativity settings in YAML, recompute scalars and then rerun fine-tuning before inference.
 
+### Softplus vs Zscore, and `scale_stat` choices
+`softplus` and `zscore` are not interchangeable knobs; they act at different steps:
+
+| Setting | What it does | Typical use |
+|---|---|---|
+| `nonnegativity.method: softplus` | Applies `softplus(raw_output)` in decoding, so decoded values are always `>= 0` before inverse scaling. | Physically non-negative predictands (for example `pr`). |
+| `scaling.method: zscore` | Scales target as `(y - mean) / std`; inverse is `y = y_scaled * std + mean`. This can produce negative values. | Temperature-like predictands (`tasmax`) and other approximately symmetric variables. |
+| `scaling.method: divide_only` | Scales as `y / scale` with `target_mu=0`; inverse is `y = y_scaled * scale`. With `softplus`, output stays non-negative by construction. | Precipitation (`pr`) when non-negativity is required. |
+
+For `divide_only`, `scale_stat` controls the scale magnitude:
+
+| `scale_stat` | Scale source | Effect on extremes |
+|---|---|---|
+| `fixed` | User-provided `fixed_scale` in YAML (for example `100.0`). | Most reproducible across runs/periods; preserves linear mapping and avoids dataset-dependent rescaling drift. |
+| `mean` | Mean precipitation over training targets. | Smallest typical scale; yields larger normalized values, which can make heavy events numerically larger in training. |
+| `p95` | 95th percentile of sampled training precipitation. | Larger scale than `mean`; moderate compression of normalized tail values. |
+| `p99` | 99th percentile of sampled training precipitation. | Larger scale than `p95`; strongest tail compression in normalized space and often the most conservative numerically. |
+
+All four `scale_stat` options still allow arbitrarily large physical precipitation after inverse scaling; they mainly change training/inference numeric conditioning in scaled space.
+
 ### `allow_negative_value` Semantics
 - `allow_negative_value: false` is the default for every predictand.
 - For physically non-negative predictands (at minimum `pr`), `allow_negative_value: false` enables nonnegative decoding by construction (`softplus` + divide-only scaling) unless explicitly overridden.

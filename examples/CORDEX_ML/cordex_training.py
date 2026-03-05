@@ -381,7 +381,17 @@ def load_pretrained_weights(model: torch.nn.Module, weights_path: str) -> Tuple[
 
     compatible = {}
     skipped = 0
+    scaler_key_parts = (
+        "input_scalers_",
+        "output_scalers_",
+        "static_input_scalers_",
+        "static_output_scalers_",
+    )
     for key, value in weights.items():
+        # Keep run-specific normalization tensors from the current config/scaler files.
+        if any(part in key for part in scaler_key_parts):
+            skipped += 1
+            continue
         target = model_state.get(key)
         if target is None or target.shape != value.shape:
             skipped += 1

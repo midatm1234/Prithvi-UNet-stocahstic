@@ -46,8 +46,8 @@ predictands:
       method: softplus
     scaling:
       method: divide_only
-      scale_stat: fixed
-      fixed_scale: 100.0
+      scale_stat: p95
+      fixed_scale: null
   tasmax:
     name: tasmax
     allow_negative_value: false
@@ -85,12 +85,12 @@ model:
 job_id: SA_T2_ACCESS-CM2_no_static
 type_training: full_dataset
 batch_size: 1
-num_epochs: 10
+num_epochs: 5
 dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 5.0e-05
-limit_steps_train: 200
-limit_steps_valid: 50
+limit_steps_train: 100000
+limit_steps_valid: 100
 min_lr: 1.0e-06
 max_lr: 1.0e-04
 warm_up_steps: 0

@@ -576,7 +576,28 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module]:
         prefix_len = len("module.")
         state_dict = state_dict.__class__((key[prefix_len:], value) for key, value in state_dict.items())
 
-    model.load_state_dict(state_dict, strict=True)
+    scaler_key_parts = (
+        "input_scalers_",
+        "output_scalers_",
+        "static_input_scalers_",
+        "static_output_scalers_",
+    )
+    state_dict = state_dict.__class__(
+        (key, value)
+        for key, value in state_dict.items()
+        if not any(part in key for part in scaler_key_parts)
+    )
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing = [
+        key
+        for key in incompatible.missing_keys
+        if not any(part in key for part in scaler_key_parts)
+    ]
+    if missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Checkpoint/model mismatch after filtering scaler tensors. "
+            f"missing={missing[:8]}, unexpected={incompatible.unexpected_keys[:8]}"
+        )
 
     return run_name, run_dir, checkpoint_path, config, model
 
