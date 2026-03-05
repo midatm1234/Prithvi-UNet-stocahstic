@@ -19,7 +19,8 @@ from o3_pipeline_utils import (
     load_pretrained_backbone,
     load_yaml_config,
     normalize_state_dict,
-    predictor_channel_order,
+    resolve_predictor_vars,
+    resolve_target_var_name,
     resolve_runtime_paths,
 )
 
@@ -28,7 +29,7 @@ DEFAULT_CONFIG_PATH = str((Path(__file__).resolve().parent / "o3_pipeline_config
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Fine-tune O3 next-step model on preprocessed MERRA2 pairs",
+        description="Fine-tune next-step chemistry model on preprocessed MERRA2 pairs",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
@@ -39,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--run-name",
         default=None,
-        help="Optional run name (default: o3_ft_<UTC timestamp>)",
+        help="Optional run name (default: chem_ft_<UTC timestamp>)",
     )
     return p.parse_args()
 
@@ -241,12 +242,6 @@ def main() -> None:
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    o3_name = str(data_cfg.get("o3_output_name", "O3_sfc"))
-    met_vars = list(data_cfg.get("met_vars", ["T", "U", "V", "PS"]))
-    met_suffix = str(data_cfg.get("met_suffix", "_sfc"))
-    predictor_vars = predictor_channel_order(o3_name=o3_name, met_vars=met_vars, met_suffix=met_suffix)
-    target_var = str(data_cfg.get("target_name", f"{o3_name}_target"))
-
     scaler_paths = resolve_scaler_paths(cfg, paths)
     eps = float(scalers_cfg.get("eps", 1e-6))
 
@@ -279,6 +274,14 @@ def main() -> None:
         raise FileNotFoundError(
             f"Missing train/val pairs files ({train_file}, {val_file}). Run preprocess_o3_pairs.py first."
         )
+
+    train_meta = xr.open_dataset(
+        train_file,
+        engine="h5netcdf" if train_file.suffix.lower() in {".nc", ".nc4"} else None,
+    )
+    predictor_vars = resolve_predictor_vars(data_cfg, dataset_attrs=train_meta.attrs)
+    target_var = str(train_meta.attrs.get("target_var", resolve_target_var_name(data_cfg)))
+    train_meta.close()
 
     batch_size = int(train_cfg.get("batch_size", 1))
     num_workers = int(train_cfg.get("num_workers", 0))
@@ -386,7 +389,7 @@ def main() -> None:
 
     run_name = args.run_name or str(train_cfg.get("run_name", "")).strip()
     if not run_name:
-        run_name = f"o3_ft_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+        run_name = f"chem_ft_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
 
     run_dir = paths["checkpoints_dir"] / run_name
     run_dir.mkdir(parents=True, exist_ok=True)

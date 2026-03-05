@@ -4,7 +4,7 @@ import glob
 import importlib.util
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -196,6 +196,68 @@ def extract_surface_3d(
     return da_sfc
 
 
+def apply_vertical_transform(
+    da: xr.DataArray,
+    *,
+    transform: str,
+    lev_dim_candidates: Sequence[str],
+) -> xr.DataArray:
+    mode = str(transform).strip().lower()
+    if mode in {"surface", "sfc"}:
+        if any(dim in da.dims for dim in lev_dim_candidates):
+            return extract_surface_3d(da, lev_dim_candidates=lev_dim_candidates)
+        return da
+    if mode in {"none", "identity", "keep"}:
+        return da
+    raise ValueError(f"Unsupported transform='{transform}'. Use one of: surface, none")
+
+
+def load_chem_fields(
+    *,
+    chem_root: Path,
+    chem_pattern: str,
+    field_specs: Sequence[Mapping[str, Any]],
+    start_time: str,
+    end_time: str,
+    delta_hours: int,
+    chunks: dict[str, int] | None,
+    lev_dim_candidates: Sequence[str],
+) -> xr.Dataset:
+    if not field_specs:
+        raise ValueError("field_specs must contain at least one chemistry field")
+
+    vars_to_keep: list[str] = []
+    for spec in field_specs:
+        raw = spec.get("var")
+        if raw is None:
+            raise KeyError(f"Chem field spec missing 'var': {spec}")
+        v = str(raw)
+        if v not in vars_to_keep:
+            vars_to_keep.append(v)
+
+    paths = resolve_paths(chem_root, chem_pattern)
+    ds = open_mfdataset_utc(
+        paths,
+        start_time=start_time,
+        end_time=end_time,
+        delta_hours=delta_hours,
+        chunks=chunks,
+        vars_to_keep=vars_to_keep,
+    )
+
+    out = xr.Dataset()
+    for spec in field_specs:
+        raw_var = str(spec.get("var"))
+        output_name = str(spec.get("output_name") or raw_var)
+        transform = str(spec.get("transform", "surface"))
+
+        da = ds[raw_var]
+        da = apply_vertical_transform(da, transform=transform, lev_dim_candidates=lev_dim_candidates).rename(output_name)
+        out[output_name] = da
+
+    return out
+
+
 def load_chem_surface(
     *,
     chem_root: Path,
@@ -208,17 +270,23 @@ def load_chem_surface(
     lev_dim_candidates: Sequence[str],
     output_name: str,
 ) -> xr.Dataset:
-    paths = resolve_paths(chem_root, chem_pattern)
-    ds = open_mfdataset_utc(
-        paths,
+    # Backward-compatible wrapper for legacy single-variable surface extraction.
+    return load_chem_fields(
+        chem_root=chem_root,
+        chem_pattern=chem_pattern,
+        field_specs=[
+            {
+                "var": chem_var,
+                "output_name": output_name,
+                "transform": "surface",
+            }
+        ],
         start_time=start_time,
         end_time=end_time,
         delta_hours=delta_hours,
         chunks=chunks,
-        vars_to_keep=[chem_var],
+        lev_dim_candidates=lev_dim_candidates,
     )
-    o3_sfc = extract_surface_3d(ds[chem_var], lev_dim_candidates=lev_dim_candidates).rename(output_name)
-    return xr.Dataset({output_name: o3_sfc})
 
 
 def load_met_surface(
@@ -255,20 +323,16 @@ def load_met_surface(
 
 def build_inputs_targets_3h(
     *,
-    ds_met_3h: xr.Dataset,
-    ds_chem_3h: xr.Dataset,
-    o3_name: str,
+    ds_predictors_3h: xr.Dataset,
+    target_3h: xr.DataArray,
     delta_hours: int,
 ) -> tuple[xr.Dataset, xr.DataArray, xr.DataArray]:
-    ds_predictors_3h = xr.merge([ds_chem_3h[[o3_name]], ds_met_3h])
-    o3_3h = ds_chem_3h[o3_name]
-
     if delta_hours < 1:
         raise ValueError("delta_hours must be >= 1")
 
     t_in = pd.DatetimeIndex(ds_predictors_3h.time.values)
     t_out = t_in + pd.Timedelta(hours=delta_hours)
-    t_target = pd.DatetimeIndex(o3_3h.time.values)
+    t_target = pd.DatetimeIndex(target_3h.time.values)
 
     valid = t_out.isin(t_target)
     if not valid.any():
@@ -281,16 +345,32 @@ def build_inputs_targets_3h(
     t_out_valid = t_out[valid]
 
     ds_predictors_3h = ds_predictors_3h.sel(time=t_in_valid)
-    o3_target_3h = o3_3h.sel(time=t_out_valid).assign_coords(time=t_in_valid)
+    target_shifted = target_3h.sel(time=t_out_valid).assign_coords(time=t_in_valid)
 
-    ds_predictors_3h, o3_target_3h = xr.align(ds_predictors_3h, o3_target_3h, join="inner")
+    ds_predictors_3h, target_shifted = xr.align(ds_predictors_3h, target_shifted, join="inner")
     time_out = xr.DataArray(
         t_out_valid.values.astype("datetime64[ns]"),
         dims=["time"],
         coords={"time": t_in_valid.values},
         name="time_out",
     )
-    return ds_predictors_3h, o3_target_3h, time_out
+    return ds_predictors_3h, target_shifted, time_out
+
+
+def build_inputs_targets_legacy_chem_met(
+    *,
+    ds_met_3h: xr.Dataset,
+    ds_chem_3h: xr.Dataset,
+    o3_name: str,
+    delta_hours: int,
+) -> tuple[xr.Dataset, xr.DataArray, xr.DataArray]:
+    # Backward-compatible wrapper for legacy O3+met pipeline assumptions.
+    ds_predictors_3h = xr.merge([ds_chem_3h[[o3_name]], ds_met_3h])
+    return build_inputs_targets_3h(
+        ds_predictors_3h=ds_predictors_3h,
+        target_3h=ds_chem_3h[o3_name],
+        delta_hours=delta_hours,
+    )
 
 
 def write_netcdf_robust(ds: xr.Dataset, out_path: Path) -> str:
@@ -331,8 +411,108 @@ def predictor_channel_order(o3_name: str, met_vars: Sequence[str], met_suffix: s
     return [o3_name] + [f"{v}{met_suffix}" for v in met_vars]
 
 
+def resolve_target_input_name(data_cfg: Mapping[str, Any]) -> str:
+    if data_cfg.get("target_input_name") is not None:
+        return str(data_cfg["target_input_name"])
+    if data_cfg.get("target_output_name") is not None:
+        return str(data_cfg["target_output_name"])
+    if data_cfg.get("o3_output_name") is not None:
+        return str(data_cfg["o3_output_name"])
+    return "O3_sfc"
+
+
+def resolve_target_var_name(data_cfg: Mapping[str, Any]) -> str:
+    target_input_name = resolve_target_input_name(data_cfg)
+    return str(data_cfg.get("target_name", f"{target_input_name}_target"))
+
+
+def infer_chem_predictor_output_names(data_cfg: Mapping[str, Any]) -> list[str]:
+    raw_specs = data_cfg.get("chem_predictors")
+    if raw_specs is None:
+        raw_specs = data_cfg.get("chem_predictor_vars", [])
+    if raw_specs is None:
+        raw_specs = []
+    if not isinstance(raw_specs, (list, tuple)):
+        raise TypeError("data.chem_predictors (or legacy data.chem_predictor_vars) must be a list")
+
+    default_transform = str(data_cfg.get("chem_predictor_transform", "surface")).strip().lower()
+    default_suffix = str(data_cfg.get("chem_predictor_suffix", "_sfc"))
+
+    out: list[str] = []
+    for item in raw_specs:
+        if isinstance(item, str):
+            var = item
+            transform = default_transform
+            if transform in {"surface", "sfc"} and default_suffix:
+                name = f"{var}{default_suffix}"
+            else:
+                name = var
+        elif isinstance(item, Mapping):
+            if "var" not in item:
+                raise KeyError(f"chem predictor spec missing 'var': {item}")
+            var = str(item["var"])
+            transform = str(item.get("transform", default_transform)).strip().lower()
+            name = item.get("output_name")
+            if name is None:
+                suffix = str(item.get("suffix", default_suffix if transform in {"surface", "sfc"} else ""))
+                name = f"{var}{suffix}" if suffix else var
+            name = str(name)
+        else:
+            raise TypeError(f"Unsupported chem predictor spec type: {type(item)}")
+        out.append(name)
+
+    return out
+
+
+def resolve_predictor_vars(
+    data_cfg: Mapping[str, Any],
+    *,
+    dataset_attrs: Mapping[str, Any] | None = None,
+) -> list[str]:
+    explicit = data_cfg.get("predictor_vars")
+    if explicit is not None:
+        if not isinstance(explicit, (list, tuple)):
+            raise TypeError("data.predictor_vars must be a list when provided")
+        return [str(v) for v in explicit]
+
+    if dataset_attrs is not None:
+        attrs_val = dataset_attrs.get("predictor_vars")
+        if attrs_val:
+            return [v for v in str(attrs_val).split(",") if v]
+
+    target_input_name = resolve_target_input_name(data_cfg)
+    include_target = bool(data_cfg.get("include_target_as_predictor", True))
+
+    chem_predictor_names_cfg = data_cfg.get("chem_predictor_output_names")
+    if chem_predictor_names_cfg is not None:
+        if not isinstance(chem_predictor_names_cfg, (list, tuple)):
+            raise TypeError("data.chem_predictor_output_names must be a list when provided")
+        chem_predictor_names = [str(v) for v in chem_predictor_names_cfg]
+    else:
+        chem_predictor_names = infer_chem_predictor_output_names(data_cfg)
+
+    met_vars = list(data_cfg.get("met_vars", ["T", "U", "V", "PS"]))
+    met_suffix = str(data_cfg.get("met_suffix", "_sfc"))
+    met_names = [f"{v}{met_suffix}" for v in met_vars]
+
+    out: list[str] = []
+    if include_target:
+        out.append(target_input_name)
+    out.extend(chem_predictor_names)
+    out.extend(met_names)
+
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for v in out:
+        if v not in seen:
+            unique.append(v)
+            seen.add(v)
+    return unique
+
+
 class O3Delta1Model(nn.Module):
-    """Prithvi-WxC encoder-decoder wrapper for next-step O3_sfc forecasting."""
+    """Prithvi-WxC encoder-decoder wrapper for single-channel next-step forecasting."""
 
     def __init__(
         self,

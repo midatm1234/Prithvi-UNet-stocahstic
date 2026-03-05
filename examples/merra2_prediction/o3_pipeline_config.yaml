@@ -28,17 +28,41 @@ data:
   chem_pattern: MERRA2_*inst3_3d_chm_N[vV]*.nc4
   met_pattern: MERRA2_*inst3_3d_asm_N[vV]*.nc4
 
-  # Forecast setup: predict O3_sfc at t+delta_hours from predictors at t
+  # Forecast setup: predict target_name at t+delta_hours from predictors at t
   start_time: "2020-01-01T00:00:00"
   end_time: "2020-01-05T21:00:00"
   delta_hours: 3
 
-  # Chemistry variable and output naming
-  chem_var: O3
+  # Target variable selection and transform.
+  # target_var can be O3 (surface), TO3/TCO3 style column fields, or any chemistry variable.
+  # target_transform: surface | none
+  # - surface: extract bottom model level when variable is 3D
+  # - none: keep original dimensionality (use for 2D column variables)
+  target_var: O3
+  target_input_name: O3_sfc
+  target_transform: surface
+
+  # Backward-compat alias used by older scripts; keep consistent with target_input_name.
   o3_output_name: O3_sfc
   target_name: O3_sfc_target
 
-  # Meteorological predictors loaded at each step
+  # Predictor construction order:
+  # 1) data.predictor_vars (if explicitly provided)
+  # 2) [target_input_name if include_target_as_predictor] + chem_predictors + met_vars
+  include_target_as_predictor: true
+
+  # Additional chemistry predictors loaded from chem_pattern.
+  # Each entry supports:
+  #   - "VAR_NAME" (uses default chem_predictor_transform/suffix)
+  #   - {var: "VAR_NAME", output_name: "custom_name", transform: surface|none}
+  chem_predictors: []
+  chem_predictor_transform: surface
+  chem_predictor_suffix: _sfc
+
+  # Optional full explicit predictor channel order. Leave null to auto-build.
+  predictor_vars: null
+
+  # Meteorological predictors loaded at each step from met_pattern.
   met_vars: [T, U, V, PS]
   met_suffix: _sfc
 
@@ -87,7 +111,7 @@ training:
   weight_decay: 1.0e-4
   grad_clip: 1.0
 
-  # Multiply both prediction and target inside MSE for stable gradients on tiny O3 values.
+  # Multiply both prediction and target inside MSE for stable gradients on tiny concentrations.
   # Does NOT change model output units.
   loss_scale: 1.0e7
 
@@ -104,4 +128,4 @@ training:
 
   freeze_backbone: false
   save_every: 1
-  run_name: o3_delta3h_ft
+  run_name: chem_delta3h_ft

@@ -10,7 +10,8 @@ import xarray as xr
 
 from o3_pipeline_utils import (
     load_yaml_config,
-    predictor_channel_order,
+    resolve_predictor_vars,
+    resolve_target_var_name,
     resolve_runtime_paths,
 )
 
@@ -19,7 +20,7 @@ DEFAULT_CONFIG_PATH = str((Path(__file__).resolve().parent / "o3_pipeline_config
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Compute channel-wise scalars for MERRA2 O3 next-step fine-tuning",
+        description="Compute channel-wise scalars for MERRA2 chemistry next-step fine-tuning",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
@@ -38,12 +39,6 @@ def main() -> None:
     data_cfg = cfg.get("data", {})
     scalers_cfg = cfg.get("scalers", {})
 
-    o3_name = str(data_cfg.get("o3_output_name", "O3_sfc"))
-    met_vars = list(data_cfg.get("met_vars", ["T", "U", "V", "PS"]))
-    met_suffix = str(data_cfg.get("met_suffix", "_sfc"))
-    predictor_vars = predictor_channel_order(o3_name=o3_name, met_vars=met_vars, met_suffix=met_suffix)
-    target_var = str(data_cfg.get("target_name", f"{o3_name}_target"))
-
     train_pairs_file = paths["train_pairs_file"]
     if not train_pairs_file.exists():
         raise FileNotFoundError(
@@ -52,6 +47,9 @@ def main() -> None:
 
     engine = "h5netcdf" if train_pairs_file.suffix.lower() in {".nc", ".nc4"} else None
     ds = xr.open_dataset(train_pairs_file, engine=engine)
+
+    predictor_vars = resolve_predictor_vars(data_cfg, dataset_attrs=ds.attrs)
+    target_var = str(ds.attrs.get("target_var", resolve_target_var_name(data_cfg)))
 
     missing = [v for v in predictor_vars + [target_var] if v not in ds.data_vars]
     if missing:
