@@ -1,0 +1,107 @@
+# MERRA2 O3 next-step pipeline configuration
+# Workflow:
+#   1) python examples/merra2_prediction/preprocess_o3_pairs.py --config <this file>
+#   2) python examples/merra2_prediction/compute_scalars_o3.py --config <this file>
+#   3) python examples/merra2_prediction/finetune_o3_next_step.py --config <this file>
+
+paths:
+  # Optional explicit base dir. If null, scripts auto-detect folder containing merra2/.
+  # You can also set env var MERRA2_PREDICTION_BASE.
+  base_dir: null
+
+  # If null, defaults to <base_dir>/merra2
+  chem_root: null
+  met_root: null
+
+  # Relative paths are resolved against base_dir.
+  preprocessed_dir: preprocessed
+  scalers_dir: experiments/o3_scalars
+  checkpoints_dir: checkpoints
+  pretrained_weights_dir: weights
+
+  # Optional explicit pair file paths.
+  train_pairs_file: preprocessed/o3_pairs_train.nc
+  val_pairs_file: preprocessed/o3_pairs_val.nc
+
+data:
+  # Raw MERRA2 files
+  chem_pattern: MERRA2_*inst3_3d_chm_N[vV]*.nc4
+  met_pattern: MERRA2_*inst3_3d_asm_N[vV]*.nc4
+
+  # Forecast setup: predict O3_sfc at t+delta_hours from predictors at t
+  start_time: "2020-01-01T00:00:00"
+  end_time: "2020-01-05T21:00:00"
+  delta_hours: 3
+
+  # Chemistry variable and output naming
+  chem_var: O3
+  o3_output_name: O3_sfc
+  target_name: O3_sfc_target
+
+  # Meteorological predictors loaded at each step
+  met_vars: [T, U, V, PS]
+  met_suffix: _sfc
+
+  # Vertical coordinate candidates for extracting surface level from 3D variables
+  lev_dim_candidates: [lev, level, model_level, eta, pfull]
+
+  # xarray chunking hints
+  xr_chunks:
+    time: 8
+    lat: 181
+    lon: 288
+
+preprocess:
+  # Split mode: chronological | random
+  split_mode: chronological
+  val_fraction: 0.2
+  seed: 42
+
+scalers:
+  eps: 1.0e-6
+  # Optional explicit scaler file paths (relative to base_dir if not absolute)
+  input_mu_file: null
+  input_sigma_file: null
+  target_mu_file: null
+  target_sigma_file: null
+
+model:
+  embed_dim: 2560
+  n_blocks: 4
+  n_heads: 16
+  mlp_multiplier: 4
+  dropout: 0.0
+  drop_path: 0.0
+  mask_unit_size: [16, 16]
+
+training:
+  seed: 42
+  device: auto     # auto | cuda | cpu
+  amp: true
+
+  batch_size: 1
+  num_workers: 0
+
+  num_epochs: 10
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+
+  # Multiply both prediction and target inside MSE for stable gradients on tiny O3 values.
+  # Does NOT change model output units.
+  loss_scale: 1.0e7
+
+  normalize_inputs: true
+  normalize_target: false
+
+  # Initialization options (choose one path):
+  # 1) initialize_from_checkpoint (full model)
+  # 2) use_pretrained_backbone (foundation backbone only)
+  initialize_from_checkpoint: null
+  use_pretrained_backbone: true
+  pretrained_repo_id: ibm-nasa-geospatial/Prithvi-WxC-1.0-2300M
+  pretrained_filename: prithvi.wxc.2300m.v1.pt
+
+  freeze_backbone: false
+  save_every: 1
+  run_name: o3_delta3h_ft
