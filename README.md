@@ -34,6 +34,18 @@ This repository contains code and examples to apply the [Prithvi WxC foundation 
    - [CORDEX ML example](examples/CORDEX_ML/):
          This directory demonstrates fine-tuning and inference on regional climate data for the CORDEX Machine Learning Task Force benchmark (https://github.com/WCRP-CORDEX/ml-benchmark). It includes workflows for multiple domains (European Alps, New Zealand, and South Africa). Detailed documentation can be found in [examples/CORDEX_ML/README.md](examples/CORDEX_ML/README.md).
 
+## CORDEX v4 pipeline (recommended)
+
+The CORDEX workflow now includes a v4 path with:
+
+- gridpoint-wise target normalization (`mode: gridpoint`) for spatially heterogeneous fields;
+- precipitation-aware `log1p_standardize` normalization for `pr` with consistent inverse transform at inference;
+- optional distribution-aware loss terms (moment, quantile, CDF) per predictand;
+- overlap/blending-based boundary mitigation for tiled inference, with seam deblock kept optional and fallback-only;
+- multi-GPU fine-tuning and multi-GPU inference (up to 4 GPUs) plus gradient accumulation and effective batch size reporting.
+
+Use the CORDEX v4 YAMLs (`*_v4.yaml`) and `runs_v4` paths documented in [examples/CORDEX_ML/README.md](examples/CORDEX_ML/README.md).
+
 ## Fine-tuned model
 
 The fine-tuned model for MERRA-2 2m temperature data is available via [Hugging Face](https://huggingface.co/ibm-granite/granite-geospatial-wxc-downscaling).

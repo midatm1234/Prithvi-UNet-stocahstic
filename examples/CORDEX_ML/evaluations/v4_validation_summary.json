@@ -1,0 +1,63 @@
+{
+  "repo_root": "/mnt/data2/kyo/granite-wxc",
+  "python_executable": "/opt/conda/bin/python",
+  "checks": {
+    "py_compile": {
+      "ok": true,
+      "details": {
+        "checked_files": 37,
+        "failed_files": []
+      }
+    },
+    "yaml_parse": {
+      "ok": true,
+      "details": {
+        "checked_files": 78,
+        "failed_files": []
+      }
+    },
+    "v4_yaml_backups": {
+      "ok": true,
+      "details": {
+        "base_yaml_files": 39,
+        "missing_v4_backups": []
+      }
+    },
+    "runs_v4_policy": {
+      "ok": true,
+      "details": {
+        "runs_v4_dirs": [
+          "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v4"
+        ],
+        "checked_files": 120,
+        "disallowed_prediction_like_files": [],
+        "disallowed_count": 0
+      }
+    },
+    "pr_roundtrip": {
+      "ok": true,
+      "details": {
+        "max_abs_roundtrip_error": 2.842170943040401e-14,
+        "min_inverse_value": 0.0,
+        "checked_values": [
+          0.0,
+          1e-12,
+          1e-08,
+          0.0001,
+          0.1,
+          1.0,
+          10.0,
+          100.0
+        ]
+      }
+    },
+    "checkpoint_readability": {
+      "ok": false,
+      "details": {
+        "skipped": true,
+        "reason": "torch unavailable: No module named 'torch'",
+        "checkpoint_count": 24
+      }
+    }
+  }
+}

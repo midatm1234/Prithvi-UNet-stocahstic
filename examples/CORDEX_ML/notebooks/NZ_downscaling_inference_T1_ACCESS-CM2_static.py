@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import xarray as xr
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -33,6 +34,7 @@ os.chdir(PROJECT_DIR)
 from cordex_inference import CordexWrappedDataset, build_inference_dataset, build_predictor_names  # noqa: E402
 from utils.nearest_fill import repair_invalid_by_nearest_xr, summarize_invalid_counts_xr  # noqa: E402
 from utils.predictand_runtime import assert_nonnegative_outputs, resolve_predictand_specs  # noqa: E402
+from utils.inference_blending import infer_batch_with_boundary_mitigation, resolve_boundary_mitigation_settings  # noqa: E402
 from utils.quantization_diagnostics import (  # noqa: E402
     RunningStats,
     format_compact_table,
@@ -80,26 +82,26 @@ PREDICTION_OUTPUT_NAMES = ["Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc", "Pre
         "Predictions_pr_tasmax_ACCESS-CM2_2080-2099.nc", "Predictions_pr_tasmax_EC-Earth3_2080-2099.nc"
 ]
 
-INFERENCE_OUTPUT_ROOTS = ["/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/end-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/NZ_T1_ACCESS-CM2_static_train/predictions/end-century/imperfect/"
+INFERENCE_OUTPUT_ROOTS = ["/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/historical/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/historical/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/historical/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/historical/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/end-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/end-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/end-century/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T1_ACCESS-CM2_static_train/predictions/end-century/imperfect/"
 ]
 
 # Fixed config for the fine-tuned model
 REPO_ROOT = REPO_ROOT.resolve()
 PROJECT_DIR = PROJECT_DIR.resolve()
 DATASET_ROOT = REPO_ROOT / "granite-geospatial-wxc-downscaling/CORDEX/NZ_domain"
-RUNS_ROOT = PROJECT_DIR / "runs/NZ_T1_ACCESS-CM2_static_train"
-CONFIG_PATH = PROJECT_DIR / "NZ_T1_ACCESS-CM2_static.yaml"
+RUNS_ROOT = PROJECT_DIR / "runs_v5/NZ_T1_ACCESS-CM2_static_train"
+CONFIG_PATH = PROJECT_DIR / "NZ_T1_ACCESS-CM2_static_v5.yaml"
 
 TRAIN_SPLIT = "train/ESD_pseudo_reality"
 TARGET_TEMPLATE_FILE = "pr_tasmax_ACCESS-CM2_1961-1980.nc"
@@ -127,6 +129,11 @@ DIAGNOSTIC_TIME_WINDOW = 5
 DIAGNOSTIC_SPATIAL_WINDOW = 20
 SAVE_DIAGNOSTICS_JSON = True
 SAVE_DISTRIBUTION_PLOT = True
+
+DIST_ENABLED = False
+DIST_RANK = 0
+DIST_WORLD_SIZE = 1
+DIST_LOCAL_RANK = 0
 
 # ================================================================
 
@@ -195,12 +202,18 @@ def _configure_idle_gpus() -> None:
 
 def _select_device() -> torch.device:
     target = (DEVICE_TARGET or "auto").lower()
+    if target == "cpu":
+        return torch.device("cpu")
+
+    if DIST_ENABLED:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed inference requested but CUDA is unavailable.")
+        return torch.device(f"cuda:{DIST_LOCAL_RANK}")
+
     if target == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("device_target is 'cuda' but no CUDA device is available.")
         return torch.device("cuda")
-    if target == "cpu":
-        return torch.device("cpu")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -243,7 +256,7 @@ def _to_pre_inverse_output(pred_inverse: torch.Tensor, model: torch.nn.Module) -
     return (pred - mu) / (sigma + 1e-12)
 
 
-def _run_full_inference(dataloader, model, device, target_vars):
+def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
     predictions = []
     pre_inverse_predictions = []
     targets = []
@@ -313,19 +326,11 @@ def _run_full_inference(dataloader, model, device, target_vars):
             stage_stats["normalized_predictors"].add(normalized_x.detach().cpu().numpy())
 
             with autocast_context():
-                model_out = model(batch, return_pre_inverse=True, return_raw_output=True)
-
-            if isinstance(model_out, tuple):
-                out = model_out[0]
-                if len(model_out) >= 3:
-                    out_raw_model = model_out[2]
-                elif len(model_out) >= 2:
-                    out_raw_model = model_out[1]
-                else:
-                    out_raw_model = _to_pre_inverse_output(out, model)
-            else:
-                out = model_out
-                out_raw_model = _to_pre_inverse_output(out, model)
+                out, _, out_raw_model = infer_batch_with_boundary_mitigation(
+                    model=model,
+                    batch=batch,
+                    cfg=boundary_cfg,
+                )
 
             if FORCE_OUTPUT_FLOAT32:
                 out = out.float()
@@ -603,12 +608,29 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module]:
 
 
 def main() -> None:
+    global DIST_ENABLED, DIST_RANK, DIST_WORLD_SIZE, DIST_LOCAL_RANK
+
     logging.disable(logging.CRITICAL)
     warnings.simplefilter(action="ignore", category=FutureWarning)
 
     _check_list_lengths()
 
-    _configure_idle_gpus()
+    DIST_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+    DIST_RANK = int(os.environ.get("RANK", "0"))
+    DIST_LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
+    DIST_ENABLED = DIST_WORLD_SIZE > 1
+
+    if DIST_ENABLED and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+
+    if DIST_ENABLED:
+        print(
+            f"[dist] inference enabled: rank={DIST_RANK}/{DIST_WORLD_SIZE}, "
+            f"local_rank={DIST_LOCAL_RANK}"
+        )
+    else:
+        _configure_idle_gpus()
 
     torch.jit.enable_onednn_fusion(True)
     if torch.cuda.is_available():
@@ -628,7 +650,8 @@ def main() -> None:
         f"force_output_float32={FORCE_OUTPUT_FLOAT32}"
     )
 
-    for idx in range(NUM_RUNS):
+    run_indices = range(DIST_RANK, NUM_RUNS, DIST_WORLD_SIZE) if DIST_ENABLED else range(NUM_RUNS)
+    for idx in run_indices:
         test_split = TEST_SPLITS[idx]
         predictor_file = PREDICTOR_FILES[idx]
         prediction_output_name = PREDICTION_OUTPUT_NAMES[idx]
@@ -703,7 +726,13 @@ def main() -> None:
         predictor_paths = list(base_dataset.predictor_paths)
         target_template_paths = list(base_dataset.target_paths)
 
-        inference_result = _run_full_inference(test_dl, model, device, target_vars)
+        boundary_cfg = resolve_boundary_mitigation_settings(config)
+        print(
+            f"[boundary] enabled={boundary_cfg.enabled}, tile_size={boundary_cfg.tile_size}, "
+            f"overlap={boundary_cfg.overlap}, blend_mode={boundary_cfg.blend_mode}, "
+            f"deblock_enabled={boundary_cfg.deblock.enabled}"
+        )
+        inference_result = _run_full_inference(test_dl, model, device, target_vars, boundary_cfg)
         full_outputs = inference_result["predictions"]
         full_outputs_pre_inverse = inference_result["predictions_pre_inverse"]
         full_targets = inference_result["targets"]
@@ -831,6 +860,10 @@ def main() -> None:
             f"[{idx + 1:02d}/{NUM_RUNS}] Saved pre-inverse predictions array to "
             f"{pre_inverse_pickle_path}"
         )
+
+    if DIST_ENABLED and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

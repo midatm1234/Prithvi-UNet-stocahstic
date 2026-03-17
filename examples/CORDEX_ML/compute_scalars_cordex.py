@@ -144,23 +144,59 @@ def _resolve_scalars_from_specs(
     targets_std_raw: np.ndarray,
     targets_log_mean: np.ndarray,
     targets_log_std: np.ndarray,
+    targets_grid_mean_raw: np.ndarray,
+    targets_grid_std_raw: np.ndarray,
+    targets_grid_log_mean: np.ndarray,
+    targets_grid_log_std: np.ndarray,
     divide_only_samples: dict[int, list[np.ndarray]],
 ) -> tuple[np.ndarray, np.ndarray]:
-    target_mu = targets_mean_raw.astype(np.float32, copy=True)
-    target_sigma = targets_std_raw.astype(np.float32, copy=True)
+    use_grid = any(spec.scaling.mode == "gridpoint" for spec in specs)
+    if use_grid:
+        target_mu = np.zeros_like(targets_grid_mean_raw, dtype=np.float32)
+        target_sigma = np.zeros_like(targets_grid_std_raw, dtype=np.float32)
+    else:
+        target_mu = targets_mean_raw.astype(np.float32, copy=True)
+        target_sigma = targets_std_raw.astype(np.float32, copy=True)
 
     quantile_map = {"p90": 0.90, "p95": 0.95, "p99": 0.99}
     for ch_idx, spec in enumerate(specs):
         scaling_method = spec.scaling.method
+        mode = spec.scaling.mode
+        eps_std = max(float(spec.scaling.eps_std), EPS)
+
+        if mode == "gridpoint":
+            raw_mean = targets_grid_mean_raw[ch_idx]
+            raw_std = targets_grid_std_raw[ch_idx]
+            log_mean = targets_grid_log_mean[ch_idx]
+            log_std = targets_grid_log_std[ch_idx]
+        else:
+            raw_mean = float(targets_mean_raw[ch_idx])
+            raw_std = float(targets_std_raw[ch_idx])
+            log_mean = float(targets_log_mean[ch_idx])
+            log_std = float(targets_log_std[ch_idx])
+
         if scaling_method == "zscore":
-            sigma = float(target_sigma[ch_idx])
-            target_sigma[ch_idx] = max(sigma, EPS)
+            if mode == "gridpoint":
+                target_mu[ch_idx] = raw_mean.astype(np.float32, copy=False)
+                target_sigma[ch_idx] = np.maximum(raw_std, eps_std).astype(np.float32, copy=False)
+            else:
+                target_mu[ch_idx] = np.float32(raw_mean)
+                target_sigma[ch_idx] = np.float32(max(float(raw_std), eps_std))
+                if use_grid:
+                    target_mu[ch_idx, ...] = np.float32(raw_mean)
+                    target_sigma[ch_idx, ...] = np.float32(max(float(raw_std), eps_std))
             continue
 
-        if scaling_method == "log1p_zscore":
-            target_mu[ch_idx] = float(targets_log_mean[ch_idx])
-            sigma = float(targets_log_std[ch_idx])
-            target_sigma[ch_idx] = max(sigma, EPS)
+        if scaling_method in {"log1p_standardize", "log1p_zscore"}:
+            if mode == "gridpoint":
+                target_mu[ch_idx] = log_mean.astype(np.float32, copy=False)
+                target_sigma[ch_idx] = np.maximum(log_std, eps_std).astype(np.float32, copy=False)
+            else:
+                target_mu[ch_idx] = np.float32(log_mean)
+                target_sigma[ch_idx] = np.float32(max(float(log_std), eps_std))
+                if use_grid:
+                    target_mu[ch_idx, ...] = np.float32(log_mean)
+                    target_sigma[ch_idx, ...] = np.float32(max(float(log_std), eps_std))
             continue
 
         if scaling_method != "divide_only":
@@ -168,16 +204,36 @@ def _resolve_scalars_from_specs(
                 f"Unsupported scaling method '{scaling_method}' for {target_vars[ch_idx]}"
             )
 
-        target_mu[ch_idx] = 0.0
+        if mode == "gridpoint":
+            target_mu[ch_idx] = 0.0
+        else:
+            target_mu[ch_idx] = np.float32(0.0)
+            if use_grid:
+                target_mu[ch_idx, ...] = np.float32(0.0)
+
         stat = spec.scaling.scale_stat
+        if mode == "gridpoint" and stat in quantile_map:
+            # Quantile-based divide_only per-gridpoint is noisy with finite time samples;
+            # use local mean as the conservative fallback.
+            print(
+                f"[predictands] {target_vars[ch_idx]}: divide_only+{stat} with mode=gridpoint "
+                "falls back to gridpoint mean scaling."
+            )
+            stat = "mean"
+
         if stat == "fixed":
             if spec.scaling.fixed_scale is None or spec.scaling.fixed_scale <= 0:
                 raise ValueError(
                     f"predictands.{spec.name}.scaling.scale_stat=fixed requires positive fixed_scale."
                 )
             scale = float(spec.scaling.fixed_scale)
+            if mode == "gridpoint":
+                scale_field = np.full_like(targets_grid_std_raw[ch_idx], fill_value=scale, dtype=np.float32)
         elif stat == "mean":
-            scale = float(targets_mean_raw[ch_idx])
+            if mode == "gridpoint":
+                scale_field = np.asarray(raw_mean, dtype=np.float32)
+            else:
+                scale = float(raw_mean)
         elif stat in quantile_map:
             channel_samples = divide_only_samples.get(ch_idx, [])
             if channel_samples:
@@ -194,7 +250,12 @@ def _resolve_scalars_from_specs(
                 f"Unsupported divide_only scale_stat '{stat}' for {target_vars[ch_idx]}"
             )
 
-        target_sigma[ch_idx] = max(scale, EPS)
+        if mode == "gridpoint":
+            target_sigma[ch_idx] = np.maximum(scale_field, eps_std).astype(np.float32, copy=False)
+        else:
+            target_sigma[ch_idx] = np.float32(max(scale, eps_std))
+            if use_grid:
+                target_sigma[ch_idx, ...] = np.float32(max(scale, eps_std))
 
     return target_mu.astype(np.float32), target_sigma.astype(np.float32)
 
@@ -209,8 +270,11 @@ def compute_scalars(
     x_sum = x_sumsq = None
     y_sum = y_sumsq = None
     y_log_sum = y_log_sumsq = None
+    y_grid_sum = y_grid_sumsq = None
+    y_grid_log_sum = y_grid_log_sumsq = None
     x_count = 0
     y_count = 0
+    y_grid_count = 0
 
     rng = np.random.default_rng(42)
     divide_only_quantiles = {"p90", "p95", "p99"}
@@ -237,6 +301,11 @@ def compute_scalars(
             if y_sum is None:
                 y_sum, y_sumsq = _init_accumulator(y.shape[0])
                 y_log_sum, y_log_sumsq = _init_accumulator(y.shape[0])
+            if y_grid_sum is None:
+                y_grid_sum = torch.zeros_like(y, dtype=torch.float64)
+                y_grid_sumsq = torch.zeros_like(y, dtype=torch.float64)
+                y_grid_log_sum = torch.zeros_like(y, dtype=torch.float64)
+                y_grid_log_sumsq = torch.zeros_like(y, dtype=torch.float64)
 
             x_sum += x_flat.sum(dim=1)
             x_sumsq += (x_flat.pow(2)).sum(dim=1)
@@ -244,9 +313,14 @@ def compute_scalars(
             y_sumsq += (y_flat.pow(2)).sum(dim=1)
             y_log_sum += y_log.sum(dim=1)
             y_log_sumsq += (y_log.pow(2)).sum(dim=1)
+            y_grid_sum += y
+            y_grid_sumsq += y.pow(2)
+            y_grid_log_sum += y_log.view_as(y)
+            y_grid_log_sumsq += y_log.pow(2).view_as(y)
 
             x_count += x_flat.shape[1]
             y_count += y_flat.shape[1]
+            y_grid_count += 1
 
             for ch_idx in divide_only_sample_channels:
                 values = y_nonnegative[ch_idx].cpu().numpy().astype(np.float32, copy=False)
@@ -268,6 +342,18 @@ def compute_scalars(
     inputs_mean, inputs_std = _finalize(x_sum, x_sumsq, x_count)
     targets_mean_raw, targets_std_raw = _finalize(y_sum, y_sumsq, y_count)
     targets_log_mean, targets_log_std = _finalize(y_log_sum, y_log_sumsq, y_count)
+    if y_grid_sum is None or y_grid_sumsq is None or y_grid_log_sum is None or y_grid_log_sumsq is None:
+        raise RuntimeError("No target grids observed when computing per-gridpoint scalars")
+    if y_grid_count <= 0:
+        raise RuntimeError("Invalid target grid sample count")
+
+    targets_grid_mean_raw = (y_grid_sum / y_grid_count).cpu().numpy().astype(np.float32)
+    targets_grid_var_raw = (y_grid_sumsq / y_grid_count) - (y_grid_sum / y_grid_count).pow(2)
+    targets_grid_std_raw = torch.sqrt(torch.clamp(targets_grid_var_raw, min=0.0)).cpu().numpy().astype(np.float32)
+
+    targets_grid_log_mean = (y_grid_log_sum / y_grid_count).cpu().numpy().astype(np.float32)
+    targets_grid_log_var = (y_grid_log_sumsq / y_grid_count) - (y_grid_log_sum / y_grid_count).pow(2)
+    targets_grid_log_std = torch.sqrt(torch.clamp(targets_grid_log_var, min=0.0)).cpu().numpy().astype(np.float32)
 
     targets_mean, targets_std = _resolve_scalars_from_specs(
         specs=target_specs,
@@ -276,6 +362,10 @@ def compute_scalars(
         targets_std_raw=targets_std_raw,
         targets_log_mean=targets_log_mean,
         targets_log_std=targets_log_std,
+        targets_grid_mean_raw=targets_grid_mean_raw,
+        targets_grid_std_raw=targets_grid_std_raw,
+        targets_grid_log_mean=targets_grid_log_mean,
+        targets_grid_log_std=targets_grid_log_std,
         divide_only_samples=divide_only_sample_channels,
     )
 
@@ -288,8 +378,13 @@ def compute_scalars(
         "targets_std_raw": targets_std_raw,
         "targets_log_mean": targets_log_mean,
         "targets_log_std": targets_log_std,
+        "targets_grid_mean_raw": targets_grid_mean_raw,
+        "targets_grid_std_raw": targets_grid_std_raw,
+        "targets_grid_log_mean": targets_grid_log_mean,
+        "targets_grid_log_std": targets_grid_log_std,
         "input_pixel_count": x_count,
         "target_pixel_count": y_count,
+        "target_grid_sample_count": y_grid_count,
     }
 
 
@@ -312,6 +407,23 @@ def _resolve_config_and_predictands(
 
     target_specs = build_predictand_specs(config, output_vars=target_vars)
     return config, target_vars, target_specs
+
+
+def _compact_array_summary(values: np.ndarray) -> dict | list:
+    arr = np.asarray(values)
+    if arr.ndim <= 1 and arr.size <= 64:
+        return arr.tolist()
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {"shape": list(arr.shape), "finite_count": 0}
+    return {
+        "shape": list(arr.shape),
+        "finite_count": int(finite.size),
+        "min": float(finite.min()),
+        "max": float(finite.max()),
+        "mean": float(finite.mean()),
+        "std": float(finite.std()),
+    }
 
 
 def main() -> None:
@@ -404,11 +516,18 @@ def main() -> None:
         "target_channels": int(stats["targets_mean"].shape[0]),
         "input_pixel_count": stats["input_pixel_count"],
         "target_pixel_count": stats["target_pixel_count"],
+        "target_grid_sample_count": stats["target_grid_sample_count"],
         "summary": {
-            "targets_mean_raw": stats["targets_mean_raw"].tolist(),
-            "targets_std_raw": stats["targets_std_raw"].tolist(),
-            "targets_mean_saved": stats["targets_mean"].tolist(),
-            "targets_std_saved": stats["targets_std"].tolist(),
+            "targets_mean_raw": _compact_array_summary(stats["targets_mean_raw"]),
+            "targets_std_raw": _compact_array_summary(stats["targets_std_raw"]),
+            "targets_log_mean": _compact_array_summary(stats["targets_log_mean"]),
+            "targets_log_std": _compact_array_summary(stats["targets_log_std"]),
+            "targets_grid_mean_raw": _compact_array_summary(stats["targets_grid_mean_raw"]),
+            "targets_grid_std_raw": _compact_array_summary(stats["targets_grid_std_raw"]),
+            "targets_grid_log_mean": _compact_array_summary(stats["targets_grid_log_mean"]),
+            "targets_grid_log_std": _compact_array_summary(stats["targets_grid_log_std"]),
+            "targets_mean_saved": _compact_array_summary(stats["targets_mean"]),
+            "targets_std_saved": _compact_array_summary(stats["targets_std"]),
         },
         "files": {
             "inputs_mean": inputs_mean_path,

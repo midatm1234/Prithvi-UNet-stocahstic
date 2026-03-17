@@ -34,12 +34,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 try:
-    from granitewxc.models.loss import rmse_loss
+    from granitewxc.models.loss import build_loss_fn, rmse_loss
 except ModuleNotFoundError:
     # Fallback for environments where the installed granitewxc package
-    # does not expose granitewxc.models.loss.
-    def rmse_loss(y_hat: torch.Tensor, y: dict[torch.Tensor]) -> torch.Tensor:
+    # does not expose the updated loss module.
+    def rmse_loss(y_hat: torch.Tensor, y: dict[str, torch.Tensor]) -> torch.Tensor:
         return torch.sqrt(torch.mean((y_hat - y["y"]) ** 2))
+    def build_loss_fn(config, output_vars):  # type: ignore[override]
+        del config, output_vars
+        return rmse_loss
 from granitewxc.models.model import get_finetune_model_UNET
 from granitewxc.utils.config import ExperimentConfig
 from granitewxc.utils.predictands import build_predictand_specs
@@ -150,6 +153,53 @@ def _resolve_paths(paths: Iterable[str]) -> list[str]:
 
 def _resolve_path(path: str) -> str:
     return _resolve_paths([path])[0]
+
+
+def _coerce_mapping(value):
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "__dict__"):
+        return dict(value.__dict__)
+    return {}
+
+
+def _resolve_training_runtime(config: ExperimentConfig) -> dict[str, int | str | None]:
+    training_cfg = _coerce_mapping(getattr(config, "training", None))
+    per_device_batch = int(training_cfg.get("per_device_batch_size", getattr(config, "batch_size", 1)))
+    grad_accum = int(
+        training_cfg.get(
+            "gradient_accumulation_steps",
+            getattr(config, "gradient_accumulation_steps", 1),
+        )
+    )
+    num_gpus_cfg = training_cfg.get("num_gpus", getattr(config, "num_gpus", None))
+    if num_gpus_cfg is not None:
+        num_gpus_cfg = int(num_gpus_cfg)
+    distributed_mode = str(
+        training_cfg.get(
+            "distributed",
+            getattr(config, "distributed_strategy", "ddp"),
+        )
+    ).lower()
+    if distributed_mode not in {"ddp", "fsdp", "none"}:
+        distributed_mode = "ddp"
+
+    setattr(config, "batch_size", max(1, per_device_batch))
+    setattr(config, "per_device_batch_size", max(1, per_device_batch))
+    setattr(config, "gradient_accumulation_steps", max(1, grad_accum))
+    if distributed_mode == "fsdp":
+        setattr(config, "distributed_strategy", "fsdp")
+    elif distributed_mode == "ddp":
+        setattr(config, "distributed_strategy", "ddp")
+
+    return {
+        "per_device_batch_size": max(1, per_device_batch),
+        "gradient_accumulation_steps": max(1, grad_accum),
+        "num_gpus": num_gpus_cfg,
+        "distributed": distributed_mode,
+    }
 
 
 def _level_suffix(level) -> str:
@@ -435,7 +485,10 @@ def build_optimizer_scheduler(
 ):
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
     scaler = GradScaler(enabled=use_gpu and torch.cuda.is_available())
-    total_steps = config.num_epochs * max(1, min(train_loader_length, config.limit_steps_train))
+    accumulation_steps = max(1, int(getattr(config, "gradient_accumulation_steps", 1)))
+    steps_per_epoch = max(1, min(train_loader_length, config.limit_steps_train))
+    optimizer_steps_per_epoch = (steps_per_epoch + accumulation_steps - 1) // accumulation_steps
+    total_steps = config.num_epochs * max(1, optimizer_steps_per_epoch)
     scheduler = CosineAnnealingLR(
         optimizer,
         T_max=total_steps,
@@ -472,6 +525,9 @@ def _distributed_worker(rank: int, world_size: int, config: ExperimentConfig, sa
     optimizer, scaler, scheduler = build_optimizer_scheduler(
         config, model, len(train_loader), use_gpu=True
     )
+    loss_fn = build_loss_fn(config, list(config.data.output_vars))
+    if global_rank == 0 and hasattr(loss_fn, "describe"):
+        print(f"[loss] active: {loss_fn.describe()}")
 
     train_losses, val_losses = train_model(
         config,
@@ -484,7 +540,7 @@ def _distributed_worker(rank: int, world_size: int, config: ExperimentConfig, sa
         local_rank,
         True,
         save_every,
-        rmse_loss,
+        loss_fn,
     )
 
     if global_rank == 0:
@@ -494,15 +550,98 @@ def _distributed_worker(rank: int, world_size: int, config: ExperimentConfig, sa
     dist.destroy_process_group()
 
 
+def _run_distributed_from_env(config: ExperimentConfig, save_every: int):
+    local_rank, global_rank = init_ddp(use_gpu=True)
+    world_size = dist.get_world_size()
+    device = torch.device(f"cuda:{local_rank}")
+
+    train_loader, val_loader = get_dataloaders(
+        config, use_gpu=True, rank=global_rank, world_size=world_size
+    )
+
+    model = create_finetune_model(config, verbose=(global_rank == 0))
+    model = model.to(device)
+    _configure_skip_offload(model, config)
+    if _fsdp_enabled(config):
+        model = _wrap_model_with_fsdp(model, local_rank, config)
+    else:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
+
+    optimizer, scaler, scheduler = build_optimizer_scheduler(
+        config, model, len(train_loader), use_gpu=True
+    )
+    loss_fn = build_loss_fn(config, list(config.data.output_vars))
+    if global_rank == 0 and hasattr(loss_fn, "describe"):
+        print(f"[loss] active: {loss_fn.describe()}")
+
+    train_losses, val_losses = train_model(
+        config,
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        scaler,
+        local_rank,
+        True,
+        save_every,
+        loss_fn,
+    )
+    dist.destroy_process_group()
+    if global_rank == 0:
+        return train_losses, val_losses
+    return None, None
+
+
 def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_every: int = 5):
     _ensure_expandable_cuda_segments()
     use_gpu = _should_use_gpu(config)
+    runtime = _resolve_training_runtime(config)
 
-    if num_gpus is None:
-        num_gpus = torch.cuda.device_count() if use_gpu else 0
+    launched_with_torchrun = bool(os.environ.get("WORLD_SIZE")) and bool(os.environ.get("RANK"))
+    if launched_with_torchrun:
+        if not use_gpu:
+            raise RuntimeError("torchrun distributed launch requires CUDA for this training path.")
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        per_device_batch_size = int(getattr(config, "per_device_batch_size", config.batch_size))
+        grad_accum = int(getattr(config, "gradient_accumulation_steps", 1))
+        effective_batch_size = per_device_batch_size * world_size * grad_accum
+        setattr(config, "effective_batch_size", effective_batch_size)
+        print(
+            "[training] external launcher detected (torchrun). "
+            f"per_device_batch_size={per_device_batch_size}, world_size={world_size}, "
+            f"gradient_accumulation_steps={grad_accum}, effective_batch_size={effective_batch_size}"
+        )
+        return _run_distributed_from_env(config, save_every=save_every)
+
+    requested_num_gpus = num_gpus if num_gpus is not None else runtime["num_gpus"]
+    available_gpus = torch.cuda.device_count() if use_gpu else 0
+    if requested_num_gpus is None:
+        num_gpus = available_gpus
     else:
-        num_gpus = min(num_gpus, torch.cuda.device_count() if use_gpu else 0)
-    num_gpus = max(1, num_gpus)
+        num_gpus = min(int(requested_num_gpus), available_gpus)
+    num_gpus = max(1, min(4, num_gpus))
+    if runtime["distributed"] == "none":
+        num_gpus = 1
+
+    per_device_batch_size = int(getattr(config, "per_device_batch_size", config.batch_size))
+    grad_accum = int(getattr(config, "gradient_accumulation_steps", 1))
+    effective_batch_size = per_device_batch_size * num_gpus * grad_accum
+    setattr(config, "effective_batch_size", effective_batch_size)
+    print(
+        "[training] per_device_batch_size="
+        f"{per_device_batch_size}, num_gpus={num_gpus}, "
+        f"gradient_accumulation_steps={grad_accum}, "
+        f"effective_batch_size={effective_batch_size}, "
+        f"distributed={runtime['distributed']}"
+    )
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        print(f"[training] CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
 
     if not use_gpu:
         device = torch.device("cpu")
@@ -512,6 +651,9 @@ def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_eve
         optimizer, scaler, scheduler = build_optimizer_scheduler(
             config, model, len(train_loader), use_gpu=False
         )
+        loss_fn = build_loss_fn(config, list(config.data.output_vars))
+        if hasattr(loss_fn, "describe"):
+            print(f"[loss] active: {loss_fn.describe()}")
         train_losses, val_losses = train_model(
             config,
             model,
@@ -523,7 +665,7 @@ def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_eve
             local_rank=0,
             use_gpu=False,
             save_every=save_every,
-            loss_func=rmse_loss,
+            loss_func=loss_fn,
         )
         return train_losses, val_losses
 
@@ -531,15 +673,20 @@ def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_eve
         os.environ.setdefault("MASTER_ADDR", "localhost")
         mp.set_start_method("spawn", force=True)
 
-        tried: list[int] = []
+        visible_env = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        tried: list[int | None] = []
         oom_errors: list[str] = []
-        for gpu_id in _single_gpu_retry_order():
+        gpu_candidates = [None] if visible_env else [*(_single_gpu_retry_order())]
+        for gpu_id in gpu_candidates:
             if gpu_id in tried:
                 continue
             tried.append(gpu_id)
-            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-            print(f"Single-GPU attempt on physical GPU {gpu_id}.")
+            if gpu_id is not None:
+                os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                print(f"Single-GPU attempt on physical GPU {gpu_id}.")
+            else:
+                print("Single-GPU attempt using existing CUDA_VISIBLE_DEVICES selection.")
 
             manager = mp.Manager()
             return_dict = manager.dict()
@@ -569,14 +716,14 @@ def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_eve
                 if "out of memory" in message or "cuda oom" in message:
                     oom_errors.append(str(exc))
                     print(
-                        f"CUDA OOM on physical GPU {gpu_id}; "
+                        f"CUDA OOM on GPU candidate {gpu_id}; "
                         "retrying on a different idle GPU if available."
                     )
                     continue
                 raise
             except ProcessExitedException as exc:
                 print(
-                    f"Single-GPU run on physical GPU {gpu_id} exited unexpectedly ({exc}); "
+                    f"Single-GPU run on GPU candidate {gpu_id} exited unexpectedly ({exc}); "
                     "trying another idle GPU if available."
                 )
                 continue

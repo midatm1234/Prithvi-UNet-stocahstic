@@ -1,0 +1,75 @@
+ M README.md
+ M examples/CORDEX_ML/ALPS_preprocess
+ M examples/CORDEX_ML/NZ_preprocess
+ M examples/CORDEX_ML/README.md
+ M examples/CORDEX_ML/SA_preprocess
+ M examples/CORDEX_ML/compute_scalars_cordex.py
+ M examples/CORDEX_ML/cordex_training.py
+ M examples/CORDEX_ML/notebooks/ALPS_downscaling_finetune_T1_CNRM-CM5_no_static.ipynb
+ M examples/CORDEX_ML/notebooks/ALPS_downscaling_finetune_T1_CNRM-CM5_static.ipynb
+ M examples/CORDEX_ML/notebooks/ALPS_downscaling_finetune_T2_CNRM-CM5_no_static.ipynb
+ M examples/CORDEX_ML/notebooks/ALPS_downscaling_finetune_T2_CNRM-CM5_static.ipynb
+ M examples/CORDEX_ML/notebooks/ALPS_downscaling_inference_T1_CNRM-CM5_no_static.py
+ M examples/CORDEX_ML/notebooks/ALPS_downscaling_inference_T1_CNRM-CM5_static.py
+ M examples/CORDEX_ML/notebooks/ALPS_downscaling_inference_T2_CNRM-CM5_no_static.py
+ M examples/CORDEX_ML/notebooks/ALPS_downscaling_inference_T2_CNRM-CM5_static.py
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_finetune.ipynb
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_finetune_T1_ACCESS-CM2_no_static.ipynb
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_finetune_T1_ACCESS-CM2_static.ipynb
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_finetune_T2_ACCESS-CM2_no_static.ipynb
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_finetune_T2_ACCESS-CM2_static.ipynb
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_inference.ipynb
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_inference_T1HP_ACCESS-CM2_static.ipynb
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_inference_T1_ACCESS-CM2_no_static.py
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_inference_T1_ACCESS-CM2_static.ipynb
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_inference_T1_ACCESS-CM2_static.py
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_inference_T2_ACCESS-CM2_no_static.py
+ M examples/CORDEX_ML/notebooks/NZ_downscaling_inference_T2_ACCESS-CM2_static.py
+ M examples/CORDEX_ML/notebooks/SA_downscaling_finetune_T1_ACCESS-CM2_no_static.ipynb
+ M examples/CORDEX_ML/notebooks/SA_downscaling_finetune_T1_ACCESS-CM2_static.ipynb
+ M examples/CORDEX_ML/notebooks/SA_downscaling_finetune_T2_ACCESS-CM2_no_static.ipynb
+ M examples/CORDEX_ML/notebooks/SA_downscaling_finetune_T2_ACCESS-CM2_static.ipynb
+ M examples/CORDEX_ML/notebooks/SA_downscaling_inference_T1_ACCESS-CM2_no_static.py
+ M examples/CORDEX_ML/notebooks/SA_downscaling_inference_T1_ACCESS-CM2_static.py
+ M examples/CORDEX_ML/notebooks/SA_downscaling_inference_T2_ACCESS-CM2_no_static.py
+ M examples/CORDEX_ML/notebooks/SA_downscaling_inference_T2_ACCESS-CM2_static.py
+ m granite-geospatial-wxc-downscaling
+ M granitewxc/models/cordex_finetune_model.py
+ M granitewxc/models/loss.py
+ M granitewxc/models/model.py
+ M granitewxc/utils/predictands.py
+ M granitewxc/utils/trainer.py
+ M tests/test_predictand_constraints.py
+?? examples/CORDEX_ML/ALPS_T1_CNRM-CM5_no_static_v4.yaml
+?? examples/CORDEX_ML/ALPS_T1_CNRM-CM5_static_v4.yaml
+?? examples/CORDEX_ML/ALPS_T2_CNRM-CM5_no_static_v4.yaml
+?? examples/CORDEX_ML/ALPS_T2_CNRM-CM5_static_v4.yaml
+?? examples/CORDEX_ML/NZ_ESD_pseudo-reality_config_small_v4.yaml
+?? examples/CORDEX_ML/NZ_T1_ACCESS-CM2_no_static_v4.yaml
+?? examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static_v4.yaml
+?? examples/CORDEX_ML/NZ_T2_ACCESS-CM2_no_static_v4.yaml
+?? examples/CORDEX_ML/NZ_T2_ACCESS-CM2_static_v4.yaml
+?? examples/CORDEX_ML/SA_T1_ACCESS-CM2_no_static_v4.yaml
+?? examples/CORDEX_ML/SA_T1_ACCESS-CM2_static_v4.yaml
+?? examples/CORDEX_ML/SA_T2_ACCESS-CM2_no_static_v4.yaml
+?? examples/CORDEX_ML/SA_T2_ACCESS-CM2_static_v4.yaml
+?? examples/CORDEX_ML/cordex_config_small_v4.yaml
+?? examples/CORDEX_ML/cordex_config_v4.yaml
+?? examples/CORDEX_ML/cordex_finetune.py
+?? examples/CORDEX_ML/evaluations/
+?? examples/CORDEX_ML/experiments/
+?? examples/CORDEX_ML/notebooks/NZ_downscaling_inference_test.nc
+?? examples/CORDEX_ML/runs_v4/
+?? examples/CORDEX_ML/utils/evaluate_v4_outputs.py
+?? examples/CORDEX_ML/utils/inference_blending.py
+?? examples/CORDEX_ML/utils/quantization_diagnostics.py
+?? examples/CORDEX_ML/utils/validate_v4_setup.py
+?? examples/merra2_prediction/aws_credentials
+?? examples/merra2_prediction/checkpoints/
+?? examples/merra2_prediction/examples/
+?? examples/merra2_prediction/experiments/
+?? examples/merra2_prediction/merra2/
+?? examples/merra2_prediction/outputs/
+?? examples/merra2_prediction/preprocessed/
+?? examples/merra2_prediction/weights/
+?? tests/test_distribution_loss.py

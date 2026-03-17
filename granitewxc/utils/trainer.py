@@ -23,12 +23,12 @@ def batch_step(
 ):
     if gpu:
         batch = {k: v.to(local_rank) for k, v in batch.items()}
-
-    dtype = torch.bfloat16 if gpu and torch.cuda.is_bf16_supported() else torch.float16
-    with autocast(device_type='cuda', dtype=dtype):
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        with autocast(device_type="cuda", dtype=dtype):
+            prediction = model(batch)
+            loss = loss_func(prediction, batch)
+    else:
         prediction = model(batch)
-        # Directly pass batch['y'] to the loss function without pre-processing
-        # Ensure that the masked_rmse_loss function handles the tensor correctly
         loss = loss_func(prediction, batch)
 
     return loss
@@ -170,6 +170,10 @@ def train_one_epoch(
     benchmark_timer, benchmark_timer_total = time(), time()
 
     benchmark_batch_mean = np.zeros(2)
+    accumulation_steps = max(1, int(kwargs.get("gradient_accumulation_steps", 1)))
+    optimizer_steps = 0
+    max_steps = min(limit_steps, len(train_loader)) if 0 < limit_steps else len(train_loader)
+    optimizer.zero_grad(set_to_none=True)
 
     for i, batch in enumerate(train_loader):
         if 0 < limit_steps <= i:
@@ -183,8 +187,6 @@ def train_one_epoch(
 
         benchmark_timer = time()
 
-        optimizer.zero_grad(set_to_none=True)
-
         loss = batch_step(
             batch, model, loss_func, gpu, local_rank
         )
@@ -194,11 +196,12 @@ def train_one_epoch(
 
         benchmark_timer = time()
 
-        if scaler is None:       
-            loss.backward()
+        loss_for_backward = loss / accumulation_steps
+        if scaler is None:
+            loss_for_backward.backward()
         else:
             benchmark_timer = time()
-            scaler.scale(loss).backward()
+            scaler.scale(loss_for_backward).backward()
 
         benchmark_backward[0] += time() - benchmark_timer
         benchmark_backward[1] += 1
@@ -206,11 +209,16 @@ def train_one_epoch(
 
         benchmark_timer = time()
 
-        if scaler is None:
-            optimizer.step()
-        else:
-            scaler.step(optimizer)
-            scaler.update()
+        should_step = ((i + 1) % accumulation_steps == 0) or ((i + 1) >= max_steps)
+        if should_step:
+            if scaler is None:
+                optimizer.step()
+            else:
+                scaler.step(optimizer)
+                scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+            optimizer_steps += 1
 
         benchmark_optimizer[0] += time() - benchmark_timer
         benchmark_optimizer[1] += 1
@@ -219,11 +227,13 @@ def train_one_epoch(
         ddp_loss[1] += 1
 
         if is_main_process():
-            inner_pbar.set_postfix(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
+            postfix = {"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"]}
+            if hasattr(loss_func, "get_last_terms"):
+                last_terms = loss_func.get_last_terms()
+                for name, value in list(last_terms.items())[:2]:
+                    postfix[name] = value
+            inner_pbar.set_postfix(**postfix)
             inner_pbar.update(1)
-
-
-        scheduler.step()
 
         # model.module.swap_masking()
 
@@ -249,7 +259,9 @@ def train_one_epoch(
         'train.benchmark.total': benchmark_total[0] / benchmark_total[1],
         'train.benchmark.samples': benchmark_samples,
         'train.num_gpus': node_count,
-        'train.benchmark.data.batch_mean': benchmark_batch_mean[0] / benchmark_batch_mean[1]
+        'train.benchmark.data.batch_mean': benchmark_batch_mean[0] / benchmark_batch_mean[1],
+        'train.gradient_accumulation_steps': accumulation_steps,
+        'train.optimizer_steps': optimizer_steps,
     }
 
     metrics = metrics 
@@ -309,8 +321,9 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
-        print(f"Learning rate: {scheduler.get_last_lr()[0]}")
-        print(f"Rank {local_rank} starting epoch {epoch + 1}...")
+        if is_main_process():
+            print(f"Learning rate: {scheduler.get_last_lr()[0]}")
+            print(f"Rank {local_rank} starting epoch {epoch + 1}...")
 
         curr_train_loss, _ = train_one_epoch(
             model=model,
@@ -324,6 +337,7 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
             gpu=use_gpu,
             limit_steps=config.limit_steps_train,
             num_epochs=config.num_epochs,
+            gradient_accumulation_steps=int(getattr(config, "gradient_accumulation_steps", 1)),
         )
 
         # Free cached training allocations before validation to reduce fragmentation/OOM risk.

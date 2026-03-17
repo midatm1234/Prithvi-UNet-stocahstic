@@ -3,6 +3,183 @@
 ## Overview
 This folder hosts the CORDEX-ML benchmark workflows for multiple regional domains—European Alps (ALPS), New Zealand (NZ), and South Africa (SA)—demonstrating how to fine-tune the Prithvi WxC UNet on coarse CORDEX predictors and produce high-resolution precipitation (`pr`) and maximum temperature (`tasmax`) forecasts. The assets here reuse the helper scripts (`preproc_cordex.py`, `compute_scalars_cordex.py`, `cordex_training.py`, and the notebooks in `notebooks/`) to cover the full loop: preprocess/regrid → compute scalars → fine-tune → inference → persist predictions as NetCDF.
 
+## CORDEX v4 updates (new default path)
+
+The repository now supports a reproducible v4 CORDEX path with updated normalization, optional distribution-aware losses, and multi-GPU execution. The v4 YAMLs (`*_v4.yaml`) are the recommended defaults for new training and inference runs.
+
+### 1) Gridpoint-wise target normalization
+
+v4 supports per-predictand normalization settings under `predictands.<name>.normalization`:
+
+- `method`: `standardize` or `log1p_standardize`
+- `mode`: `global` or `gridpoint`
+- `eps_std`: numerical floor for small std values
+
+For `mode: gridpoint`, target statistics are computed at each `(lat, lon)` grid point over time and saved in `targets_mean.npy` / `targets_std.npy` with shape `[C, H, W]` (instead of `[C]`).
+
+Why this helps: climate fields are spatially heterogeneous, so a single global mean/std can over-normalize some regions and under-normalize others; gridpoint-wise stats preserve local climatology and improve conditioning.
+
+### 2) `pr` log1p normalization and inverse transform
+
+For precipitation in v4, use:
+
+```yaml
+predictands:
+  pr:
+    normalization:
+      method: log1p_standardize
+      mode: gridpoint
+      eps_std: 1.0e-6
+      allow_negative_value: false
+  tasmax:
+    normalization:
+      method: standardize
+      mode: gridpoint
+      eps_std: 1.0e-6
+```
+
+Transform and inverse are:
+
+- forward: `log1p(max(pr, 0))`, then standardize
+- inverse: de-standardize, then `expm1`, then clamp tiny negative roundoff to zero
+
+This keeps `pr=0` valid and yields non-negative denormalized precipitation.
+
+### 3) Optional distribution-aware losses
+
+Loss is now configurable with a base RMSE plus optional per-predictand distribution penalties:
+
+- `moment`: mean/std/skewness matching
+- `quantile`: selected quantile matching
+- `cdf`: soft CDF matching
+
+Example:
+
+```yaml
+loss:
+  base: rmse
+  predictands:
+    tasmax:
+      distribution_loss:
+        enabled: true
+        method: moment
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: false
+    pr:
+      distribution_loss:
+        enabled: false
+```
+
+Recommended first setting: `tasmax` with `moment` loss and a small weight (for example `0.01` to `0.05`).
+
+### 4) Block-boundary artifact mitigation policy
+
+v4 treats seam deblocking as fallback only. Primary controls target root causes in tiled reconstruction:
+
+- overlap size
+- blend mode (`cosine` or `uniform`)
+- tile size / stride consistency
+- scaler alignment per tile (`__scaler_offset`) for gridpoint denormalization
+
+Optional seam deblock is boundary-local and conservative:
+
+```yaml
+inference:
+  boundary_mitigation:
+    enabled: true
+    tile_size: [256, 256]
+    overlap: [64, 64]
+    blend_mode: cosine
+    deblock:
+      enabled: false
+      boundary_width: 2
+      strength: 0.15
+      kernel_size: 3
+```
+
+### 5) Multi-GPU fine-tuning and effective batch size
+
+Fine-tuning supports DDP/FSDP execution and gradient accumulation. The effective batch size is:
+
+`effective_batch_size = per_device_batch_size * world_size * gradient_accumulation_steps`
+
+YAML example:
+
+```yaml
+training:
+  distributed: ddp
+  num_gpus: 4
+  per_device_batch_size: 8
+  gradient_accumulation_steps: 4
+```
+
+Launch on selected GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
+  examples/CORDEX_ML/cordex_finetune.py \
+  --config examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static_v4.yaml
+```
+
+Training logs print per-device batch size, world size, accumulation steps, and effective batch size.
+
+### 6) Multi-GPU inference
+
+Inference scripts support one process per GPU via `torchrun`. Work is sharded by run index to increase throughput without spatially splitting individual fields.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
+  examples/CORDEX_ML/notebooks/NZ_downscaling_inference_T1_ACCESS-CM2_static.py
+```
+
+This avoids duplicate predictions across ranks and preserves deterministic output writing per run index.
+
+### 7) v4 config and run backups
+
+- All CORDEX YAMLs have `*_v4.yaml` copies.
+- Existing runs/checkpoints/metadata were copied to sibling `runs_v4` directories.
+- Prediction outputs are intentionally excluded from `runs_v4` backups.
+
+### 8) Compatibility notes
+
+- Old configs remain supported (`predictands.<name>.scaling` still works).
+- Old checkpoints can be loaded with v4 configs; scaler tensors from checkpoints are ignored so current config/scalar files remain authoritative.
+- Scientific comparability: models trained with legacy global normalization are not directly equivalent to v4 gridpoint normalization. Compare metrics side-by-side before drawing conclusions.
+
+### 9) Reproducible validation commands
+
+```bash
+cd /mnt/data2/kyo/granite-wxc
+
+# Syntax
+python -m py_compile $(find examples/CORDEX_ML -name "*.py" -type f)
+
+# YAML parse
+python - <<'PY'
+from pathlib import Path
+import yaml
+for p in Path("examples/CORDEX_ML").rglob("*.yaml"):
+    with open(p) as f:
+        yaml.safe_load(f)
+print("YAML validation passed")
+PY
+
+# v4 setup validation (writes JSON summary)
+python examples/CORDEX_ML/utils/validate_v4_setup.py \
+  --output-json examples/CORDEX_ML/evaluations/v4_validation_summary.json
+
+# Baseline vs v4 metric comparison (requires numpy/torch runtime)
+python examples/CORDEX_ML/utils/evaluate_v4_outputs.py \
+  --baseline-config examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static.yaml \
+  --v4-config examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static_v4.yaml \
+  --checkpoint examples/CORDEX_ML/runs_v4/NZ_T1_ACCESS-CM2_static_train/NZ_T1_ACCESS-CM2_static/checkpoints/best.ckpt \
+  --num-samples 64 \
+  --batch-size 1 \
+  --output-json examples/CORDEX_ML/evaluations/NZ_T1_static_v4_eval.json
+```
+
 ## Data (Zenodo)
 - **Source**: [CORDEX-ML Benchmark](https://zenodo.org/records/17517423) provides data for multiple domains. The Zenodo record includes coarse predictors, high-resolution targets, and static fields for ALPS, NZ, and SA regions.
 - **Inputs**: CORDEX coarse predictors (multi-level dynamics plus static orography) stored under the benchmark's domain-specific `predictors` folders (e.g., `CORDEX/ALPS_domain/`, `CORDEX/NZ_domain/`, `CORDEX/SA_domain/`).
@@ -257,13 +434,20 @@ The model accepts multi-level atmospheric predictors from CORDEX regional climat
 - **Output shape**: 256×256 pixels per variable (2 channels total)
 
 ### Normalization Scheme
-Target scaling is now configured per predictand in YAML:
-- `pr` defaults in example CORDEX YAMLs: `allow_negative_value: false`, `nonnegativity.enabled: true`, `nonnegativity.method: softplus`, `scaling.method: divide_only`, `scale_stat: fixed`, `fixed_scale: 100.0`.
-- `tasmax` defaults: `allow_negative_value: false`, `nonnegativity.enabled: false`, `scaling.method: zscore`.
-- `divide_only` means no centering (`target_mu=0`) and scale-only inverse (`y = y_scaled * scale`), which preserves non-negativity when combined with a positive link.
-- `zscore` keeps the usual inverse (`y = y_scaled * std + mean`).
-- Inputs remain channel-wise standardized with pre-computed `input_mu` and `input_sigma`.
-- If you change predictand scaling/nonnegativity settings in YAML, recompute scalars and then rerun fine-tuning before inference.
+v4 defaults use per-predictand `normalization` config with gridpoint statistics:
+
+- `tasmax`: `method: standardize`, `mode: gridpoint`
+- `pr`: `method: log1p_standardize`, `mode: gridpoint`, `allow_negative_value: false`
+- `eps_std` avoids division by near-zero local std values
+
+Scalars are computed from training targets over the time axis and saved as `.npy` arrays:
+
+- global mode: shape `[C]`
+- gridpoint mode: shape `[C, H, W]`
+
+Inputs remain channel-wise standardized by `input_mu` and `input_sigma`.
+
+When normalization settings change, recompute scalars and retrain/re-evaluate before using for production inference.
 
 ### Softplus vs Zscore, and `scale_stat` choices
 `softplus` and `zscore` are not interchangeable knobs; they act at different steps:
@@ -271,8 +455,9 @@ Target scaling is now configured per predictand in YAML:
 | Setting | What it does | Typical use |
 |---|---|---|
 | `nonnegativity.method: softplus` | Applies `softplus(raw_output)` in decoding, so decoded values are always `>= 0` before inverse scaling. | Physically non-negative predictands (for example `pr`). |
-| `scaling.method: zscore` | Scales target as `(y - mean) / std`; inverse is `y = y_scaled * std + mean`. This can produce negative values. | Temperature-like predictands (`tasmax`) and other approximately symmetric variables. |
-| `scaling.method: divide_only` | Scales as `y / scale` with `target_mu=0`; inverse is `y = y_scaled * scale`. With `softplus`, output stays non-negative by construction. | Precipitation (`pr`) when non-negativity is required. |
+| `normalization.method: standardize` | Scales target as `(y - mean) / std`; inverse is `y = y_scaled * std + mean`. This can produce negative values. | Temperature-like predictands (`tasmax`) and other approximately symmetric variables. |
+| `normalization.method: log1p_standardize` | Scales transformed target `(log1p(max(y,0)) - mean) / std`; inverse is `expm1(y_scaled * std + mean)`. | Precipitation (`pr`) with zero-heavy and skewed distribution. |
+| `scaling.method: divide_only` | Legacy scale-only normalization (`target_mu=0`, `y = y_scaled * scale`). Still supported for backward compatibility. | Legacy configs/checkpoints. |
 
 For `divide_only`, `scale_stat` controls the scale magnitude:
 
@@ -287,10 +472,10 @@ All four `scale_stat` options still allow arbitrarily large physical precipitati
 
 ### `allow_negative_value` Semantics
 - `allow_negative_value: false` is the default for every predictand.
-- For physically non-negative predictands (at minimum `pr`), `allow_negative_value: false` enables nonnegative decoding by construction (`softplus` + divide-only scaling) unless explicitly overridden.
+- For physically non-negative predictands (at minimum `pr`), `allow_negative_value: false` keeps precipitation non-negative after inverse transform (`expm1` path with tiny-negative clamp).
 - For temperature-like predictands (for example `tasmax` in degC), nonnegativity remains disabled by default even when `allow_negative_value: false`; this is intentional and logged as a warning.
 - **Scalars are computed separately** for static and dynamic inputs when applicable
-- Normalization files are stored as `.npy` arrays (NumPy format) with shape `[num_channels]`
+- Normalization files are stored as `.npy` arrays (NumPy format) with shape `[num_channels]` or `[num_channels, lat, lon]` in gridpoint mode
 
 ### Framework and Libraries
 - **Deep learning framework**: PyTorch (with PyTorch Lightning for training orchestration)
@@ -315,7 +500,8 @@ All four `scale_stat` options still allow arbitrarily large physical precipitati
 - **Learning rate scheduler**: Cosine annealing with min/max bounds
 
 #### Gradient Accumulation & Optimization
-- **Maximum batch size** (`max_batch_size`): 4 (effective batch size via gradient accumulation)
+- **Gradient accumulation** (`gradient_accumulation_steps`): configurable in YAML
+- **Effective batch size**: `per_device_batch_size * num_gpus * gradient_accumulation_steps`
 - **Optimizer**: Adam (default PyTorch Lightning optimizer)
 
 #### Step Limits (for faster iteration during debugging)
@@ -324,9 +510,13 @@ All four `scale_stat` options still allow arbitrarily large physical precipitati
 - *Note*: Set to 0 (or omitted) to use full dataset
 
 ### Loss Function
-- **Primary loss**: Root Mean Squared Error (RMSE)
-- **Formula**: $\text{RMSE} = \sqrt{\frac{1}{N}\sum_{i=1}^{N}(\hat{y}_i - y_i)^2}$
-- **Evaluation metrics**: RMSE on validation set; best model checkpoint saved based on lowest validation RMSE
+- **Base loss**: Root Mean Squared Error (RMSE)
+- **Optional per-predictand distribution losses**:
+  - moment (`mean`, `std`, optional `skewness`)
+  - quantile
+  - CDF (soft empirical CDF matching)
+- **Final loss**: `rmse + sum(weight_i * distribution_loss_i)`
+- **Logging**: training logs include active loss terms and weighted contributions
 
 ### Masking Strategy (Optional)
 - **Mask unit size** (`mask_unit_size`): [16, 16] (adaptive masking support)

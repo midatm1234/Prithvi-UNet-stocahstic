@@ -13,6 +13,20 @@ from granitewxc.utils.target_transforms import PositivePrecipLink
 from granitewxc.models.finetune_model import FinetuneWrapper
 
 
+def _reshape_output_scaler_tensor(name: str, tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if tensor.ndim == 1:
+        return tensor.reshape(1, -1, 1, 1)
+    if tensor.ndim == 3:
+        return tensor.unsqueeze(0)
+    if tensor.ndim == 4 and tensor.shape[0] == 1:
+        return tensor
+    raise ValueError(
+        f"{name} must have shape [C], [C,H,W], or [1,C,H,W], got {tuple(tensor.shape)}"
+    )
+
+
 class ClimateECCCFinetuneWrapper(FinetuneWrapper):
     """ General purpose wrapper class to finetune using us configurable head and backbone """
 
@@ -184,11 +198,13 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
         if output_scalers_mu is not None:
             self.output_scalers_mu = torch.nn.Parameter(
-                output_scalers_mu.reshape(1, -1, 1, 1), requires_grad=False
+                _reshape_output_scaler_tensor("output_scalers_mu", output_scalers_mu),
+                requires_grad=False,
             )
 
         self.output_scalers_sigma = torch.nn.Parameter(
-            output_scalers_sigma.reshape(1, -1, 1, 1), requires_grad=False
+            _reshape_output_scaler_tensor("output_scalers_sigma", output_scalers_sigma),
+            requires_grad=False,
         )
 
         # ----- to be used in  UNET
@@ -283,7 +299,12 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         scaling_codes = []
         nonneg_enabled = []
         nonneg_codes = []
-        scaling_to_code = {"zscore": 0, "divide_only": 1, "log1p_zscore": 2}
+        scaling_to_code = {
+            "zscore": 0,
+            "divide_only": 1,
+            "log1p_zscore": 2,
+            "log1p_standardize": 2,
+        }
         nonneg_to_code = {"none": 0, "softplus": 1, "exp": 2}
         for idx, spec in enumerate(specs):
             scaling_method = spec.scaling.method
@@ -293,11 +314,13 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             nonneg_codes.append(nonneg_to_code[nonneg_method])
 
             if scaling_method == "divide_only" and hasattr(self, "output_scalers_mu"):
-                mu_val = float(self.output_scalers_mu[0, idx, 0, 0].item())
-                if abs(mu_val) > 1e-6:
+                mu_slice = self.output_scalers_mu[0, idx, ...]
+                mu_abs_max = float(torch.abs(mu_slice).max().item())
+                if mu_abs_max > 1e-6:
                     raise ValueError(
                         f"predictands.{spec.name}.scaling.method=divide_only requires zero target_mu, "
-                        f"but loaded target_mu[{idx}]={mu_val:.6g}. Recompute scalers or use legacy config."
+                        f"but loaded max(|target_mu[{idx}]|)={mu_abs_max:.6g}. "
+                        "Recompute scalers or use legacy config."
                     )
 
         self.output_var_names = output_vars
@@ -340,13 +363,42 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 )
         return constrained
 
-    def _decode_outputs(self, raw_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        constrained = self._apply_output_constraints(raw_out)
-        sigma = self.output_scalers_sigma.to(device=constrained.device, dtype=constrained.dtype)
+    def _resolve_output_scalers(
+        self,
+        constrained: torch.Tensor,
+        scaler_offset: tuple[int, int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sigma_full = self.output_scalers_sigma.to(device=constrained.device, dtype=constrained.dtype)
         if hasattr(self, "output_scalers_mu"):
-            mu = self.output_scalers_mu.to(device=constrained.device, dtype=constrained.dtype)
+            mu_full = self.output_scalers_mu.to(device=constrained.device, dtype=constrained.dtype)
         else:
-            mu = torch.zeros_like(sigma)
+            mu_full = torch.zeros_like(sigma_full)
+
+        h, w = constrained.shape[-2:]
+        if sigma_full.shape[-2:] == (1, 1) or sigma_full.shape[-2:] == (h, w):
+            return mu_full, sigma_full
+
+        if scaler_offset is not None:
+            y0, x0 = int(scaler_offset[0]), int(scaler_offset[1])
+            y1, x1 = y0 + h, x0 + w
+            if 0 <= y0 and 0 <= x0 and y1 <= sigma_full.shape[-2] and x1 <= sigma_full.shape[-1]:
+                return (
+                    mu_full[..., y0:y1, x0:x1],
+                    sigma_full[..., y0:y1, x0:x1],
+                )
+
+        # Conservative fallback for mismatched grids.
+        sigma = F.interpolate(sigma_full, size=(h, w), mode="nearest")
+        mu = F.interpolate(mu_full, size=(h, w), mode="nearest")
+        return mu, sigma
+
+    def _decode_outputs(
+        self,
+        raw_out: torch.Tensor,
+        scaler_offset: tuple[int, int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        constrained = self._apply_output_constraints(raw_out)
+        mu, sigma = self._resolve_output_scalers(constrained, scaler_offset=scaler_offset)
         decoded = constrained * sigma + mu
 
         method_codes = self.predictand_scaling_method_codes.to(device=constrained.device)
@@ -356,10 +408,17 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
         log1p_mask = method_codes == 2
         if bool(log1p_mask.any().item()):
-            decoded[:, log1p_mask, ...] = torch.expm1(
+            log_decoded = torch.expm1(
                 constrained[:, log1p_mask, ...] * sigma[:, log1p_mask, ...]
                 + mu[:, log1p_mask, ...]
             )
+            tiny_negative_tol = 1e-7
+            log_decoded = torch.where(
+                (log_decoded < 0.0) & (log_decoded > -tiny_negative_tol),
+                torch.zeros_like(log_decoded),
+                log_decoded,
+            )
+            decoded[:, log1p_mask, ...] = log_decoded
 
         return decoded, constrained
 
@@ -551,7 +610,8 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         x = self.output_conv_block(out)
 
         raw_out = x
-        x_out, x_pre_inverse = self._decode_outputs(raw_out)
+        scaler_offset = batch.get("__scaler_offset")
+        x_out, x_pre_inverse = self._decode_outputs(raw_out, scaler_offset=scaler_offset)
         expected_hw = batch["y"].shape[-2:]
         if x_out.shape[-2:] != expected_hw:
             x_out = F.interpolate(
@@ -720,10 +780,12 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
 
         if output_scalers_mu is not None:
             self.output_scalers_mu = torch.nn.Parameter(
-                output_scalers_mu.reshape(1, -1, 1, 1), requires_grad=False
+                _reshape_output_scaler_tensor("output_scalers_mu", output_scalers_mu),
+                requires_grad=False,
             )
         self.output_scalers_sigma = torch.nn.Parameter(
-            output_scalers_sigma.reshape(1, -1, 1, 1), requires_grad=False
+            _reshape_output_scaler_tensor("output_scalers_sigma", output_scalers_sigma),
+            requires_grad=False,
         )
 
         self.patch_size_px = patch_size_px_backbone
@@ -763,7 +825,12 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
         scaling_codes = []
         nonneg_enabled = []
         nonneg_codes = []
-        scaling_to_code = {"zscore": 0, "divide_only": 1, "log1p_zscore": 2}
+        scaling_to_code = {
+            "zscore": 0,
+            "divide_only": 1,
+            "log1p_zscore": 2,
+            "log1p_standardize": 2,
+        }
         nonneg_to_code = {"none": 0, "softplus": 1, "exp": 2}
         for idx, spec in enumerate(specs):
             scaling_method = spec.scaling.method
@@ -773,11 +840,13 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
             nonneg_codes.append(nonneg_to_code[nonneg_method])
 
             if scaling_method == "divide_only" and hasattr(self, "output_scalers_mu"):
-                mu_val = float(self.output_scalers_mu[0, idx, 0, 0].item())
-                if abs(mu_val) > 1e-6:
+                mu_slice = self.output_scalers_mu[0, idx, ...]
+                mu_abs_max = float(torch.abs(mu_slice).max().item())
+                if mu_abs_max > 1e-6:
                     raise ValueError(
                         f"predictands.{spec.name}.scaling.method=divide_only requires zero target_mu, "
-                        f"but loaded target_mu[{idx}]={mu_val:.6g}. Recompute scalers or use legacy config."
+                        f"but loaded max(|target_mu[{idx}]|)={mu_abs_max:.6g}. "
+                        "Recompute scalers or use legacy config."
                     )
 
         self.output_var_names = output_vars
@@ -820,13 +889,41 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
                 )
         return constrained
 
-    def _decode_outputs(self, raw_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        constrained = self._apply_output_constraints(raw_out)
-        sigma = self.output_scalers_sigma.to(device=constrained.device, dtype=constrained.dtype)
+    def _resolve_output_scalers(
+        self,
+        constrained: torch.Tensor,
+        scaler_offset: tuple[int, int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sigma_full = self.output_scalers_sigma.to(device=constrained.device, dtype=constrained.dtype)
         if hasattr(self, "output_scalers_mu"):
-            mu = self.output_scalers_mu.to(device=constrained.device, dtype=constrained.dtype)
+            mu_full = self.output_scalers_mu.to(device=constrained.device, dtype=constrained.dtype)
         else:
-            mu = torch.zeros_like(sigma)
+            mu_full = torch.zeros_like(sigma_full)
+
+        h, w = constrained.shape[-2:]
+        if sigma_full.shape[-2:] == (1, 1) or sigma_full.shape[-2:] == (h, w):
+            return mu_full, sigma_full
+
+        if scaler_offset is not None:
+            y0, x0 = int(scaler_offset[0]), int(scaler_offset[1])
+            y1, x1 = y0 + h, x0 + w
+            if 0 <= y0 and 0 <= x0 and y1 <= sigma_full.shape[-2] and x1 <= sigma_full.shape[-1]:
+                return (
+                    mu_full[..., y0:y1, x0:x1],
+                    sigma_full[..., y0:y1, x0:x1],
+                )
+
+        sigma = F.interpolate(sigma_full, size=(h, w), mode="nearest")
+        mu = F.interpolate(mu_full, size=(h, w), mode="nearest")
+        return mu, sigma
+
+    def _decode_outputs(
+        self,
+        raw_out: torch.Tensor,
+        scaler_offset: tuple[int, int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        constrained = self._apply_output_constraints(raw_out)
+        mu, sigma = self._resolve_output_scalers(constrained, scaler_offset=scaler_offset)
 
         decoded = constrained * sigma + mu
 
@@ -837,10 +934,17 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
 
         log1p_mask = method_codes == 2
         if bool(log1p_mask.any().item()):
-            decoded[:, log1p_mask, ...] = torch.expm1(
+            log_decoded = torch.expm1(
                 constrained[:, log1p_mask, ...] * sigma[:, log1p_mask, ...]
                 + mu[:, log1p_mask, ...]
             )
+            tiny_negative_tol = 1e-7
+            log_decoded = torch.where(
+                (log_decoded < 0.0) & (log_decoded > -tiny_negative_tol),
+                torch.zeros_like(log_decoded),
+                log_decoded,
+            )
+            decoded[:, log1p_mask, ...] = log_decoded
 
         return decoded, constrained
 
@@ -977,7 +1081,8 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
             x_out = self.output_scalers_sigma * x + batch['climate_y']
             x_pre_inverse = x
         else:
-            x_out, x_pre_inverse = self._decode_outputs(raw_out)
+            scaler_offset = batch.get("__scaler_offset")
+            x_out, x_pre_inverse = self._decode_outputs(raw_out, scaler_offset=scaler_offset)
 
         if return_pre_inverse and return_raw_output:
             return x_out, x_pre_inverse, raw_out

@@ -71,11 +71,16 @@ def get_scalers(config: ExperimentConfig):
 
         for idx, spec in enumerate(specs):
             if spec.scaling.method == "divide_only":
-                mu_value = float(target_mu[idx].item())
-                if abs(mu_value) > 1e-6:
+                mu_slice = target_mu[idx]
+                if mu_slice.ndim == 0:
+                    mu_abs_max = float(torch.abs(mu_slice).item())
+                else:
+                    mu_abs_max = float(torch.abs(mu_slice).max().item())
+                if mu_abs_max > 1e-6:
                     raise ValueError(
                         f"predictands.{spec.name}.scaling.method='divide_only' requires "
-                        f"target_mu[{idx}] == 0, got {mu_value:.6g}. Recompute scalers."
+                        f"target_mu[{idx}] == 0, got max(|mu|)={mu_abs_max:.6g}. "
+                        "Recompute scalers."
                     )
 
         static_channels = int(getattr(config.model, "num_static_channels", 1))
