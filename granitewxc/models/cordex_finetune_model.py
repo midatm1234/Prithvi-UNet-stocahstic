@@ -13,6 +13,29 @@ from granitewxc.utils.target_transforms import PositivePrecipLink
 from granitewxc.models.finetune_model import FinetuneWrapper
 
 
+PRECIP_VAR_NAMES = {"pr", "precip", "precipitation"}
+
+
+def _canonicalize_precip_model(value: str | None) -> str:
+    text = str(value or "single_head").strip().lower()
+    aliases = {
+        "single": "single_head",
+        "single_head": "single_head",
+        "default": "single_head",
+        "legacy": "single_head",
+        "hurdle": "hurdle",
+        "bernoulli_positive": "hurdle",
+        "bernoulli_plus_positive": "hurdle",
+        "bernoulli_positive_amount": "hurdle",
+        "bernoulli-plus-positive-amount": "hurdle",
+    }
+    if text not in aliases:
+        raise ValueError(
+            f"Unsupported precip_model '{value}'. Expected one of {sorted(aliases)}."
+        )
+    return aliases[text]
+
+
 def _reshape_output_scaler_tensor(name: str, tensor: torch.Tensor | None) -> torch.Tensor | None:
     if tensor is None:
         return None
@@ -253,10 +276,12 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             ))
 
         current_ch = config.model.encoder_decoder_conv_channels + self.downscaling_embed_dim
+        self._decoder_output_channels = current_ch
         self.output_conv_block = nn.Sequential(nn.Conv2d(current_ch, current_ch, kernel_size=3, stride=1, padding='same', padding_mode='replicate'),
                                                nn.LeakyReLU(),
                                                nn.Conv2d(current_ch, out_channels, kernel_size=3, stride=1, padding='same', padding_mode='replicate'),
                                               )
+        self.precip_wet_head: nn.Module | None = None
 
         self.apply(self._init_weights)
         
@@ -272,6 +297,16 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 kernel_size=1,
             )
         self._configure_predictand_decoding(config)
+        if self.precip_hurdle_enabled:
+            self.precip_wet_head = nn.Conv2d(
+                in_channels=self._decoder_output_channels,
+                out_channels=1,
+                kernel_size=3,
+                stride=1,
+                padding='same',
+                padding_mode='replicate',
+            )
+            self._init_weights(self.precip_wet_head)
 
     def _configure_predictand_decoding(self, config: ExperimentConfig | None) -> None:
         n_outputs = int(self.output_scalers_sigma.shape[1])
@@ -323,6 +358,36 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                         "Recompute scalers or use legacy config."
                     )
 
+        precip_model = _canonicalize_precip_model(
+            getattr(config, "precip_model", getattr(config, "precip_head_type", "single_head"))
+            if config is not None
+            else "single_head"
+        )
+        precip_idx = next(
+            (idx for idx, name in enumerate(output_vars) if str(name).lower() in PRECIP_VAR_NAMES),
+            -1,
+        )
+        if precip_model == "hurdle" and precip_idx < 0:
+            raise ValueError(
+                "precip_model='hurdle' requires a precipitation output variable (e.g. 'pr')."
+            )
+        precip_hurdle_enabled = precip_model == "hurdle" and precip_idx >= 0
+        if precip_hurdle_enabled:
+            precip_spec = specs[precip_idx]
+            if precip_spec.scaling.method != "divide_only":
+                raise ValueError(
+                    "precip_model='hurdle' requires divide_only precipitation scaling "
+                    f"(predictands.{precip_spec.name}.scaling.method='divide_only')."
+                )
+            if precip_spec.scaling.scale_stat != "p95":
+                raise ValueError(
+                    "precip_model='hurdle' requires precipitation scaling.scale_stat='p95'."
+                )
+            if precip_spec.scaling.mode != "global":
+                raise ValueError(
+                    "precip_model='hurdle' requires precipitation normalization.mode='global'."
+                )
+
         self.output_var_names = output_vars
         self.register_buffer(
             "predictand_scaling_method_codes",
@@ -339,6 +404,13 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             torch.tensor(nonneg_codes, dtype=torch.int64),
             persistent=False,
         )
+        self.precip_model = precip_model
+        self.precip_channel_index = precip_idx
+        self.precip_hurdle_enabled = precip_hurdle_enabled
+        self.precip_wet_threshold = float(
+            getattr(config, "precip_wet_threshold", 0.5) if config is not None else 0.5
+        )
+        self._last_precip_hurdle_aux = None
         self._precip_softplus_link = PositivePrecipLink()
 
     def _apply_output_constraints(self, raw_out: torch.Tensor) -> torch.Tensor:
@@ -396,6 +468,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         self,
         raw_out: torch.Tensor,
         scaler_offset: tuple[int, int] | None = None,
+        wet_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         constrained = self._apply_output_constraints(raw_out)
         mu, sigma = self._resolve_output_scalers(constrained, scaler_offset=scaler_offset)
@@ -419,6 +492,31 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 log_decoded,
             )
             decoded[:, log1p_mask, ...] = log_decoded
+
+        self._last_precip_hurdle_aux = None
+        if self.precip_hurdle_enabled:
+            if wet_logits is None:
+                raise ValueError("precip_model='hurdle' requires wet_logits during decoding.")
+            pr_idx = int(self.precip_channel_index)
+            q95 = torch.clamp(sigma[:, pr_idx : pr_idx + 1, ...], min=1e-12)
+            amount_raw = raw_out[:, pr_idx : pr_idx + 1, ...]
+            amount_pred_norm = self._precip_softplus_link(amount_raw)
+            amount_pred = amount_pred_norm * q95
+            p_wet = torch.sigmoid(wet_logits)
+            final_pr = torch.where(
+                p_wet >= self.precip_wet_threshold,
+                amount_pred,
+                torch.zeros_like(amount_pred),
+            )
+            decoded[:, pr_idx : pr_idx + 1, ...] = final_pr
+            constrained[:, pr_idx : pr_idx + 1, ...] = amount_pred_norm
+            self._last_precip_hurdle_aux = {
+                "wet_logits": wet_logits,
+                "p_wet": p_wet,
+                "amount_pred_norm": amount_pred_norm,
+                "amount_pred": amount_pred,
+                "q95": q95,
+            }
 
         return decoded, constrained
 
@@ -608,10 +706,19 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             out = torch.cat((upsampled, skip), dim=1)
 
         x = self.output_conv_block(out)
+        wet_logits = None
+        if self.precip_hurdle_enabled:
+            if self.precip_wet_head is None:
+                raise ValueError("precip_model='hurdle' requested but precip_wet_head is not initialized.")
+            wet_logits = self.precip_wet_head(out)
 
         raw_out = x
         scaler_offset = batch.get("__scaler_offset")
-        x_out, x_pre_inverse = self._decode_outputs(raw_out, scaler_offset=scaler_offset)
+        x_out, x_pre_inverse = self._decode_outputs(
+            raw_out,
+            scaler_offset=scaler_offset,
+            wet_logits=wet_logits,
+        )
         expected_hw = batch["y"].shape[-2:]
         if x_out.shape[-2:] != expected_hw:
             x_out = F.interpolate(
@@ -632,6 +739,37 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 mode="bilinear",
                 align_corners=False,
             )
+            if self._last_precip_hurdle_aux is not None:
+                self._last_precip_hurdle_aux["wet_logits"] = F.interpolate(
+                    self._last_precip_hurdle_aux["wet_logits"],
+                    size=expected_hw,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                self._last_precip_hurdle_aux["p_wet"] = torch.sigmoid(
+                    self._last_precip_hurdle_aux["wet_logits"]
+                )
+                self._last_precip_hurdle_aux["amount_pred_norm"] = F.interpolate(
+                    self._last_precip_hurdle_aux["amount_pred_norm"],
+                    size=expected_hw,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                self._last_precip_hurdle_aux["q95"] = F.interpolate(
+                    self._last_precip_hurdle_aux["q95"],
+                    size=expected_hw,
+                    mode="nearest",
+                )
+                amount_pred = (
+                    self._last_precip_hurdle_aux["amount_pred_norm"]
+                    * self._last_precip_hurdle_aux["q95"]
+                )
+                self._last_precip_hurdle_aux["amount_pred"] = amount_pred
+
+        if self._last_precip_hurdle_aux is not None:
+            batch["__precip_hurdle_aux"] = self._last_precip_hurdle_aux
+        else:
+            batch.pop("__precip_hurdle_aux", None)
 
         if return_pre_inverse and return_raw_output:
             return x_out, x_pre_inverse, raw_out
@@ -640,6 +778,9 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         if return_raw_output:
             return x_out, raw_out
         return x_out
+
+    def get_last_precip_hurdle_aux(self) -> dict[str, torch.Tensor] | None:
+        return self._last_precip_hurdle_aux
 
     # ----------------------
     # Utility helpers

@@ -61,12 +61,12 @@ predictands:
       enabled: true
       method: softplus
     scaling:
-      method: log1p_standardize
-      scale_stat: mean
+      method: divide_only
+      scale_stat: p95
       fixed_scale: null
     normalization:
-      method: log1p_standardize
-      mode: gridpoint
+      method: divide_only
+      mode: global
       eps_std: 1.0e-06
       allow_negative_value: false
   tasmax:
@@ -114,8 +114,8 @@ model:
   unet: true
 job_id: cordex_nz_small
 type_training: full_dataset
-batch_size: 16
-num_epochs: 5
+batch_size: 64
+num_epochs: 10
 dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 5.0e-05
@@ -159,19 +159,19 @@ inference:
       strength: 0.15
       kernel_size: 3
 training:
-  distributed: ddp
-  num_gpus: 4
+  distributed: fsdp
+  num_gpus: 1
   per_device_batch_size: 1
-  gradient_accumulation_steps: 1
-gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 32
+gradient_accumulation_steps: 32
 loss:
   base: rmse
   predictands:
     pr:
       distribution_loss:
-        enabled: true
+        enabled: false
         method: cdf
-        weight: 0.05
+        weight: 0.0
         bins: 100
     tasmax:
       distribution_loss:
@@ -182,3 +182,10 @@ loss:
         use_std: true
         use_skewness: false
         bins: 100
+resume_training: false
+resume_checkpoint_path: null
+precip_model: hurdle
+precip_wet_threshold: 0.5
+precip_lambda_occurrence: 1.0
+precip_lambda_amount: 1.0
+precip_amount_loss_type: smoothl1

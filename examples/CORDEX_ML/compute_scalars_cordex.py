@@ -278,6 +278,11 @@ def compute_scalars(
 
     rng = np.random.default_rng(42)
     divide_only_quantiles = {"p90", "p95", "p99"}
+    log1p_channels = {
+        idx
+        for idx, spec in enumerate(target_specs)
+        if spec.scaling.method in {"log1p_standardize", "log1p_zscore"}
+    }
     divide_only_sample_channels = {
         idx: []
         for idx, spec in enumerate(target_specs)
@@ -294,7 +299,12 @@ def compute_scalars(
             x_flat = x.view(x.shape[0], -1)
             y_flat = y.view(y.shape[0], -1)
             y_nonnegative = torch.clamp(y_flat, min=0.0)
-            y_log = torch.log1p(y_nonnegative)
+            y_log = torch.zeros_like(y_flat)
+            y_log_grid = torch.zeros_like(y)
+            if log1p_channels:
+                log_indices = sorted(log1p_channels)
+                y_log[log_indices, :] = torch.log1p(y_nonnegative[log_indices, :])
+                y_log_grid[log_indices, ...] = y_log[log_indices, :].view_as(y[log_indices, ...])
 
             if x_sum is None:
                 x_sum, x_sumsq = _init_accumulator(x.shape[0])
@@ -315,8 +325,8 @@ def compute_scalars(
             y_log_sumsq += (y_log.pow(2)).sum(dim=1)
             y_grid_sum += y
             y_grid_sumsq += y.pow(2)
-            y_grid_log_sum += y_log.view_as(y)
-            y_grid_log_sumsq += y_log.pow(2).view_as(y)
+            y_grid_log_sum += y_log_grid
+            y_grid_log_sumsq += y_log_grid.pow(2)
 
             x_count += x_flat.shape[1]
             y_count += y_flat.shape[1]

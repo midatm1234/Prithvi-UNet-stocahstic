@@ -19,6 +19,17 @@ SCALING_METHOD_ALIASES = {
     "log1p_standardize": "log1p_standardize",
 }
 ALLOWED_SCALE_STATS = {"mean", "p90", "p95", "p99", "fixed"}
+ALLOWED_PRECIP_MODELS = {
+    "single",
+    "single_head",
+    "default",
+    "legacy",
+    "hurdle",
+    "bernoulli_positive",
+    "bernoulli_plus_positive",
+    "bernoulli_positive_amount",
+    "bernoulli-plus-positive-amount",
+}
 
 
 @dataclass
@@ -77,6 +88,27 @@ def canonicalize_scaling_method(value: Any) -> str:
             f"Expected one of {sorted(ALLOWED_SCALING_METHODS)}."
         )
     return canonical
+
+
+def canonicalize_precip_model(value: Any) -> str:
+    model = str(value or "single_head").strip().lower()
+    if model not in ALLOWED_PRECIP_MODELS:
+        raise ValueError(
+            f"Unsupported precip_model '{value}'. "
+            f"Expected one of {sorted(ALLOWED_PRECIP_MODELS)}."
+        )
+    aliases = {
+        "single": "single_head",
+        "single_head": "single_head",
+        "default": "single_head",
+        "legacy": "single_head",
+        "hurdle": "hurdle",
+        "bernoulli_positive": "hurdle",
+        "bernoulli_plus_positive": "hurdle",
+        "bernoulli_positive_amount": "hurdle",
+        "bernoulli-plus-positive-amount": "hurdle",
+    }
+    return aliases[model]
 
 
 def _parse_predictand_spec(name: str, raw_cfg: Mapping[str, Any]) -> PredictandSpec:
@@ -207,6 +239,37 @@ def build_predictand_specs(
     for var_name in output_vars:
         raw_cfg = raw_predictands.get(var_name, {})
         specs.append(_parse_predictand_spec(var_name, _coerce_mapping(raw_cfg)))
+
+    precip_model = canonicalize_precip_model(
+        getattr(config, "precip_model", getattr(config, "precip_head_type", "single_head"))
+    )
+    if precip_model == "hurdle":
+        precip_spec = next(
+            (spec for spec in specs if spec.name.lower() in PHYSICALLY_NONNEGATIVE_VARS),
+            None,
+        )
+        if precip_spec is None:
+            raise ValueError(
+                "precip_model='hurdle' requires a precipitation predictand (e.g. 'pr')."
+            )
+        if precip_spec.scaling.method != "divide_only":
+            raise ValueError(
+                "precip_model='hurdle' requires precipitation scaling.method='divide_only'."
+            )
+        if precip_spec.scaling.scale_stat != "p95":
+            raise ValueError(
+                "precip_model='hurdle' requires precipitation scaling.scale_stat='p95'."
+            )
+        if precip_spec.scaling.mode != "global":
+            raise ValueError(
+                "precip_model='hurdle' requires precipitation normalization.mode='global' "
+                "so q95 is quantile-based."
+            )
+        if precip_spec.nonnegativity.method != "softplus" or not precip_spec.nonnegativity.enabled:
+            raise ValueError(
+                "precip_model='hurdle' requires precipitation nonnegativity.enabled=True "
+                "and nonnegativity.method='softplus'."
+            )
 
     setattr(config, "predictands", {spec.name: spec.to_dict() for spec in specs})
     return specs

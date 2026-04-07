@@ -434,10 +434,11 @@ The model accepts multi-level atmospheric predictors from CORDEX regional climat
 - **Output shape**: 256×256 pixels per variable (2 channels total)
 
 ### Normalization Scheme
-v4 defaults use per-predictand `normalization` config with gridpoint statistics:
+Current CORDEX configs use per-predictand `normalization` plus optional precipitation hurdle settings:
 
 - `tasmax`: `method: standardize`, `mode: gridpoint`
-- `pr`: `method: log1p_standardize`, `mode: gridpoint`, `allow_negative_value: false`
+- `pr` (single-head legacy): `method: log1p_standardize`, `mode: gridpoint`
+- `pr` (hurdle mode): `method: divide_only`, `scale_stat: p95`, `mode: global`
 - `eps_std` avoids division by near-zero local std values
 
 Scalars are computed from training targets over the time axis and saved as `.npy` arrays:
@@ -457,7 +458,8 @@ When normalization settings change, recompute scalars and retrain/re-evaluate be
 | `nonnegativity.method: softplus` | Applies `softplus(raw_output)` in decoding, so decoded values are always `>= 0` before inverse scaling. | Physically non-negative predictands (for example `pr`). |
 | `normalization.method: standardize` | Scales target as `(y - mean) / std`; inverse is `y = y_scaled * std + mean`. This can produce negative values. | Temperature-like predictands (`tasmax`) and other approximately symmetric variables. |
 | `normalization.method: log1p_standardize` | Scales transformed target `(log1p(max(y,0)) - mean) / std`; inverse is `expm1(y_scaled * std + mean)`. | Precipitation (`pr`) with zero-heavy and skewed distribution. |
-| `scaling.method: divide_only` | Legacy scale-only normalization (`target_mu=0`, `y = y_scaled * scale`). Still supported for backward compatibility. | Legacy configs/checkpoints. |
+| `scaling.method: divide_only` | Scale-only normalization (`target_mu=0`, `y = y_scaled * scale`). In hurdle mode, `scale_stat: p95` supplies the positive-amount `q95`. | Hurdle precipitation amount head (`pr / q95`). |
+| `precip_model: hurdle` | Uses Bernoulli wet-day logits + positive amount head (`softplus`) and outputs exact 0 when `sigmoid(wet_logits) < precip_wet_threshold`. | Precipitation with frequent dry days. |
 
 For `divide_only`, `scale_stat` controls the scale magnitude:
 
@@ -511,11 +513,17 @@ All four `scale_stat` options still allow arbitrarily large physical precipitati
 
 ### Loss Function
 - **Base loss**: Root Mean Squared Error (RMSE)
+- **Hurdle precipitation loss** (when `precip_model: hurdle`):
+  - `BCEWithLogitsLoss(wet_logits, wet_target)` on all pixels
+  - amount loss (`smoothl1` or `mse`) on wet pixels only, using normalized amount target `pr / q95`
+  - weighted sum controlled by `precip_lambda_occurrence` and `precip_lambda_amount`
 - **Optional per-predictand distribution losses**:
   - moment (`mean`, `std`, optional `skewness`)
   - quantile
   - CDF (soft empirical CDF matching)
-- **Final loss**: `rmse + sum(weight_i * distribution_loss_i)`
+- **Final loss**:
+  - non-hurdle: `rmse + sum(weight_i * distribution_loss_i)`
+  - hurdle: `rmse(non-precip vars) + precip_hurdle_loss + sum(non-precip distribution losses)`
 - **Logging**: training logs include active loss terms and weighted contributions
 
 ### Masking Strategy (Optional)
