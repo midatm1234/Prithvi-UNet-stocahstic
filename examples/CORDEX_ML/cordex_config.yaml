@@ -46,7 +46,7 @@ predictands:
       enabled: true
       method: softplus
     scaling:
-      method: log1p_standardize
+      method: divide_only
       scale_stat: p95
       fixed_scale: null
   tasmax:
@@ -106,3 +106,13 @@ backbone_freeze: false
 backbone_prefix: encoder.
 finetune_w_static: true
 strict_matching: false
+
+training:
+  distributed: fsdp
+  num_gpus: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 32
+gradient_accumulation_steps: 32
+
+resume_training: false
+resume_checkpoint_path: null

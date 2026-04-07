@@ -45,7 +45,7 @@ predictands:
       enabled: true
       method: softplus
     scaling:
-      method: log1p_standardize
+      method: divide_only
       scale_stat: p95
       fixed_scale: null
   tasmax:
@@ -85,7 +85,7 @@ model:
 job_id: cordex_nz_small
 type_training: full_dataset
 batch_size: 16
-num_epochs: 5
+num_epochs: 10
 dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 5.0e-05
@@ -111,3 +111,13 @@ fsdp_precision: bf16
 fsdp_min_num_params: 5000000
 backbone_gradient_checkpointing: true
 skip_activation_offload: true
+
+training:
+  distributed: fsdp
+  num_gpus: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 32
+gradient_accumulation_steps: 32
+
+resume_training: false
+resume_checkpoint_path: null
