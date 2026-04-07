@@ -181,18 +181,29 @@ def resolve_checkpoint(params: UserParams, run_dir: Path) -> Path:
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 
     preference = (params.preferred_checkpoint or "best").lower()
-    ordered_patterns: list[str] = []
-    if preference == "best":
-        ordered_patterns = ["*best*.ckpt", "*last*.ckpt"]
-    elif preference == "last":
-        ordered_patterns = ["*last*.ckpt", "*best*.ckpt"]
-    else:
-        ordered_patterns = ["*best*.ckpt", "*last*.ckpt"]
+    best_ckpt = checkpoint_dir / "best.ckpt"
+    last_ckpt = checkpoint_dir / "last.ckpt"
+    def _epoch_index(path: Path) -> int:
+        token = path.stem[len("epoch_") :]
+        return int(token) if token.isdigit() else -1
 
-    for pattern in ordered_patterns:
-        matches = sorted(checkpoint_dir.glob(pattern))
-        if matches:
-            return matches[0]
+    epoch_ckpts = sorted(checkpoint_dir.glob("epoch_*.ckpt"), key=_epoch_index)
+    latest_epoch_ckpt = epoch_ckpts[-1] if epoch_ckpts else None
+
+    ordered_candidates: list[Path] = []
+    if preference == "last":
+        if latest_epoch_ckpt is not None:
+            ordered_candidates.append(latest_epoch_ckpt)
+        ordered_candidates.extend([last_ckpt, best_ckpt])
+    else:
+        ordered_candidates.append(best_ckpt)
+        if latest_epoch_ckpt is not None:
+            ordered_candidates.append(latest_epoch_ckpt)
+        ordered_candidates.append(last_ckpt)
+
+    for candidate in ordered_candidates:
+        if candidate.exists():
+            return candidate
 
     remaining = sorted(
         checkpoint_dir.glob("*.ckpt"), key=lambda path: path.stat().st_mtime, reverse=True

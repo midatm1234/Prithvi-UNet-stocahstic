@@ -229,17 +229,34 @@ def resolve_checkpoint_path(manifest: Mapping[str, Any], preference: str = "best
     """Determine the checkpoint path to load for inference."""
 
     checkpoint_dir = Path(manifest["checkpoint_dir"])
-    candidates = {
-        "best": checkpoint_dir / "best.ckpt",
-        "last": checkpoint_dir / "last.ckpt",
-    }
-    preferred = candidates.get(preference, candidates["best"])
-    if preferred.exists():
-        return preferred
+    best_ckpt = checkpoint_dir / "best.ckpt"
+    last_ckpt = checkpoint_dir / "last.ckpt"
+    def _epoch_index(path: Path) -> int:
+        token = path.stem[len("epoch_") :]
+        return int(token) if token.isdigit() else -1
 
-    for path in candidates.values():
+    epoch_ckpts = sorted(checkpoint_dir.glob("epoch_*.ckpt"), key=_epoch_index)
+    latest_epoch_ckpt = epoch_ckpts[-1] if epoch_ckpts else None
+
+    preference = (preference or "best").lower()
+    ordered: list[Path] = []
+    if preference == "last":
+        if latest_epoch_ckpt is not None:
+            ordered.append(latest_epoch_ckpt)
+        ordered.extend([last_ckpt, best_ckpt])
+    else:
+        ordered.append(best_ckpt)
+        if latest_epoch_ckpt is not None:
+            ordered.append(latest_epoch_ckpt)
+        ordered.append(last_ckpt)
+
+    for path in ordered:
         if path.exists():
             return path
+
+    fallback = sorted(checkpoint_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if fallback:
+        return fallback[0]
     raise FileNotFoundError(f"No checkpoint available under {checkpoint_dir}")
 
 

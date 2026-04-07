@@ -82,32 +82,32 @@ PREDICTION_OUTPUT_NAMES = ["Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc", "Pre
         "Predictions_pr_tasmax_ACCESS-CM2_2080-2099.nc", "Predictions_pr_tasmax_EC-Earth3_2080-2099.nc"
 ]
 
-INFERENCE_OUTPUT_ROOTS = ["/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v5/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/imperfect/"
+INFERENCE_OUTPUT_ROOTS = ["/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/historical/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/historical/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/historical/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/historical/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/perfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/imperfect/",
+        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_static_train/predictions/end-century/imperfect/"
 ]
 
 # Fixed config for the fine-tuned model
 REPO_ROOT = REPO_ROOT.resolve()
 PROJECT_DIR = PROJECT_DIR.resolve()
 DATASET_ROOT = REPO_ROOT / "granite-geospatial-wxc-downscaling/CORDEX/NZ_domain"
-RUNS_ROOT = PROJECT_DIR / "runs_v5/NZ_T2_ACCESS-CM2_static_train"
-CONFIG_PATH = PROJECT_DIR / "NZ_T2_ACCESS-CM2_static_v5.yaml"
+CONFIG_PATH = PROJECT_DIR / "NZ_T2_ACCESS-CM2_static_v6.yaml"
+RUNS_ROOT = PROJECT_DIR / f"runs_v6/{CONFIG_PATH.stem.replace('_v6', '')}_train"
 
 TRAIN_SPLIT = "train/Emulator_hist_future"
 TARGET_TEMPLATE_FILE = "pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc"
 TRAIN_TARGETS = [DATASET_ROOT / TRAIN_SPLIT / "target" / TARGET_TEMPLATE_FILE]
 
-FINETUNE_RUN_NAME = "NZ_T2_ACCESS-CM2_static"  # set None to auto-pick latest
+FINETUNE_RUN_NAME = getattr(get_config(str(CONFIG_PATH)), "job_id", None)  # set None to auto-pick latest
 USE_STATIC = True
 STATIC_PATH = None  # e.g., DATASET_ROOT / TRAIN_SPLIT / "predictors" / "Static_fields.nc"
 
@@ -148,6 +148,51 @@ def _check_list_lengths() -> None:
     for name, values in lists.items():
         if len(values) != NUM_RUNS:
             raise ValueError(f"{name} must have {NUM_RUNS} entries (got {len(values)})")
+
+
+def _candidate_runs_roots(preferred_runs_root: Path) -> list[Path]:
+    """Return fallback candidates for run roots (runs_v6 -> runs)."""
+    try:
+        rel = preferred_runs_root.resolve().relative_to(PROJECT_DIR.resolve())
+    except Exception:
+        return [preferred_runs_root]
+    if not rel.parts:
+        return [preferred_runs_root]
+    tail = Path(*rel.parts[1:]) if len(rel.parts) > 1 else Path()
+    preferred_base = rel.parts[0]
+    base_order = [name for name in (preferred_base, "runs", "runs_v6") if name in ("runs", "runs_v6")]
+    base_order = list(dict.fromkeys(base_order))
+    return [PROJECT_DIR / base / tail for base in base_order]
+
+
+def _select_runs_root(preferred_runs_root: Path, run_name_hint: str | None) -> Path:
+    """Choose a run root that actually contains the requested run/manifest."""
+    candidates = _candidate_runs_roots(preferred_runs_root)
+
+    if run_name_hint:
+        for candidate in candidates:
+            manifest = candidate / run_name_hint / "run_manifest.json"
+            if manifest.exists():
+                return candidate
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        for child in candidate.iterdir():
+            if child.is_dir() and (child / "run_manifest.json").exists():
+                return candidate
+
+    return preferred_runs_root
+
+
+def _remap_runs_base(path: Path, runs_base_name: str) -> Path:
+    """Rewrite '/runs_v6/' segments to the selected runs base."""
+    text = str(path)
+    for name in ("runs_v6", "runs"):
+        token = f"/{name}/"
+        if token in text:
+            return Path(text.replace(token, f"/{runs_base_name}/", 1))
+    return path
 
 
 def _resolve_inputs(values):
@@ -516,11 +561,15 @@ def _build_dataloader(config, predictor_paths, target_paths, device):
     )
 
 
-def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module]:
+def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, Path]:
+    runs_root = _select_runs_root(RUNS_ROOT, FINETUNE_RUN_NAME)
+    if runs_root != RUNS_ROOT:
+        print(f"[runs] Using fallback runs root: {runs_root} (preferred {RUNS_ROOT})")
+
     base_params = UserParams(
         repo_root=REPO_ROOT,
         project_dir=PROJECT_DIR,
-        runs_root=RUNS_ROOT,
+        runs_root=runs_root,
         config_path=CONFIG_PATH,
         inference_run_name=FINETUNE_RUN_NAME,
         preferred_checkpoint=PREFERRED_CHECKPOINT,
@@ -604,7 +653,7 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module]:
             f"missing={missing[:8]}, unexpected={incompatible.unexpected_keys[:8]}"
         )
 
-    return run_name, run_dir, checkpoint_path, config, model
+    return run_name, run_dir, checkpoint_path, config, model, runs_root
 
 
 def main() -> None:
@@ -641,7 +690,7 @@ def main() -> None:
     np.random.seed(42)
 
     device = _select_device()
-    run_name, run_dir, checkpoint_path, config, model = _load_model_and_config()
+    run_name, run_dir, checkpoint_path, config, model, runs_root_used = _load_model_and_config()
     model.to(device)
     scaler_dtype_summary = _collect_scaler_dtype_summary(model)
     print(f"[diag] scaler dtypes: {scaler_dtype_summary}")
@@ -655,7 +704,10 @@ def main() -> None:
         test_split = TEST_SPLITS[idx]
         predictor_file = PREDICTOR_FILES[idx]
         prediction_output_name = PREDICTION_OUTPUT_NAMES[idx]
-        inference_output_root = INFERENCE_OUTPUT_ROOTS[idx]
+        inference_output_root = _remap_runs_base(
+            Path(INFERENCE_OUTPUT_ROOTS[idx]),
+            runs_root_used.parent.name,
+        )
 
         if predictor_file:
             test_predictors = [DATASET_ROOT / test_split / predictor_file]
@@ -665,10 +717,10 @@ def main() -> None:
         params = UserParams(
             repo_root=REPO_ROOT,
             project_dir=PROJECT_DIR,
-            runs_root=RUNS_ROOT,
+            runs_root=runs_root_used,
             config_path=CONFIG_PATH,
             inference_run_name=run_name,
-            inference_output_root=Path(inference_output_root),
+            inference_output_root=inference_output_root,
             inference_predictor_root=DATASET_ROOT / test_split,
             test_predictor_paths=test_predictors,
             test_target_paths=TRAIN_TARGETS,

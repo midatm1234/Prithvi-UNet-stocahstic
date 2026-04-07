@@ -54,15 +54,26 @@ from torch.multiprocessing.spawn import ProcessRaisedException, ProcessExitedExc
 def _ensure_expandable_cuda_segments() -> None:
     """Request expandable CUDA allocator segments to reduce fragmentation OOMs."""
     desired = "expandable_segments:True"
-    current = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "").strip()
-    if not current:
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = desired
-        return
+    preferred_key = "PYTORCH_ALLOC_CONF"
+    deprecated_key = "PYTORCH_CUDA_ALLOC_CONF"
 
-    entries = [item.strip() for item in current.split(",") if item.strip()]
-    keys = {item.split(":", 1)[0].strip().lower() for item in entries if ":" in item}
-    if "expandable_segments" not in keys:
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = f"{current},{desired}"
+    # Prefer the new env var; if only the deprecated one is set, migrate it.
+    current = os.environ.get(preferred_key, "").strip()
+    deprecated_current = os.environ.get(deprecated_key, "").strip()
+    if not current:
+        current = deprecated_current
+
+    if not current:
+        os.environ[preferred_key] = desired
+    else:
+        entries = [item.strip() for item in current.split(",") if item.strip()]
+        keys = {item.split(":", 1)[0].strip().lower() for item in entries if ":" in item}
+        if "expandable_segments" not in keys:
+            current = f"{current},{desired}"
+        os.environ[preferred_key] = current
+
+    # Remove deprecated key so torch does not emit deprecation warnings.
+    os.environ.pop(deprecated_key, None)
 
 
 def _should_use_gpu(config: ExperimentConfig) -> bool:
@@ -163,6 +174,29 @@ def _coerce_mapping(value):
     if hasattr(value, "__dict__"):
         return dict(value.__dict__)
     return {}
+
+
+def _set_training_distributed_mode(config: ExperimentConfig, mode: str) -> None:
+    """Synchronize distributed mode at both top-level and nested training config."""
+    mode = str(mode).lower()
+    if mode not in {"ddp", "fsdp", "none"}:
+        return
+
+    if mode == "fsdp":
+        setattr(config, "distributed_strategy", "fsdp")
+    elif mode == "ddp":
+        setattr(config, "distributed_strategy", "ddp")
+
+    training_cfg = getattr(config, "training", None)
+    if training_cfg is None:
+        return
+    if isinstance(training_cfg, dict):
+        training_cfg["distributed"] = mode
+        return
+    try:
+        setattr(training_cfg, "distributed", mode)
+    except Exception:
+        pass
 
 
 def _resolve_training_runtime(config: ExperimentConfig) -> dict[str, int | str | None]:
@@ -503,99 +537,104 @@ def _distributed_worker(rank: int, world_size: int, config: ExperimentConfig, sa
     os.environ["WORLD_SIZE"] = str(world_size)
 
     local_rank, global_rank = init_ddp(use_gpu=True)
-    device = torch.device(f"cuda:{local_rank}")
+    try:
+        device = torch.device(f"cuda:{local_rank}")
 
-    train_loader, val_loader = get_dataloaders(
-        config, use_gpu=True, rank=global_rank, world_size=world_size
-    )
-
-    model = create_finetune_model(config, verbose=(global_rank == 0))
-    model = model.to(device)
-    _configure_skip_offload(model, config)
-    if _fsdp_enabled(config):
-        model = _wrap_model_with_fsdp(model, local_rank, config)
-    else:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=False,
+        train_loader, val_loader = get_dataloaders(
+            config, use_gpu=True, rank=global_rank, world_size=world_size
         )
 
-    optimizer, scaler, scheduler = build_optimizer_scheduler(
-        config, model, len(train_loader), use_gpu=True
-    )
-    loss_fn = build_loss_fn(config, list(config.data.output_vars))
-    if global_rank == 0 and hasattr(loss_fn, "describe"):
-        print(f"[loss] active: {loss_fn.describe()}")
+        model = create_finetune_model(config, verbose=(global_rank == 0))
+        model = model.to(device)
+        _configure_skip_offload(model, config)
+        if _fsdp_enabled(config):
+            model = _wrap_model_with_fsdp(model, local_rank, config)
+        else:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
 
-    train_losses, val_losses = train_model(
-        config,
-        model,
-        train_loader,
-        val_loader,
-        optimizer,
-        scheduler,
-        scaler,
-        local_rank,
-        True,
-        save_every,
-        loss_fn,
-    )
+        optimizer, scaler, scheduler = build_optimizer_scheduler(
+            config, model, len(train_loader), use_gpu=True
+        )
+        loss_fn = build_loss_fn(config, list(config.data.output_vars))
+        if global_rank == 0 and hasattr(loss_fn, "describe"):
+            print(f"[loss] active: {loss_fn.describe()}")
 
-    if global_rank == 0:
-        return_dict["train_losses"] = train_losses
-        return_dict["val_losses"] = val_losses
+        train_losses, val_losses = train_model(
+            config,
+            model,
+            train_loader,
+            val_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            local_rank,
+            True,
+            save_every,
+            loss_fn,
+        )
 
-    dist.destroy_process_group()
+        if global_rank == 0:
+            return_dict["train_losses"] = train_losses
+            return_dict["val_losses"] = val_losses
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _run_distributed_from_env(config: ExperimentConfig, save_every: int):
     local_rank, global_rank = init_ddp(use_gpu=True)
-    world_size = dist.get_world_size()
-    device = torch.device(f"cuda:{local_rank}")
+    try:
+        world_size = dist.get_world_size()
+        device = torch.device(f"cuda:{local_rank}")
 
-    train_loader, val_loader = get_dataloaders(
-        config, use_gpu=True, rank=global_rank, world_size=world_size
-    )
-
-    model = create_finetune_model(config, verbose=(global_rank == 0))
-    model = model.to(device)
-    _configure_skip_offload(model, config)
-    if _fsdp_enabled(config):
-        model = _wrap_model_with_fsdp(model, local_rank, config)
-    else:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=False,
+        train_loader, val_loader = get_dataloaders(
+            config, use_gpu=True, rank=global_rank, world_size=world_size
         )
 
-    optimizer, scaler, scheduler = build_optimizer_scheduler(
-        config, model, len(train_loader), use_gpu=True
-    )
-    loss_fn = build_loss_fn(config, list(config.data.output_vars))
-    if global_rank == 0 and hasattr(loss_fn, "describe"):
-        print(f"[loss] active: {loss_fn.describe()}")
+        model = create_finetune_model(config, verbose=(global_rank == 0))
+        model = model.to(device)
+        _configure_skip_offload(model, config)
+        if _fsdp_enabled(config):
+            model = _wrap_model_with_fsdp(model, local_rank, config)
+        else:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
 
-    train_losses, val_losses = train_model(
-        config,
-        model,
-        train_loader,
-        val_loader,
-        optimizer,
-        scheduler,
-        scaler,
-        local_rank,
-        True,
-        save_every,
-        loss_fn,
-    )
-    dist.destroy_process_group()
-    if global_rank == 0:
-        return train_losses, val_losses
-    return None, None
+        optimizer, scaler, scheduler = build_optimizer_scheduler(
+            config, model, len(train_loader), use_gpu=True
+        )
+        loss_fn = build_loss_fn(config, list(config.data.output_vars))
+        if global_rank == 0 and hasattr(loss_fn, "describe"):
+            print(f"[loss] active: {loss_fn.describe()}")
+
+        train_losses, val_losses = train_model(
+            config,
+            model,
+            train_loader,
+            val_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            local_rank,
+            True,
+            save_every,
+            loss_fn,
+        )
+        if global_rank == 0:
+            return train_losses, val_losses
+        return None, None
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_every: int = 5):
@@ -766,7 +805,7 @@ def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_eve
         if "out of memory" in message and num_gpus > 1:
             if not _fsdp_enabled(config):
                 print("Encountered CUDA OOM with DDP; enabling FSDP retry.")
-                setattr(config, "distributed_strategy", "fsdp")
+                _set_training_distributed_mode(config, "fsdp")
                 if not getattr(config, "fsdp_precision", None):
                     setattr(
                         config,

@@ -157,10 +157,10 @@ inference:
       kernel_size: 3
 training:
   distributed: ddp
-  num_gpus: 4
+  num_gpus: 2
   per_device_batch_size: 1
-  gradient_accumulation_steps: 1
-gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 32
+gradient_accumulation_steps: 32
 loss:
   base: rmse
   predictands:
@@ -175,3 +175,6 @@ loss:
         use_mean: true
         use_std: true
         use_skewness: false
+
+resume_training: false
+resume_checkpoint_path: null

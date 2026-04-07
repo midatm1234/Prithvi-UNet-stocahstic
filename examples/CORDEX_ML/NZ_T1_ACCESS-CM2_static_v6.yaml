@@ -1,16 +1,16 @@
 data:
   type: cordex
   training_predictor_paths:
-  - ./granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/Emulator_hist_future/predictors/CNRM-CM5_1961-1980_2080-2099_regridded.nc
+  - ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980_regridded.nc
   training_target_paths:
-  - ./granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/Emulator_hist_future/target/pr_tasmax_CNRM-CM5_1961-1980_2080-2099.nc
+  - ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc
   validation_predictor_paths:
-  - ./granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/Emulator_hist_future/predictors/CNRM-CM5_1961-1980_2080-2099_regridded.nc
+  - ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980_regridded.nc
   validation_target_paths:
-  - ./granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/Emulator_hist_future/target/pr_tasmax_CNRM-CM5_1961-1980_2080-2099.nc
+  - ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc
   test_predictor_paths: []
   test_target_paths: []
-  static_path: ./granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/Emulator_hist_future/predictors/Static_fields.nc
+  static_path: ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc
   use_static: true
   input_vars:
   - u
@@ -52,10 +52,10 @@ data:
   crop_factor: 256
   downsample_factor: 8
   scalers:
-    inputs_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/ALPS_T2_CNRM-CM5_static_v4_scalars/inputs_mean.npy
-    inputs_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/ALPS_T2_CNRM-CM5_static_v4_scalars/inputs_std.npy
-    targets_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/ALPS_T2_CNRM-CM5_static_v4_scalars/targets_mean.npy
-    targets_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/ALPS_T2_CNRM-CM5_static_v4_scalars/targets_std.npy
+    inputs_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_v6_scalars/inputs_mean.npy
+    inputs_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_v6_scalars/inputs_std.npy
+    targets_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_v6_scalars/targets_mean.npy
+    targets_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_v6_scalars/targets_std.npy
 predictands:
   pr:
     name: pr
@@ -64,12 +64,12 @@ predictands:
       enabled: true
       method: softplus
     scaling:
-      method: log1p_standardize
-      scale_stat: mean
+      method: divide_only
+      scale_stat: p95
       fixed_scale: null
     normalization:
-      method: log1p_standardize
-      mode: gridpoint
+      method: divide_only
+      mode: global
       eps_std: 1.0e-06
       allow_negative_value: false
   tasmax:
@@ -87,10 +87,10 @@ predictands:
       mode: gridpoint
       eps_std: 1.0e-06
 model:
-  input_mu: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/ALPS_T2_CNRM-CM5_static_v4_scalars/inputs_mean.npy
-  input_sigma: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/ALPS_T2_CNRM-CM5_static_v4_scalars/inputs_std.npy
-  target_mu: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/ALPS_T2_CNRM-CM5_static_v4_scalars/targets_mean.npy
-  target_sigma: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/ALPS_T2_CNRM-CM5_static_v4_scalars/targets_std.npy
+  input_mu: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_v6_scalars/inputs_mean.npy
+  input_sigma: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_v6_scalars/inputs_std.npy
+  target_mu: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_v6_scalars/targets_mean.npy
+  target_sigma: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_v6_scalars/targets_std.npy
   embed_dim: 1024
   n_blocks_encoder: 8
   mlp_multiplier: 4
@@ -115,10 +115,10 @@ model:
   residual_connection: true
   encoder_shift: false
   unet: true
-job_id: ALPS_T2_CNRM-CM5_static
+job_id: cordex_nz_small_v6
 type_training: full_dataset
-batch_size: 16
-num_epochs: 5
+batch_size: 64
+num_epochs: 10
 dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 5.0e-05
@@ -162,8 +162,8 @@ inference:
       strength: 0.15
       kernel_size: 3
 training:
-  distributed: ddp
-  num_gpus: 2
+  distributed: fsdp
+  num_gpus: 1
   per_device_batch_size: 1
   gradient_accumulation_steps: 32
 gradient_accumulation_steps: 32
@@ -173,14 +173,22 @@ loss:
     pr:
       distribution_loss:
         enabled: false
+        method: cdf
+        weight: 0.0
+        bins: 100
     tasmax:
       distribution_loss:
-        enabled: false
-        method: moment
+        enabled: true
+        method: cdf
         weight: 0.05
         use_mean: true
         use_std: true
         use_skewness: false
-
+        bins: 100
 resume_training: false
 resume_checkpoint_path: null
+precip_model: hurdle
+precip_wet_threshold: 0.01
+precip_lambda_occurrence: 1.0
+precip_lambda_amount: 1.0
+precip_amount_loss_type: smoothl1
