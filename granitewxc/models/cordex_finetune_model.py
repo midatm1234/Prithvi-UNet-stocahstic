@@ -558,6 +558,11 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         Returns:
             Tensor of shape [batch, parameter, lat, lon].
         """
+        # v6 hurdle training keeps aux tensors for the precipitation loss. Clear any
+        # stale reference from the previous step before allocating new activations,
+        # otherwise the previous autograd graph can remain alive and raise peak VRAM.
+        self._last_precip_hurdle_aux = None
+        batch.pop("__precip_hurdle_aux", None)
 
         B, _, H, W = batch['x'].shape
         # Scale inputs
@@ -781,6 +786,9 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
     def get_last_precip_hurdle_aux(self) -> dict[str, torch.Tensor] | None:
         return self._last_precip_hurdle_aux
+
+    def clear_last_precip_hurdle_aux(self) -> None:
+        self._last_precip_hurdle_aux = None
 
     # ----------------------
     # Utility helpers
