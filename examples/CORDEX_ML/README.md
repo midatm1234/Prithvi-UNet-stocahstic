@@ -3,6 +3,92 @@
 ## Overview
 This folder hosts the CORDEX-ML benchmark workflows for multiple regional domains—European Alps (ALPS), New Zealand (NZ), and South Africa (SA)—demonstrating how to fine-tune the Prithvi WxC UNet on coarse CORDEX predictors and produce high-resolution precipitation (`pr`) and maximum temperature (`tasmax`) forecasts. The assets here reuse the helper scripts (`preproc_cordex.py`, `compute_scalars_cordex.py`, `cordex_training.py`, and the notebooks in `notebooks/`) to cover the full loop: preprocess/regrid → compute scalars → fine-tune → inference → persist predictions as NetCDF.
 
+## v6 Block Artifact Root-Cause Fixes
+
+The remaining coarse block patterns in `pr` and `tasmax` are now addressed in the training/inference pipeline itself, not by cosmetic post-smoothing.
+
+Primary root causes found and fixed:
+
+1. **Grid mismatch in v6 configs**: several `*_v6.yaml` files used `target_size=256` while v6 scalers are `128x128`, causing resizing and normalization inconsistencies that amplify block structure.
+2. **Decoder reconstruction path instability**: UNET decode flow could create coarse artifacts from upsample/downsample mismatch; decode path now aligns bottleneck-to-skip scales correctly and supports stable interpolation-based decoder upsampling.
+3. **Inference reconstruction sensitivity**: tiling behavior now supports explicit overlap + weighted blending (`hann`/`cosine`/`gaussian`/`linear`) with configurable overlap/weights, and optional full-frame inference bypass.
+4. **Training alignment bias**: when crop size equals full field, random crop is disabled; v6 now supports `data.train_random_crop_offset` to randomize spatial alignment without shrinking the crop.
+5. **Scaler resize fallback**: output scaler interpolation for mismatched grids now supports smooth interpolation modes (default `bilinear`) instead of nearest-only fallback.
+
+### Primary controls (recommended)
+
+Use these first to reduce block boundaries while preserving physical gradients:
+
+- `data.target_size_lat/lon` and `train_crop_size_lat/lon` must match scaler grid.
+- `data.train_random_crop_offset`: small random shift (for example `[8, 8]`).
+- `inference.boundary_mitigation.overlap` + blend window (`hann` by default).
+- `model.decoder_upsampling_mode: bilinear` (or `nearest`) instead of artifact-prone decode settings.
+- Optional low-weight structure-aware losses:
+  - `loss.spatial_gradient`
+  - `loss.multiscale`
+  - `loss.boundary_continuity`
+
+### Fallback control (not primary)
+
+- `use_seam_deblocking` / `seam_deblocking_strength` remains available, but should only be used as a conservative fallback after overlap blending and reconstruction settings are tuned.
+
+### New/updated v6 YAML knobs
+
+```yaml
+data:
+  train_random_crop_offset: [8, 8]
+
+model:
+  decoder_upsampling_mode: bilinear
+  output_scaler_resize_mode: bilinear
+  output_scaler_align_corners: false
+
+inference:
+  inference_tile_size: [96, 96]
+  inference_overlap: [32, 32]
+  inference_blend_window: hann
+  inference_blend_sigma: 0.35
+  use_seam_deblocking: false
+  seam_deblocking_strength: 0.1
+  boundary_mitigation:
+    enabled: true
+    tile_size: [96, 96]
+    overlap: [32, 32]
+    blend_window: hann
+    blend_sigma: 0.35
+    deblock:
+      enabled: false
+
+loss:
+  use_gradient_loss: true
+  gradient_loss_weight: 0.03
+  use_tv_loss: false
+  tv_loss_weight: 0.0005
+  use_multiscale_loss: true
+  multiscale_loss_weight: 0.015
+  boundary_continuity:
+    enabled: true
+    weight: 0.01
+    predictands: {pr: 0.2, tasmax: 1.0}
+    stride_lat: 16
+    stride_lon: 16
+    match_target: true
+```
+
+### Artifact diagnosis utility
+
+Use the new diagnostic script to separate stitching artifacts from model artifacts:
+
+```bash
+python examples/CORDEX_ML/utils/inference_artifact_diagnostics.py \
+  --config examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static_v6.yaml \
+  --checkpoint <path-to-checkpoint> \
+  --num-samples 16 \
+  --output-dir examples/CORDEX_ML/evaluations/artifact_diag_nz_t1
+```
+
+This runs no-overlap and overlap-blended reconstructions, writes comparison figures/difference maps, and reports seam-aligned metrics so you can verify whether artifacts are dominated by stitching, decoder behavior, or training/crop strategy.
+
 ## CORDEX v4 updates (new default path)
 
 The repository now supports a reproducible v4 CORDEX path with updated normalization, optional distribution-aware losses, and multi-GPU execution. The v4 YAMLs (`*_v4.yaml`) are the recommended defaults for new training and inference runs.
@@ -76,10 +162,10 @@ Recommended first setting: `tasmax` with `moment` loss and a small weight (for e
 
 ### 4) Block-boundary artifact mitigation policy
 
-v4 treats seam deblocking as fallback only. Primary controls target root causes in tiled reconstruction:
+v4/v6 treat seam deblocking as fallback only. Primary controls target root causes in tiled reconstruction:
 
 - overlap size
-- blend mode (`cosine` or `uniform`)
+- blend window (`hann`, `cosine`, `gaussian`, or `uniform`)
 - tile size / stride consistency
 - scaler alignment per tile (`__scaler_offset`) for gridpoint denormalization
 
@@ -87,17 +173,65 @@ Optional seam deblock is boundary-local and conservative:
 
 ```yaml
 inference:
+  inference_tile_size: [96, 96]
+  inference_overlap: [32, 32]
+  inference_blend_window: hann
+  inference_blend_sigma: 0.35
   boundary_mitigation:
     enabled: true
-    tile_size: [256, 256]
-    overlap: [64, 64]
-    blend_mode: cosine
+    tile_size: [96, 96]
+    overlap: [32, 32]
+    blend_window: hann
+    blend_sigma: 0.35
     deblock:
       enabled: false
       boundary_width: 2
-      strength: 0.15
+      strength: 0.1
       kernel_size: 3
 ```
+
+### 4b) Training-side artifact suppression (recommended for v6 retrains)
+
+In addition to inference stitching controls, v6 now supports training knobs that directly
+reduce checkerboard/block boundaries and over-strong terrain imprint:
+
+- `loss.spatial_gradient`: matches output spatial gradients to target gradients.
+- `model.static_embedding_scale`: scales static-terrain embedding contribution.
+- `model.static_skip_scale` (UNET): scales static skip-path contribution.
+- `model.static_dropout_p`: randomly drops static channels during training.
+- `data.train_random_crop_offset`: applies random spatial shifts even when crop size equals full grid.
+
+Example:
+
+```yaml
+data:
+  target_size_lat: 128
+  target_size_lon: 128
+  train_crop_size_lat: 128
+  train_crop_size_lon: 128
+  train_random_crop_offset: [8, 8]
+
+model:
+  static_embedding_scale: 0.6
+  static_skip_scale: 0.5
+  static_dropout_p: 0.1
+
+loss:
+  base: rmse
+  spatial_gradient:
+    enabled: true
+    weight: 0.03
+    predictands:
+      tasmax: 1.0
+      pr: 0.25
+    precipitation_wet_only: true
+    precipitation_wet_threshold: 0.1
+```
+
+Practical starting point:
+- First tune `static_embedding_scale/static_skip_scale` in `[0.4, 0.8]` and `static_dropout_p` in `[0.05, 0.15]`.
+- Then add `loss.spatial_gradient.weight` in `[0.01, 0.05]`.
+- Keep validation RMSE as the primary early-stop metric.
 
 ### 5) Multi-GPU fine-tuning and effective batch size
 

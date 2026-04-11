@@ -44,15 +44,20 @@ data:
   n_random_windows: 1
   input_size_lat: 16
   input_size_lon: 16
-  target_size_lat: 256
-  target_size_lon: 256
-  crop_factor: 256
+  target_size_lat: 128
+  target_size_lon: 128
+  train_crop_size_lat: 128
+  train_crop_size_lon: 128
+  crop_factor: 128
   downsample_factor: 8
   scalers:
     inputs_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_no_static_v6_scalars/inputs_mean.npy
     inputs_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_no_static_v6_scalars/inputs_std.npy
     targets_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_no_static_v6_scalars/targets_mean.npy
     targets_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_no_static_v6_scalars/targets_std.npy
+  train_random_crop_offset:
+  - 8
+  - 8
 predictands:
   pr:
     name: pr
@@ -112,6 +117,17 @@ model:
   residual_connection: true
   encoder_shift: false
   unet: true
+  decoder_upsampling_mode: bilinear
+  output_scaler_resize_mode: bilinear
+  output_scaler_align_corners: false
+  unet_upsample_scales:
+  - 2
+  - 2
+  - 2
+  unet_decoder_kernel_size:
+  - 3
+  - 3
+  - 3
 job_id: SA_T2_ACCESS-CM2_no_static_v6
 type_training: full_dataset
 batch_size: 64
@@ -147,17 +163,33 @@ inference:
   boundary_mitigation:
     enabled: true
     tile_size:
-    - 256
-    - 256
+    - 96
+    - 96
     overlap:
-    - 64
-    - 64
-    blend_mode: cosine
+    - 32
+    - 32
+    blend_mode: hann
     deblock:
       enabled: false
       boundary_width: 2
-      strength: 0.15
+      strength: 0.1
       kernel_size: 3
+    force_full_frame: false
+    blend_window: hann
+    blend_sigma: 0.35
+    use_seam_deblocking: false
+    seam_deblocking_strength: 0.1
+  inference_tile_size:
+  - 96
+  - 96
+  inference_overlap:
+  - 32
+  - 32
+  inference_blend_window: hann
+  inference_blend_sigma: 0.35
+  force_full_frame: false
+  use_seam_deblocking: false
+  seam_deblocking_strength: 0.1
 training:
   distributed: fsdp
   num_gpus: 1
@@ -184,8 +216,45 @@ loss:
         use_std: true
         use_skewness: false
         bins: 100
+  spatial_gradient:
+    enabled: true
+    weight: 0.03
+    predictands:
+      tasmax: 1.0
+      pr: 0.25
+    precipitation_wet_only: true
+    precipitation_wet_threshold: 0.1
+  use_gradient_loss: true
+  gradient_loss_weight: 0.03
+  use_tv_loss: false
+  tv_loss_weight: 0.0005
+  use_multiscale_loss: true
+  multiscale_loss_weight: 0.015
+  tv:
+    enabled: false
+    weight: 0.0005
+    predictands:
+      pr: 0.1
+      tasmax: 0.3
+  multiscale:
+    enabled: true
+    weight: 0.015
+    scales:
+    - 2
+    - 4
+    loss_type: l1
+  boundary_continuity:
+    enabled: true
+    weight: 0.01
+    predictands:
+      pr: 0.2
+      tasmax: 1.0
+    stride_lat: 16
+    stride_lon: 16
+    match_target: true
 precip_model: hurdle
 precip_wet_threshold: 0.01
+precip_occurrence_prob_threshold: 0.5
 precip_lambda_occurrence: 1.0
 precip_lambda_amount: 1.0
 precip_amount_loss_type: smoothl1

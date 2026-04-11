@@ -11,6 +11,24 @@ from PrithviWxC.model import PrithviWxCEncoderDecoder
 
 
 
+def _as_int_list(value, default: list[int]) -> list[int]:
+    if value is None:
+        return list(default)
+    if isinstance(value, (int, float)):
+        return [max(1, int(value))]
+    if isinstance(value, (list, tuple)):
+        out: list[int] = []
+        for item in value:
+            if isinstance(item, (list, tuple)):
+                if not item:
+                    continue
+                out.append(max(1, int(item[0])))
+            else:
+                out.append(max(1, int(item)))
+        return out or list(default)
+    return list(default)
+
+
 def _resolve_scaler_device(config: ExperimentConfig) -> torch.device:
     requested = getattr(config, "scalers_device", None)
     if requested is None:
@@ -222,6 +240,19 @@ def get_finetune_model_UNET(config: ExperimentConfig) -> torch.nn.Module:
     #########################################################
     # 5. Putting it all together
     #########################################################
+    unet_scales = _as_int_list(
+        getattr(config.model, "unet_upsample_scales", None),
+        [2, 2, 2],
+    )
+    unet_kernels = _as_int_list(
+        getattr(config.model, "unet_decoder_kernel_size", None),
+        [3] * len(unet_scales),
+    )
+    if len(unet_kernels) < len(unet_scales):
+        unet_kernels.extend([unet_kernels[-1]] * (len(unet_scales) - len(unet_kernels)))
+    elif len(unet_kernels) > len(unet_scales):
+        unet_kernels = unet_kernels[: len(unet_scales)]
+
     model = ClimateDownscaleFinetuneUNETModel(
         embedding=embedding,
         embedding_static=embedding_static,
@@ -238,8 +269,8 @@ def get_finetune_model_UNET(config: ExperimentConfig) -> torch.nn.Module:
         output_scalers_sigma=scalers['target_sigma'],
         patch_size_px_backbone=(1, 1),
         n_bins=n_output_parameters, #n_bins: int = 512,
-        scale = [2,2,2], # ----- to be used in  UNET (config.encoder_decoder_scale_per_stage)
-        kernel_size  = [3,3,3], # encoder_decoder_kernel_size_per_stage
+        scale=unet_scales,
+        kernel_size=unet_kernels,
         config = config
     )
 

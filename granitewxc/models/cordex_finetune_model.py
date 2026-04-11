@@ -11,6 +11,7 @@ from granitewxc.utils.config import ExperimentConfig
 from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.target_transforms import PositivePrecipLink
 from granitewxc.models.finetune_model import FinetuneWrapper
+from granitewxc.decoders.downscaling import ConvTransposeBlock, InterpBlock, PixelShuffleBlock
 
 
 PRECIP_VAR_NAMES = {"pr", "precip", "precipitation"}
@@ -169,6 +170,33 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         self.mask_unit_size_px_backbone = config.mask_unit_size
         self.encoder_decoder_scale_per_stage = config.model.encoder_decoder_scale_per_stage
         self.use_static = bool(getattr(config.data, "use_static", getattr(config, "finetune_w_static", True)))
+        self.static_embedding_scale = float(
+            getattr(config.model, "static_embedding_scale", 1.0)
+        )
+        self.static_skip_scale = float(
+            getattr(config.model, "static_skip_scale", 1.0)
+        )
+        self.static_dropout_p = float(
+            getattr(config.model, "static_dropout_p", 0.0)
+        )
+        self.static_dropout_p = min(max(self.static_dropout_p, 0.0), 1.0)
+        self.decoder_upsampling_mode = str(
+            getattr(
+                config.model,
+                "decoder_upsampling_mode",
+                getattr(config.model, "encoder_decoder_upsampling_mode", "pixel_shuffle"),
+            )
+        ).lower()
+        if self.decoder_upsampling_mode not in {"pixel_shuffle", "bilinear", "nearest", "conv_transpose"}:
+            self.decoder_upsampling_mode = "pixel_shuffle"
+        self.output_scaler_resize_mode = str(
+            getattr(config.model, "output_scaler_resize_mode", "bilinear")
+        ).lower()
+        if self.output_scaler_resize_mode not in {"nearest", "bilinear", "bicubic"}:
+            self.output_scaler_resize_mode = "bilinear"
+        self.output_scaler_align_corners = bool(
+            getattr(config.model, "output_scaler_align_corners", False)
+        )
         #-----------
 
         self.n_input_timestamps = n_input_timestamps
@@ -267,13 +295,34 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 current_ch = config.model.embed_dim 
             else :
                 current_ch = config.model.encoder_decoder_conv_channels + self.downscaling_embed_dim
-            # in_channels // (scale_factor ** 2)
-            self.upsample_layers.append(nn.Sequential(
-                nn.Conv2d(in_channels=current_ch, out_channels=channels * s_i ** 2,
-                          kernel_size=k_i, stride=1, padding='same', padding_mode='replicate'),
-                nn.PixelShuffle(s_i),
-                nn.PReLU()
-            ))
+            if self.decoder_upsampling_mode == "pixel_shuffle":
+                layer = PixelShuffleBlock(
+                    scale=s_i,
+                    in_channels=current_ch,
+                    channels=channels,
+                    kernel_size=k_i,
+                    stride=1,
+                    activation=nn.PReLU,
+                )
+            elif self.decoder_upsampling_mode in {"bilinear", "nearest"}:
+                layer = InterpBlock(
+                    scale=s_i,
+                    in_channels=current_ch,
+                    channels=channels,
+                    kernel_size=k_i,
+                    stride=1,
+                    activation=nn.PReLU,
+                    mode=self.decoder_upsampling_mode,
+                )
+            else:
+                layer = ConvTransposeBlock(
+                    in_channels=current_ch,
+                    channels=channels,
+                    kernel_size=max(2, int(s_i)),
+                    stride=int(s_i),
+                    activation=nn.PReLU,
+                )
+            self.upsample_layers.append(layer)
 
         current_ch = config.model.encoder_decoder_conv_channels + self.downscaling_embed_dim
         self._decoder_output_channels = current_ch
@@ -408,7 +457,16 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         self.precip_channel_index = precip_idx
         self.precip_hurdle_enabled = precip_hurdle_enabled
         self.precip_wet_threshold = float(
-            getattr(config, "precip_wet_threshold", 0.5) if config is not None else 0.5
+            getattr(config, "precip_wet_threshold", 0.0) if config is not None else 0.0
+        )
+        self.precip_occurrence_prob_threshold = float(
+            getattr(config, "precip_occurrence_prob_threshold", 0.5)
+            if config is not None
+            else 0.5
+        )
+        self.precip_occurrence_prob_threshold = min(
+            max(self.precip_occurrence_prob_threshold, 0.0),
+            1.0,
         )
         self._last_precip_hurdle_aux = None
         self._precip_softplus_link = PositivePrecipLink()
@@ -417,23 +475,21 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         if not bool(self.predictand_nonneg_enabled_mask.any().item()):
             return raw_out
 
-        constrained = raw_out.clone()
-        indices = torch.nonzero(self.predictand_nonneg_enabled_mask, as_tuple=False).flatten()
-        for channel_idx in indices.tolist():
-            method_code = int(self.predictand_nonneg_method_codes[channel_idx].item())
-            if method_code == 1:
-                constrained[:, channel_idx, ...] = self._precip_softplus_link(
-                    constrained[:, channel_idx, ...]
-                )
-            elif method_code == 2:
-                constrained[:, channel_idx, ...] = torch.exp(
-                    constrained[:, channel_idx, ...]
-                )
-            else:
-                raise ValueError(
-                    f"Invalid nonnegativity method code {method_code} for channel {channel_idx}"
-                )
-        return constrained
+        channels: list[torch.Tensor] = []
+        for channel_idx in range(raw_out.shape[1]):
+            channel = raw_out[:, channel_idx : channel_idx + 1, ...]
+            if bool(self.predictand_nonneg_enabled_mask[channel_idx].item()):
+                method_code = int(self.predictand_nonneg_method_codes[channel_idx].item())
+                if method_code == 1:
+                    channel = self._precip_softplus_link(channel)
+                elif method_code == 2:
+                    channel = torch.exp(channel)
+                else:
+                    raise ValueError(
+                        f"Invalid nonnegativity method code {method_code} for channel {channel_idx}"
+                    )
+            channels.append(channel)
+        return torch.cat(channels, dim=1)
 
     def _resolve_output_scalers(
         self,
@@ -460,8 +516,22 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 )
 
         # Conservative fallback for mismatched grids.
-        sigma = F.interpolate(sigma_full, size=(h, w), mode="nearest")
-        mu = F.interpolate(mu_full, size=(h, w), mode="nearest")
+        if self.output_scaler_resize_mode in {"bilinear", "bicubic"}:
+            sigma = F.interpolate(
+                sigma_full,
+                size=(h, w),
+                mode=self.output_scaler_resize_mode,
+                align_corners=self.output_scaler_align_corners,
+            )
+            mu = F.interpolate(
+                mu_full,
+                size=(h, w),
+                mode=self.output_scaler_resize_mode,
+                align_corners=self.output_scaler_align_corners,
+            )
+        else:
+            sigma = F.interpolate(sigma_full, size=(h, w), mode=self.output_scaler_resize_mode)
+            mu = F.interpolate(mu_full, size=(h, w), mode=self.output_scaler_resize_mode)
         return mu, sigma
 
     def _decode_outputs(
@@ -477,7 +547,12 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         method_codes = self.predictand_scaling_method_codes.to(device=constrained.device)
         divide_mask = method_codes == 1
         if bool(divide_mask.any().item()):
-            decoded[:, divide_mask, ...] = constrained[:, divide_mask, ...] * sigma[:, divide_mask, ...]
+            divide_indices = torch.nonzero(divide_mask, as_tuple=False).flatten().tolist()
+            divide_values = constrained[:, divide_mask, ...] * sigma[:, divide_mask, ...]
+            decoded_channels = list(decoded.split(1, dim=1))
+            for local_idx, channel_idx in enumerate(divide_indices):
+                decoded_channels[channel_idx] = divide_values[:, local_idx : local_idx + 1, ...]
+            decoded = torch.cat(decoded_channels, dim=1)
 
         log1p_mask = method_codes == 2
         if bool(log1p_mask.any().item()):
@@ -491,7 +566,11 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 torch.zeros_like(log_decoded),
                 log_decoded,
             )
-            decoded[:, log1p_mask, ...] = log_decoded
+            log_indices = torch.nonzero(log1p_mask, as_tuple=False).flatten().tolist()
+            decoded_channels = list(decoded.split(1, dim=1))
+            for local_idx, channel_idx in enumerate(log_indices):
+                decoded_channels[channel_idx] = log_decoded[:, local_idx : local_idx + 1, ...]
+            decoded = torch.cat(decoded_channels, dim=1)
 
         self._last_precip_hurdle_aux = None
         if self.precip_hurdle_enabled:
@@ -504,12 +583,17 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             amount_pred = amount_pred_norm * q95
             p_wet = torch.sigmoid(wet_logits)
             final_pr = torch.where(
-                p_wet >= self.precip_wet_threshold,
+                p_wet >= self.precip_occurrence_prob_threshold,
                 amount_pred,
                 torch.zeros_like(amount_pred),
             )
-            decoded[:, pr_idx : pr_idx + 1, ...] = final_pr
-            constrained[:, pr_idx : pr_idx + 1, ...] = amount_pred_norm
+            decoded_channels = list(decoded.split(1, dim=1))
+            decoded_channels[pr_idx] = final_pr
+            decoded = torch.cat(decoded_channels, dim=1)
+
+            constrained_channels = list(constrained.split(1, dim=1))
+            constrained_channels[pr_idx] = amount_pred_norm
+            constrained = torch.cat(constrained_channels, dim=1)
             self._last_precip_hurdle_aux = {
                 "wet_logits": wet_logits,
                 "p_wet": p_wet,
@@ -577,6 +661,8 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             x_static = (static_x - self.static_input_scalers_mu) / (
                 self.static_input_scalers_sigma + self.static_input_scalers_epsilon
             )
+            if self.training and self.static_dropout_p > 0.0:
+                x_static = F.dropout2d(x_static, p=self.static_dropout_p, training=True)
 
             if self.residual == 'climate':
                 # Scale climatology
@@ -591,10 +677,12 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             # Embedding and dowsampling of static HRDPS covariates
             y_static = (static_y - self.static_output_scalers_mu) / (
                 self.static_output_scalers_sigma + self.static_input_scalers_epsilon) # self.static_input_scalers_epsilon is a constant small number
+            if self.training and self.static_dropout_p > 0.0:
+                y_static = F.dropout2d(y_static, p=self.static_dropout_p, training=True)
 
             # Dowsampling step
             copy_activations = {}
-            copy_activations[0] = self.embedding_static(y_static)
+            copy_activations[0] = self.embedding_static(y_static) * self.static_skip_scale
             primary_device = x.device
 
             for step_idx in range(self.num_upsample):
@@ -604,7 +692,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 copy_activations[step_idx] = self._maybe_offload_skip(copy_activations[step_idx], step_idx, primary_device)
 
             x_embedded = self.embedding(x) # [batch, time x parameter, lat, lon] -> [batch, emb, lat*scale[0], lon*scale[0]]
-            static_embedded = self.embedding_static(x_static)
+            static_embedded = self.embedding_static(x_static) * self.static_embedding_scale
             x_shallow_feats = x_embedded + static_embedded
 
             # ----- to be used in  UNET
@@ -628,8 +716,10 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             )
             for step_idx in range(self.num_upsample):
                 copy_activations[step_idx] = self._maybe_offload_skip(current_skip, step_idx, primary_device)
-                if step_idx < self.num_upsample - 1:
-                    current_skip = F.max_pool2d(current_skip, kernel_size=2)
+                current_skip = F.max_pool2d(current_skip, kernel_size=2)
+            copy_activations[self.num_upsample] = self._maybe_offload_skip(
+                current_skip, self.num_upsample, primary_device
+            )
 
         x_shallow_feats = torch.cat([x_shallow_feats, deepest_skip], dim=1)
         x_shallow_feats = self.conv_before_backbone(x_shallow_feats)
@@ -698,6 +788,14 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
         # Upscaling
         out = x_deep_feats
+        bottleneck_skip = self._ensure_on_device(copy_activations[self.num_upsample], out.device)
+        if out.shape[-2:] != bottleneck_skip.shape[-2:]:
+            out = F.interpolate(
+                out,
+                size=bottleneck_skip.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
         for step_idx in reversed(range(self.num_upsample)):
             skip = self._ensure_on_device(copy_activations[step_idx], out.device)
             upsampled = self.upsample_layers[step_idx](out)
@@ -897,8 +995,27 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
             self.use_static = bool(
                 getattr(config.data, "use_static", getattr(config, "finetune_w_static", True))
             )
+            self.static_embedding_scale = float(
+                getattr(config.model, "static_embedding_scale", 1.0)
+            )
+            self.static_dropout_p = float(
+                getattr(config.model, "static_dropout_p", 0.0)
+            )
+            self.output_scaler_resize_mode = str(
+                getattr(config.model, "output_scaler_resize_mode", "bilinear")
+            ).lower()
+            if self.output_scaler_resize_mode not in {"nearest", "bilinear", "bicubic"}:
+                self.output_scaler_resize_mode = "bilinear"
+            self.output_scaler_align_corners = bool(
+                getattr(config.model, "output_scaler_align_corners", False)
+            )
         else:
             self.use_static = True
+            self.static_embedding_scale = 1.0
+            self.static_dropout_p = 0.0
+            self.output_scaler_resize_mode = "bilinear"
+            self.output_scaler_align_corners = False
+        self.static_dropout_p = min(max(self.static_dropout_p, 0.0), 1.0)
 
         self.conv_after_backbone = nn.Conv2d(
             embed_dim_backbone, 
@@ -1062,8 +1179,22 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
                     sigma_full[..., y0:y1, x0:x1],
                 )
 
-        sigma = F.interpolate(sigma_full, size=(h, w), mode="nearest")
-        mu = F.interpolate(mu_full, size=(h, w), mode="nearest")
+        if self.output_scaler_resize_mode in {"bilinear", "bicubic"}:
+            sigma = F.interpolate(
+                sigma_full,
+                size=(h, w),
+                mode=self.output_scaler_resize_mode,
+                align_corners=self.output_scaler_align_corners,
+            )
+            mu = F.interpolate(
+                mu_full,
+                size=(h, w),
+                mode=self.output_scaler_resize_mode,
+                align_corners=self.output_scaler_align_corners,
+            )
+        else:
+            sigma = F.interpolate(sigma_full, size=(h, w), mode=self.output_scaler_resize_mode)
+            mu = F.interpolate(mu_full, size=(h, w), mode=self.output_scaler_resize_mode)
         return mu, sigma
 
     def _decode_outputs(
@@ -1142,6 +1273,8 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
             x_static = (static_x - self.static_input_scalers_mu) / (
                 self.static_input_scalers_sigma + self.static_input_scalers_epsilon
             )
+            if self.training and self.static_dropout_p > 0.0:
+                x_static = F.dropout2d(x_static, p=self.static_dropout_p, training=True)
 
             if self.residual == 'climate':
                 # Scale climatology
@@ -1153,7 +1286,7 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
                 x_static = torch.cat([x_static, climate], dim=1)
 
             x_embedded = self.embedding(x) # [batch, time x parameter, lat, lon] -> [batch, emb, lat*scale[0], lon*scale[0]]
-            static_embedded = self.embedding_static(x_static)
+            static_embedded = self.embedding_static(x_static) * self.static_embedding_scale
             x_shallow_feats = x_embedded + static_embedded
         else:
             x_shallow_feats = self.embedding(x)

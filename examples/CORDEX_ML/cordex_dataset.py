@@ -11,6 +11,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import xarray as xr
 from torch.utils.data import Dataset
 
@@ -93,6 +94,7 @@ class CordexDownscaleDataset(Dataset):
         dtype: torch.dtype = torch.float32,
         crop_size: Optional[Tuple[int, int]] = None,
         random_crop: bool = True,
+        random_crop_offset: Optional[Tuple[int, int]] = None,
         seed: Optional[int] = None,
         use_static: bool = True,
         allow_time_mismatch: bool = False,
@@ -148,6 +150,13 @@ class CordexDownscaleDataset(Dataset):
             self.crop_size = (lat_size, lon_size)
 
         self.random_crop = random_crop and self.crop_size != self.fine_shape
+        if random_crop_offset is None:
+            self.random_crop_offset = (0, 0)
+        else:
+            self.random_crop_offset = (
+                max(0, int(random_crop_offset[0])),
+                max(0, int(random_crop_offset[1])),
+            )
         self._rng = np.random.default_rng(seed)
 
         self._time_lengths, self._target_time_lengths = self._compute_time_lengths()
@@ -171,6 +180,9 @@ class CordexDownscaleDataset(Dataset):
             lon_slice,
             target_len=target_lengths[file_idx],
         )
+
+        if self.random_crop_offset != (0, 0):
+            x, y = self._apply_random_spatial_offset(x, y)
 
         return {"x": x, "y": y}
 
@@ -388,6 +400,42 @@ class CordexDownscaleDataset(Dataset):
         lat_slice = slice(lat_start, lat_start + self.crop_size[0])
         lon_slice = slice(lon_start, lon_start + self.crop_size[1])
         return lat_slice, lon_slice
+
+    def _apply_random_spatial_offset(
+        self,
+        predictors: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        max_dy, max_dx = self.random_crop_offset
+        if max_dy <= 0 and max_dx <= 0:
+            return predictors, targets
+
+        dy = 0 if max_dy <= 0 else int(self._rng.integers(-max_dy, max_dy + 1))
+        dx = 0 if max_dx <= 0 else int(self._rng.integers(-max_dx, max_dx + 1))
+        if dy == 0 and dx == 0:
+            return predictors, targets
+
+        def _shift(tensor: torch.Tensor) -> torch.Tensor:
+            _, h, w = tensor.shape
+            pad_y = abs(dy)
+            pad_x = abs(dx)
+            if pad_y == 0 and pad_x == 0:
+                return tensor
+
+            mode = "reflect"
+            if h <= 1 or w <= 1:
+                mode = "replicate"
+
+            padded = F.pad(
+                tensor.unsqueeze(0),
+                (pad_x, pad_x, pad_y, pad_y),
+                mode=mode,
+            )
+            y0 = pad_y - dy
+            x0 = pad_x - dx
+            return padded[..., y0 : y0 + h, x0 : x0 + w].squeeze(0)
+
+        return _shift(predictors), _shift(targets)
 
     def _build_regridder(
         self, grid_in: xr.Dataset, grid_out: xr.Dataset, method: str

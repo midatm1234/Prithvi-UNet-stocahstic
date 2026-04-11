@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def rmse_loss(y_hat: torch.Tensor, y: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -42,6 +43,40 @@ class PrecipHurdleLossSpec:
     lambda_occurrence: float
     lambda_amount: float
     amount_loss_type: str
+
+
+@dataclass
+class SpatialGradientLossSpec:
+    enabled: bool
+    weight: float
+    channel_weights: tuple[float, ...]
+    precipitation_wet_only: bool
+    precipitation_wet_threshold: float
+
+
+@dataclass
+class TotalVariationLossSpec:
+    enabled: bool
+    weight: float
+    channel_weights: tuple[float, ...]
+
+
+@dataclass
+class MultiScaleLossSpec:
+    enabled: bool
+    weight: float
+    scales: tuple[int, ...]
+    loss_type: str
+
+
+@dataclass
+class BoundaryContinuityLossSpec:
+    enabled: bool
+    weight: float
+    channel_weights: tuple[float, ...]
+    stride_lat: int
+    stride_lon: int
+    match_target: bool
 
 
 PRECIP_VAR_NAMES = {"pr", "precip", "precipitation"}
@@ -150,6 +185,99 @@ class CompositePredictandLoss:
                 bins=max(8, bins),
                 cdf_temperature=max(1e-4, cdf_temperature),
             )
+
+        gradient_cfg = _coerce_mapping(cfg.get("spatial_gradient"))
+        if "use_gradient_loss" in cfg:
+            gradient_cfg["enabled"] = bool(cfg.get("use_gradient_loss"))
+        if "gradient_loss_weight" in cfg:
+            gradient_cfg["weight"] = float(cfg.get("gradient_loss_weight", 0.0))
+        gradient_enabled = bool(gradient_cfg.get("enabled", False))
+        gradient_weight = float(gradient_cfg.get("weight", 0.0))
+        channel_weights = [1.0 for _ in self.output_vars]
+        gradient_predictands = _coerce_mapping(gradient_cfg.get("predictands"))
+        for idx, name in enumerate(self.output_vars):
+            if name in gradient_predictands:
+                channel_weights[idx] = max(0.0, float(gradient_predictands[name]))
+        precip_idx = next(
+            (idx for idx, name in enumerate(self.output_vars) if str(name).lower() in PRECIP_VAR_NAMES),
+            -1,
+        )
+        self._spatial_gradient = SpatialGradientLossSpec(
+            enabled=gradient_enabled and gradient_weight > 0.0,
+            weight=max(0.0, gradient_weight),
+            channel_weights=tuple(channel_weights),
+            precipitation_wet_only=bool(gradient_cfg.get("precipitation_wet_only", True)),
+            precipitation_wet_threshold=float(
+                gradient_cfg.get(
+                    "precipitation_wet_threshold",
+                    cfg.get("precip_wet_threshold", 0.01),
+                )
+            ),
+        )
+
+        tv_cfg = _coerce_mapping(cfg.get("tv"))
+        if "use_tv_loss" in cfg:
+            tv_cfg["enabled"] = bool(cfg.get("use_tv_loss"))
+        if "tv_loss_weight" in cfg:
+            tv_cfg["weight"] = float(cfg.get("tv_loss_weight", 0.0))
+        tv_channel_weights = [1.0 for _ in self.output_vars]
+        tv_predictands = _coerce_mapping(tv_cfg.get("predictands"))
+        for idx, name in enumerate(self.output_vars):
+            if name in tv_predictands:
+                tv_channel_weights[idx] = max(0.0, float(tv_predictands[name]))
+        self._tv = TotalVariationLossSpec(
+            enabled=bool(tv_cfg.get("enabled", False)) and float(tv_cfg.get("weight", 0.0)) > 0.0,
+            weight=max(0.0, float(tv_cfg.get("weight", 0.0))),
+            channel_weights=tuple(tv_channel_weights),
+        )
+
+        multiscale_cfg = _coerce_mapping(cfg.get("multiscale"))
+        if "use_multiscale_loss" in cfg:
+            multiscale_cfg["enabled"] = bool(cfg.get("use_multiscale_loss"))
+        if "multiscale_loss_weight" in cfg:
+            multiscale_cfg["weight"] = float(cfg.get("multiscale_loss_weight", 0.0))
+        scales_raw = multiscale_cfg.get("scales", (2, 4))
+        scales: list[int] = []
+        if isinstance(scales_raw, (int, float)):
+            scales = [int(scales_raw)]
+        elif isinstance(scales_raw, (list, tuple)):
+            scales = [int(item) for item in scales_raw]
+        scales = [value for value in scales if value > 1]
+        if not scales:
+            scales = [2]
+        multiscale_loss_type = str(multiscale_cfg.get("loss_type", "l1")).lower()
+        if multiscale_loss_type not in {"l1", "l2", "rmse"}:
+            multiscale_loss_type = "l1"
+        self._multiscale = MultiScaleLossSpec(
+            enabled=bool(multiscale_cfg.get("enabled", False))
+            and float(multiscale_cfg.get("weight", 0.0)) > 0.0,
+            weight=max(0.0, float(multiscale_cfg.get("weight", 0.0))),
+            scales=tuple(scales),
+            loss_type=multiscale_loss_type,
+        )
+
+        boundary_cfg = _coerce_mapping(cfg.get("boundary_continuity"))
+        boundary_channel_weights = [1.0 for _ in self.output_vars]
+        boundary_predictands = _coerce_mapping(boundary_cfg.get("predictands"))
+        for idx, name in enumerate(self.output_vars):
+            if name in boundary_predictands:
+                boundary_channel_weights[idx] = max(0.0, float(boundary_predictands[name]))
+        mask_size = cfg.get("mask_unit_size", (16, 16))
+        if isinstance(mask_size, (list, tuple)) and len(mask_size) >= 2:
+            default_stride_lat = int(mask_size[0])
+            default_stride_lon = int(mask_size[1])
+        else:
+            default_stride_lat = default_stride_lon = 16
+        self._boundary_continuity = BoundaryContinuityLossSpec(
+            enabled=bool(boundary_cfg.get("enabled", False))
+            and float(boundary_cfg.get("weight", 0.0)) > 0.0,
+            weight=max(0.0, float(boundary_cfg.get("weight", 0.0))),
+            channel_weights=tuple(boundary_channel_weights),
+            stride_lat=max(2, int(boundary_cfg.get("stride_lat", default_stride_lat))),
+            stride_lon=max(2, int(boundary_cfg.get("stride_lon", default_stride_lon))),
+            match_target=bool(boundary_cfg.get("match_target", True)),
+        )
+        self._precip_index = precip_idx
         self._last_terms: dict[str, float] = {}
 
     @staticmethod
@@ -215,6 +343,167 @@ class CompositePredictandLoss:
             return self._cdf_loss(pred, target, spec)
         raise ValueError(f"Unsupported distribution loss method: {spec.method}")
 
+    def _compute_spatial_gradient_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        weights = torch.tensor(
+            self._spatial_gradient.channel_weights,
+            device=pred.device,
+            dtype=pred.dtype,
+        )
+        total = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        total_weight = torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+        for ch_idx in range(pred.shape[1]):
+            weight = weights[ch_idx]
+            if float(weight.item()) <= 0.0:
+                continue
+
+            pred_ch = pred[:, ch_idx : ch_idx + 1, ...]
+            target_ch = target[:, ch_idx : ch_idx + 1, ...]
+
+            pred_dx = pred_ch[..., :, 1:] - pred_ch[..., :, :-1]
+            pred_dy = pred_ch[..., 1:, :] - pred_ch[..., :-1, :]
+            target_dx = target_ch[..., :, 1:] - target_ch[..., :, :-1]
+            target_dy = target_ch[..., 1:, :] - target_ch[..., :-1, :]
+
+            if (
+                self._spatial_gradient.precipitation_wet_only
+                and ch_idx == self._precip_index
+            ):
+                wet_threshold = self._spatial_gradient.precipitation_wet_threshold
+                wet_x = (
+                    (target_ch[..., :, 1:] > wet_threshold)
+                    | (target_ch[..., :, :-1] > wet_threshold)
+                ).to(dtype=pred.dtype)
+                wet_y = (
+                    (target_ch[..., 1:, :] > wet_threshold)
+                    | (target_ch[..., :-1, :] > wet_threshold)
+                ).to(dtype=pred.dtype)
+
+                if bool(wet_x.any().item()):
+                    loss_x = (torch.abs(pred_dx - target_dx) * wet_x).sum() / wet_x.sum().clamp_min(1.0)
+                else:
+                    loss_x = torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+                if bool(wet_y.any().item()):
+                    loss_y = (torch.abs(pred_dy - target_dy) * wet_y).sum() / wet_y.sum().clamp_min(1.0)
+                else:
+                    loss_y = torch.zeros((), device=pred.device, dtype=pred.dtype)
+            else:
+                loss_x = torch.mean(torch.abs(pred_dx - target_dx))
+                loss_y = torch.mean(torch.abs(pred_dy - target_dy))
+
+            channel_loss = 0.5 * (loss_x + loss_y)
+            total = total + weight * channel_loss
+            total_weight = total_weight + weight
+
+        if float(total_weight.item()) <= 0.0:
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
+        return total / total_weight
+
+    def _compute_total_variation_loss(self, pred: torch.Tensor) -> torch.Tensor:
+        weights = torch.tensor(
+            self._tv.channel_weights,
+            device=pred.device,
+            dtype=pred.dtype,
+        )
+        total = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        total_weight = torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+        for ch_idx in range(pred.shape[1]):
+            weight = weights[ch_idx]
+            if float(weight.item()) <= 0.0:
+                continue
+            pred_ch = pred[:, ch_idx : ch_idx + 1, ...]
+            dx = pred_ch[..., :, 1:] - pred_ch[..., :, :-1]
+            dy = pred_ch[..., 1:, :] - pred_ch[..., :-1, :]
+            channel_tv = 0.5 * (torch.mean(torch.abs(dx)) + torch.mean(torch.abs(dy)))
+            total = total + weight * channel_tv
+            total_weight = total_weight + weight
+
+        if float(total_weight.item()) <= 0.0:
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
+        return total / total_weight
+
+    def _compute_multiscale_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        terms: list[torch.Tensor] = []
+        for scale in self._multiscale.scales:
+            if pred.shape[-2] < scale or pred.shape[-1] < scale:
+                continue
+            pred_ds = F.avg_pool2d(pred, kernel_size=scale, stride=scale)
+            target_ds = F.avg_pool2d(target, kernel_size=scale, stride=scale)
+            if self._multiscale.loss_type == "l2":
+                term = torch.mean((pred_ds - target_ds) ** 2)
+            elif self._multiscale.loss_type == "rmse":
+                term = torch.sqrt(torch.mean((pred_ds - target_ds) ** 2) + 1e-12)
+            else:
+                term = torch.mean(torch.abs(pred_ds - target_ds))
+            terms.append(term)
+        if not terms:
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
+        return torch.stack(terms).mean()
+
+    def _compute_boundary_continuity_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        weights = torch.tensor(
+            self._boundary_continuity.channel_weights,
+            device=pred.device,
+            dtype=pred.dtype,
+        )
+        total = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        total_weight = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        stride_lat = self._boundary_continuity.stride_lat
+        stride_lon = self._boundary_continuity.stride_lon
+        h, w = pred.shape[-2:]
+        y_idx = [idx for idx in range(stride_lat, h, stride_lat)]
+        x_idx = [idx for idx in range(stride_lon, w, stride_lon)]
+        if not y_idx and not x_idx:
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+        for ch_idx in range(pred.shape[1]):
+            weight = weights[ch_idx]
+            if float(weight.item()) <= 0.0:
+                continue
+            pred_ch = pred[:, ch_idx : ch_idx + 1, ...]
+            target_ch = target[:, ch_idx : ch_idx + 1, ...]
+            channel_terms: list[torch.Tensor] = []
+
+            if x_idx:
+                pred_jump_x = torch.cat(
+                    [pred_ch[..., :, idx : idx + 1] - pred_ch[..., :, idx - 1 : idx] for idx in x_idx],
+                    dim=-1,
+                )
+                if self._boundary_continuity.match_target:
+                    target_jump_x = torch.cat(
+                        [target_ch[..., :, idx : idx + 1] - target_ch[..., :, idx - 1 : idx] for idx in x_idx],
+                        dim=-1,
+                    )
+                    channel_terms.append(torch.mean(torch.abs(pred_jump_x - target_jump_x)))
+                else:
+                    channel_terms.append(torch.mean(torch.abs(pred_jump_x)))
+
+            if y_idx:
+                pred_jump_y = torch.cat(
+                    [pred_ch[..., idx : idx + 1, :] - pred_ch[..., idx - 1 : idx, :] for idx in y_idx],
+                    dim=-2,
+                )
+                if self._boundary_continuity.match_target:
+                    target_jump_y = torch.cat(
+                        [target_ch[..., idx : idx + 1, :] - target_ch[..., idx - 1 : idx, :] for idx in y_idx],
+                        dim=-2,
+                    )
+                    channel_terms.append(torch.mean(torch.abs(pred_jump_y - target_jump_y)))
+                else:
+                    channel_terms.append(torch.mean(torch.abs(pred_jump_y)))
+
+            if not channel_terms:
+                continue
+            channel_term = torch.stack(channel_terms).mean()
+            total = total + weight * channel_term
+            total_weight = total_weight + weight
+
+        if float(total_weight.item()) <= 0.0:
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
+        return total / total_weight
+
     def _base_rmse(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if self._precip_hurdle is None:
             return torch.sqrt(torch.mean((pred - target) ** 2))
@@ -268,7 +557,7 @@ class CompositePredictandLoss:
                 f"amount_pred_norm shape {tuple(amount_pred_norm_use.shape)} does not match precip target shape {tuple(target.shape)}."
             )
 
-        wet_target = (target > 0.0).to(dtype=wet_logits_use.dtype)
+        wet_target = (target > self._precip_hurdle.wet_threshold).to(dtype=wet_logits_use.dtype)
         occ_loss = self._occ_loss_fn(wet_logits_use, wet_target)
 
         amount_target_norm = target.to(dtype=amount_pred_norm_use.dtype) / q95_use.to(
@@ -317,6 +606,34 @@ class CompositePredictandLoss:
             terms[f"{name}.distribution.{spec.method}"] = float(dist_term.detach().item())
             terms[f"{name}.distribution.{spec.method}.weighted"] = float(weighted.detach().item())
 
+        if self._spatial_gradient.enabled:
+            grad_term = self._compute_spatial_gradient_loss(y_hat, target)
+            weighted_grad = grad_term * self._spatial_gradient.weight
+            total = total + weighted_grad
+            terms["spatial_gradient"] = float(grad_term.detach().item())
+            terms["spatial_gradient.weighted"] = float(weighted_grad.detach().item())
+
+        if self._tv.enabled:
+            tv_term = self._compute_total_variation_loss(y_hat)
+            weighted_tv = tv_term * self._tv.weight
+            total = total + weighted_tv
+            terms["tv"] = float(tv_term.detach().item())
+            terms["tv.weighted"] = float(weighted_tv.detach().item())
+
+        if self._multiscale.enabled:
+            multiscale_term = self._compute_multiscale_loss(y_hat, target)
+            weighted_multiscale = multiscale_term * self._multiscale.weight
+            total = total + weighted_multiscale
+            terms["multiscale"] = float(multiscale_term.detach().item())
+            terms["multiscale.weighted"] = float(weighted_multiscale.detach().item())
+
+        if self._boundary_continuity.enabled:
+            boundary_term = self._compute_boundary_continuity_loss(y_hat, target)
+            weighted_boundary = boundary_term * self._boundary_continuity.weight
+            total = total + weighted_boundary
+            terms["boundary_continuity"] = float(boundary_term.detach().item())
+            terms["boundary_continuity.weighted"] = float(weighted_boundary.detach().item())
+
         self._last_terms = terms
         return total
 
@@ -339,6 +656,41 @@ class CompositePredictandLoss:
                     "cdf_temperature": spec.cdf_temperature,
                 }
                 for idx, spec in self._dist_specs.items()
+            },
+            "spatial_gradient": {
+                "enabled": self._spatial_gradient.enabled,
+                "weight": self._spatial_gradient.weight,
+                "predictands": {
+                    name: float(self._spatial_gradient.channel_weights[idx])
+                    for idx, name in enumerate(self.output_vars)
+                },
+                "precipitation_wet_only": self._spatial_gradient.precipitation_wet_only,
+                "precipitation_wet_threshold": self._spatial_gradient.precipitation_wet_threshold,
+            },
+            "tv": {
+                "enabled": self._tv.enabled,
+                "weight": self._tv.weight,
+                "predictands": {
+                    name: float(self._tv.channel_weights[idx])
+                    for idx, name in enumerate(self.output_vars)
+                },
+            },
+            "multiscale": {
+                "enabled": self._multiscale.enabled,
+                "weight": self._multiscale.weight,
+                "scales": list(self._multiscale.scales),
+                "loss_type": self._multiscale.loss_type,
+            },
+            "boundary_continuity": {
+                "enabled": self._boundary_continuity.enabled,
+                "weight": self._boundary_continuity.weight,
+                "predictands": {
+                    name: float(self._boundary_continuity.channel_weights[idx])
+                    for idx, name in enumerate(self.output_vars)
+                },
+                "stride_lat": self._boundary_continuity.stride_lat,
+                "stride_lon": self._boundary_continuity.stride_lon,
+                "match_target": self._boundary_continuity.match_target,
             },
         }
         if self._precip_hurdle is not None:
@@ -365,9 +717,17 @@ def build_loss_fn(config: Any, output_vars: list[str]):
         "precip_lambda_occurrence",
         "precip_lambda_amount",
         "precip_amount_loss_type",
+        "use_gradient_loss",
+        "gradient_loss_weight",
+        "use_tv_loss",
+        "tv_loss_weight",
+        "use_multiscale_loss",
+        "multiscale_loss_weight",
     ):
         if key not in merged_cfg and hasattr(config, key):
             merged_cfg[key] = getattr(config, key)
+    if "mask_unit_size" not in merged_cfg and hasattr(config, "mask_unit_size"):
+        merged_cfg["mask_unit_size"] = getattr(config, "mask_unit_size")
 
     precip_model = _canonicalize_precip_model(
         merged_cfg.get("precip_model", merged_cfg.get("precip_head_type", "single_head"))
