@@ -195,6 +195,7 @@ training:
   num_gpus: 1
   per_device_batch_size: 1
   gradient_accumulation_steps: 32
+  auto_resume_if_checkpoint_exists: false
 gradient_accumulation_steps: 32
 loss:
   base: rmse
@@ -258,3 +259,4 @@ precip_occurrence_prob_threshold: 0.5
 precip_lambda_occurrence: 1.0
 precip_lambda_amount: 1.0
 precip_amount_loss_type: smoothl1
+auto_resume_if_checkpoint_exists: false

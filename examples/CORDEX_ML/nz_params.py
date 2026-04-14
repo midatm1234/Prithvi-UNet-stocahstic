@@ -22,6 +22,46 @@ def _coerce_sequence(values: Sequence[Any] | None) -> list[Path]:
     return [_coerce_path(item) for item in values]
 
 
+def _extract_config_version(path_like: Any) -> int | None:
+    if not path_like:
+        return None
+    stem = Path(str(path_like)).stem
+    if "_v" not in stem:
+        return None
+    suffix = stem.rsplit("_v", 1)[-1]
+    if suffix.isdigit():
+        return int(suffix)
+    return None
+
+
+def _run_config_version(run_dir: Path) -> int | None:
+    manifest_path = _coerce_path(run_dir) / "run_manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except Exception:
+        return None
+    return _extract_config_version(manifest.get("base_config") or manifest.get("config_snapshot"))
+
+
+def _validate_run_version(run_dir: Path, requested_config_path: Path) -> None:
+    requested_version = _extract_config_version(requested_config_path)
+    if requested_version is None:
+        return
+    run_version = _run_config_version(run_dir)
+    if run_version is None:
+        return
+    if run_version != requested_version:
+        raise RuntimeError(
+            "Config/run version mismatch: "
+            f"requested config {requested_config_path} (v{requested_version}) but "
+            f"selected run '{_coerce_path(run_dir).name}' is v{run_version}. "
+            "Choose a matching run or config version."
+        )
+
+
 @dataclass
 class UserParams:
     """User-editable parameters shared across NZ CORDEX notebooks."""
@@ -132,8 +172,17 @@ def resolve_run_dir(
     run_name = env_override or params.run_name
     if not run_name:
         job_id = getattr(config, "job_id", "nz_finetune")
-        stamp = (timestamp or datetime.utcnow()).strftime("%Y%m%d-%H%M%S")
-        run_name = f"{job_id}_{stamp}"
+        run_name = str(job_id)
+        append_ts = bool(getattr(config, "append_timestamp_to_run_name", False))
+        env_append = os.environ.get("CORDEX_APPEND_RUN_TIMESTAMP", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if append_ts or env_append:
+            stamp = (timestamp or datetime.utcnow()).strftime("%Y%m%d-%H%M%S")
+            run_name = f"{run_name}_{stamp}"
     run_dir = runs_root / run_name
     return run_name, run_dir
 
@@ -142,6 +191,7 @@ def resolve_existing_run_dir(params: UserParams) -> Tuple[str, Path]:
     """Locate an existing fine-tune run directory for inference."""
 
     runs_root = _coerce_path(params.runs_root)
+    requested_config_path = _coerce_path(params.config_path)
     env_override = os.environ.get(params.env_inference_run_var or "")
     run_name = env_override or params.inference_run_name
     if run_name:
@@ -151,6 +201,7 @@ def resolve_existing_run_dir(params: UserParams) -> Tuple[str, Path]:
             raise FileNotFoundError(
                 f"Requested run '{run_name}' not found or missing manifest under {runs_root}"
             )
+        _validate_run_version(run_dir, requested_config_path)
         return run_name, run_dir
 
     candidates: list[Path] = []
@@ -163,7 +214,26 @@ def resolve_existing_run_dir(params: UserParams) -> Tuple[str, Path]:
     candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     if not candidates:
         raise FileNotFoundError(f"No fine-tune runs with manifests found under {runs_root}")
+
+    requested_version = _extract_config_version(requested_config_path)
+    if requested_version is not None:
+        matching = [path for path in candidates if _run_config_version(path) == requested_version]
+        if not matching:
+            available_versions = sorted(
+                {
+                    version
+                    for version in (_run_config_version(path) for path in candidates)
+                    if version is not None
+                }
+            )
+            raise FileNotFoundError(
+                f"No fine-tune runs with config version v{requested_version} found under {runs_root}. "
+                f"Available versions: {available_versions or '<unknown>'}"
+            )
+        candidates = matching
+
     run_dir = candidates[0]
+    _validate_run_version(run_dir, requested_config_path)
     return run_dir.name, run_dir
 
 

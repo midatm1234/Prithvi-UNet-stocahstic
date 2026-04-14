@@ -74,6 +74,13 @@ def init_ddp(use_gpu: bool):
 
     if use_gpu:
         init_dist("nccl", rank, world_size)
+        visible = torch.cuda.device_count()
+        if local_rank < 0 or local_rank >= visible:
+            visible_env = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+            raise RuntimeError(
+                f"Invalid LOCAL_RANK={local_rank} for {visible} visible CUDA device(s). "
+                f"WORLD_SIZE={world_size}, RANK={rank}, CUDA_VISIBLE_DEVICES={visible_env}."
+            )
         torch.cuda.set_device(local_rank)
         os.environ["TORCH_SHOW_CPP_STACKTRACES"] = str(1)
         os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = str(1)

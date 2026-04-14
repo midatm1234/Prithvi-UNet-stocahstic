@@ -115,11 +115,11 @@ REPAIR_INVALID_INPUTS = True
 
 DEVICE_TARGET = "cuda"
 NUM_WORKERS = 2
-BATCH_SIZE = None
+INFERENCE_BATCH_SIZE = 8  # inference-only; does not affect model weights
 PREFERRED_CHECKPOINT = "best"
 MIN_FREE_GB = 8  # minimum free GPU memory to consider "idle"
-MAX_GPUS = None  # set to an int to cap how many GPUs to expose
-RESPECT_CUDA_VISIBLE_DEVICES = False  # ignore preset CUDA_VISIBLE_DEVICES when auto-selecting idle GPUs
+MAX_GPUS = 1  # set to an int to cap how many GPUs to expose
+RESPECT_CUDA_VISIBLE_DEVICES = True  # ignore preset CUDA_VISIBLE_DEVICES when auto-selecting idle GPUs
 ENABLE_MIXED_PRECISION = False  # keeps inference in full precision to avoid output quantization
 FORCE_OUTPUT_FLOAT32 = True
 NETCDF_OUTPUT_DTYPE = "float32"
@@ -574,7 +574,7 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
         inference_run_name=FINETUNE_RUN_NAME,
         preferred_checkpoint=PREFERRED_CHECKPOINT,
         device_target=DEVICE_TARGET,
-        batch_size=BATCH_SIZE,
+        batch_size=INFERENCE_BATCH_SIZE,
         num_workers=NUM_WORKERS,
         use_static=USE_STATIC,
     )
@@ -583,10 +583,17 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
     run_name, run_dir = resolve_existing_run_dir(base_params)
     manifest = load_run_manifest(run_dir)
     resolved_config_path = Path(manifest["config_snapshot"]).resolve()
+    base_config_raw = manifest.get("base_config")
+    config_source_path = resolved_config_path
+    if base_config_raw:
+        candidate = Path(base_config_raw).expanduser().resolve()
+        if candidate.exists():
+            config_source_path = candidate
 
     os.chdir(PROJECT_DIR)
-    config = get_config(str(resolved_config_path))
-    assert_no_eccc_reference(resolved_config_path)
+    config = get_config(str(config_source_path))
+    assert_no_eccc_reference(config_source_path)
+    print(f"[config] source={config_source_path}")
 
     manifest_scalars = manifest.get("scalars", {})
     if isinstance(manifest_scalars, dict):
@@ -606,8 +613,8 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
 
     if NUM_WORKERS is not None:
         config.dl_num_workers = int(NUM_WORKERS)
-    if BATCH_SIZE is not None:
-        config.batch_size = int(BATCH_SIZE)
+    if INFERENCE_BATCH_SIZE is not None:
+        config.batch_size = int(INFERENCE_BATCH_SIZE)
     config.device_target = DEVICE_TARGET
     if USE_STATIC is not None:
         config.data.use_static = bool(USE_STATIC)
@@ -729,7 +736,7 @@ def main() -> None:
             preferred_checkpoint=PREFERRED_CHECKPOINT,
             device_target=DEVICE_TARGET,
             num_workers=NUM_WORKERS,
-            batch_size=BATCH_SIZE,
+            batch_size=INFERENCE_BATCH_SIZE,
         )
 
         validate_paths(params, require_inference=True)
@@ -779,11 +786,15 @@ def main() -> None:
         target_template_paths = list(base_dataset.target_paths)
 
         boundary_cfg = resolve_boundary_mitigation_settings(config)
-        print(
-            f"[boundary] enabled={boundary_cfg.enabled}, tile_size={boundary_cfg.tile_size}, "
-            f"overlap={boundary_cfg.overlap}, blend_mode={boundary_cfg.blend_mode}, "
-            f"deblock_enabled={boundary_cfg.deblock.enabled}"
-        )
+        boundary_cfg.force_full_frame = True
+        if boundary_cfg.force_full_frame:
+            print("[boundary] force_full_frame=True (tiling/blending disabled)")
+        else:
+            print(
+                f"[boundary] enabled={boundary_cfg.enabled}, tile_size={boundary_cfg.tile_size}, "
+                f"overlap={boundary_cfg.overlap}, blend_mode={boundary_cfg.blend_mode}, "
+                f"deblock_enabled={boundary_cfg.deblock.enabled}"
+            )
         inference_result = _run_full_inference(test_dl, model, device, target_vars, boundary_cfg)
         full_outputs = inference_result["predictions"]
         full_outputs_pre_inverse = inference_result["predictions_pre_inverse"]

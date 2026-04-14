@@ -201,6 +201,7 @@ training:
   num_gpus: 1
   per_device_batch_size: 1
   gradient_accumulation_steps: 32
+  auto_resume_if_checkpoint_exists: false
 gradient_accumulation_steps: 32
 loss:
   base: rmse
@@ -256,11 +257,12 @@ loss:
     stride_lat: 16
     stride_lon: 16
     match_target: true
-resume_training: true
-resume_checkpoint_path: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs/SA_T1_ACCESS-CM2_static_train/SA_T1_ACCESS-CM2_static_v6/checkpoints/last.ckpt
+resume_training: false
+resume_checkpoint_path: null
 precip_model: hurdle
 precip_wet_threshold: 0.01
 precip_occurrence_prob_threshold: 0.5
 precip_lambda_occurrence: 1.0
 precip_lambda_amount: 1.0
 precip_amount_loss_type: smoothl1
+auto_resume_if_checkpoint_exists: false
