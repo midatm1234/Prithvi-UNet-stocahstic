@@ -25,6 +25,7 @@ from merra_prism_utils import (
     align_dates,
     discover_all_prism_targets,
     discover_merra2_files,
+    load_elevation,
     load_yaml,
     parse_date_range_from_config,
     resolve_path,
@@ -133,6 +134,26 @@ class MerraPrismDataset(Dataset):
         scalar_dir_raw = scalars_dir or data_cfg.get("scalar_dir", "")
         self._scalars = self._load_scalars(scalar_dir_raw)
 
+        # Load static elevation (appended as the last input channel)
+        elev_file = data_cfg.get("static_elevation_file", None)
+        elev_var = data_cfg.get("static_elevation_var", None)
+        self._elevation: Optional[np.ndarray] = None
+        if elev_file:
+            elev_path = resolve_path(elev_file)
+            if elev_path.exists():
+                self._elevation = load_elevation(elev_path, var_name=elev_var or None)
+                print(
+                    f"[dataset] loaded static elevation {self._elevation.shape} "
+                    f"from {elev_path.name}"
+                )
+            else:
+                import warnings as _w
+                _w.warn(
+                    f"static_elevation_file not found: {elev_path}; "
+                    "elevation channel will be omitted.",
+                    RuntimeWarning,
+                )
+
     # ------------------------------------------------------------------
     # Scalar loading
     # ------------------------------------------------------------------
@@ -180,7 +201,12 @@ class MerraPrismDataset(Dataset):
     # I/O helpers
     # ------------------------------------------------------------------
     def _load_predictor(self, sample_date: Any) -> torch.Tensor:
-        """Load MERRA2 predictor variables for a single date."""
+        """Load MERRA2 predictor variables for a single date.
+
+        The static elevation field (if configured) is appended as the
+        last channel so that the full tensor is
+        ``[dynamic_vars..., elevation]``.
+        """
         path = self._predictor_map[sample_date]
         arrays: List[np.ndarray] = []
         with xr.open_dataset(str(path)) as ds:
@@ -200,6 +226,15 @@ class MerraPrismDataset(Dataset):
                     arr = arr[np.newaxis, :]
                 arrays.append(arr)
         stacked = np.stack(arrays, axis=0)
+
+        # Append elevation as the final static channel
+        if self._elevation is not None:
+            elev = self._elevation.astype(np.float32)
+            # Resize to match dynamic predictor spatial size if needed
+            if elev.shape != stacked.shape[-2:]:
+                elev = self._resize_elevation(elev, stacked.shape[-2:])
+            stacked = np.concatenate([stacked, elev[np.newaxis]], axis=0)
+
         return torch.from_numpy(stacked).to(self.dtype)
 
     def _load_targets(self, sample_date: Any) -> torch.Tensor:
@@ -255,6 +290,15 @@ class MerraPrismDataset(Dataset):
         std_t = torch.clamp(std_t, min=1e-6)
         return (y - mean_t) / std_t
 
+    @staticmethod
+    def _resize_elevation(elev: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+        """Bilinear resize of a 2-D elevation array to *target_shape* (H, W)."""
+        t = torch.from_numpy(elev).unsqueeze(0).unsqueeze(0)
+        resized = torch.nn.functional.interpolate(
+            t, size=target_shape, mode="bilinear", align_corners=False
+        )
+        return resized.squeeze(0).squeeze(0).numpy()
+
     # ------------------------------------------------------------------
     # Metadata helpers
     # ------------------------------------------------------------------
@@ -264,8 +308,13 @@ class MerraPrismDataset(Dataset):
 
     @property
     def num_predictor_channels(self) -> int:
-        return len(self.predictor_vars)
+        """Total input channels = dynamic MERRA2 vars + 1 elevation (if loaded)."""
+        return len(self.predictor_vars) + (1 if self._elevation is not None else 0)
 
     @property
     def num_target_channels(self) -> int:
         return len(self.target_vars)
+
+    @property
+    def has_elevation(self) -> bool:
+        return self._elevation is not None

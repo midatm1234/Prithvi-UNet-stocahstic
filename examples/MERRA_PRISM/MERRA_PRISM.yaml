@@ -23,22 +23,27 @@ data:
 
   # MERRA2 predictor variable names expected inside each daily file.
   predictor_variables:
-    - T2M
-    - U10M
-    - V10M
-    - QV2M
-    - PS
-    - SLP
-    - PRECTOT
-    - PRECTOTCORR
-    - T500
-    - T850
+    - QV500
+    - QV700
+    - QV850
     - U500
+    - U700
     - U850
     - V500
-    - V850
-    - H500
-    - H850
+    - V700
+    - V850  
+    - T500
+    - T700
+    - T850
+    #- H500
+    #- H700
+    #- H850
+    
+  # Static elevation file on the PRISM 800 m grid.
+  # The file is regridded to the PRISM target grid if needed.
+  static_elevation_file: ./examples/MERRA_PRISM/prism_elevation.nc
+  # Variable name inside the elevation file (auto-detected if null).
+  static_elevation_var: null
 
   # Preprocessed / regridded output directory.
   preprocessed_dir: ./examples/MERRA_PRISM/preprocessed
@@ -71,11 +76,11 @@ data:
 # --- Date ranges ----------------------------------------------------------
 dates:
   training:
-    start: "2000-01-01"
-    end: "2019-12-31"
+    start: "1995-01-01"
+    end: "2015-12-31"
   inference:
-    start: "2020-01-01"
-    end: "2023-12-31"
+    start: "2016-01-01"
+    end: "2025-12-31"
 
 # --- Normalization / predictand configuration -----------------------------
 normalization:
@@ -140,7 +145,7 @@ model:
   dropout_rate: 0.0
   drop_path: 0.0
   residual: none
-  num_static_channels: 0
+  num_static_channels: 1   # 1 elevation channel appended to dynamic predictors
   downscaling_patch_size:
     - 2
     - 2
@@ -195,7 +200,7 @@ checkpoint_dir: ./examples/MERRA_PRISM/experiments/checkpoints
 run_dir: ./examples/MERRA_PRISM/experiments/runs
 
 # Pre-trained backbone weights (update to your local path).
-path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET_small.pt
+path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET.pt
 backbone_use: true
 backbone_freeze: false
 backbone_prefix: "encoder."
@@ -225,9 +230,12 @@ loss:
   predictands:
     ppt:
       distribution_loss:
-        enabled: false
+        enabled: true
         method: cdf
-        weight: 0.0
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: true
         bins: 100
     tmax:
       distribution_loss:
@@ -332,4 +340,4 @@ precip_amount_loss_type: smoothl1
 
 resume_training: false
 resume_checkpoint_path: null
-auto_resume_if_checkpoint_exists: false
+auto_resume_if_checkpoint_exists: true

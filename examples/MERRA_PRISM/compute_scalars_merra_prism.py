@@ -33,6 +33,7 @@ from merra_prism_utils import (
     align_dates,
     discover_all_prism_targets,
     discover_merra2_files,
+    load_elevation,
     load_yaml,
     parse_date_range_from_config,
     resolve_path,
@@ -153,8 +154,21 @@ def compute_scalars(
     pred_map = {d: p for d, p in merra_files}
     target_maps = {var: {d: p for d, p in fl} for var, fl in prism_files.items()}
 
-    # Accumulators
-    n_pred = len(predictor_variables)
+    # Load static elevation (contributes one extra input channel)
+    elev_file = data_cfg.get("static_elevation_file", None)
+    elev_var = data_cfg.get("static_elevation_var", None)
+    elevation_arr: Optional[np.ndarray] = None
+    if elev_file:
+        elev_path = resolve_path(elev_file)
+        if elev_path.exists():
+            elevation_arr = load_elevation(elev_path, var_name=elev_var or None)
+            print(f"[scalars] using elevation channel {elevation_arr.shape} from {elev_path.name}")
+        else:
+            print(f"[scalars] WARN: elevation file not found: {elev_path}; skipping elevation channel")
+
+    # Accumulators — n_pred includes the elevation channel if present
+    n_pred_dynamic = len(predictor_variables)
+    n_pred = n_pred_dynamic + (1 if elevation_arr is not None else 0)
     n_tgt = len(target_variables)
 
     x_sum = np.zeros(n_pred, dtype=np.float64)
@@ -171,8 +185,20 @@ def compute_scalars(
     y_grid_count = 0
 
     for idx, sample_date in enumerate(aligned_dates):
-        # Predictors
+        # Predictors (dynamic channels)
         x = _load_predictor_arrays(pred_map[sample_date], predictor_variables)
+
+        # Append elevation as the last channel (constant across all dates)
+        if elevation_arr is not None:
+            elev = elevation_arr.astype(np.float32)
+            # Resize to match MERRA2 spatial size if needed
+            if elev.shape != x.shape[-2:]:
+                import torch as _torch
+                t = _torch.from_numpy(elev).unsqueeze(0).unsqueeze(0)
+                t = _torch.nn.functional.interpolate(t, size=x.shape[-2:], mode="bilinear", align_corners=False)
+                elev = t.squeeze(0).squeeze(0).numpy()
+            x = np.concatenate([x, elev[np.newaxis]], axis=0)
+
         x_flat = x.reshape(n_pred, -1).astype(np.float64)
         x_sum += x_flat.sum(axis=1)
         x_sumsq += (x_flat ** 2).sum(axis=1)

@@ -227,3 +227,73 @@ def validate_target_variables(
                 f"Target variable directory not found: {var_dir}. "
                 f"Expected layout: {target_dir}/<variable>/<YYYY>/*.nc"
             )
+
+
+# ---------------------------------------------------------------------------
+# Static elevation helpers
+# ---------------------------------------------------------------------------
+
+def load_elevation(
+    elevation_file: str | Path,
+    var_name: Optional[str] = None,
+    target_lat: Optional[Any] = None,
+    target_lon: Optional[Any] = None,
+) -> "np.ndarray":
+    """Load the static elevation field and optionally regrid to *target_lat/lon*.
+
+    Parameters
+    ----------
+    elevation_file : path
+        Path to ``prism_elevation.nc`` (or similar).
+    var_name : str | None
+        Variable name inside the file.  Auto-detected when None.
+    target_lat, target_lon : array-like | None
+        If provided, the elevation field is interpolated to this grid.
+
+    Returns
+    -------
+    np.ndarray
+        2-D float32 array of shape (nlat, nlon).
+    """
+    try:
+        import xarray as xr
+        import numpy as np
+    except ImportError:
+        raise ImportError("xarray and numpy are required to load elevation data")
+
+    elevation_file = resolve_path(elevation_file)
+    if not elevation_file.exists():
+        raise FileNotFoundError(f"Elevation file not found: {elevation_file}")
+
+    with xr.open_dataset(str(elevation_file)) as ds:
+        # Auto-detect variable
+        if var_name and var_name in ds.data_vars:
+            da = ds[var_name]
+        else:
+            candidates = [v for v in ds.data_vars if "elev" in v.lower() or "dem" in v.lower() or "topo" in v.lower()]
+            da = ds[candidates[0]] if candidates else ds[list(ds.data_vars)[0]]
+
+        # Drop time if present
+        if "time" in da.dims:
+            da = da.isel(time=0, drop=True)
+
+        # Regrid if target grid provided
+        if target_lat is not None and target_lon is not None:
+            lat_candidates = ("lat", "latitude", "y")
+            lon_candidates = ("lon", "longitude", "x")
+            lat_name = next((n for n in lat_candidates if n in da.dims or n in da.coords), None)
+            lon_name = next((n for n in lon_candidates if n in da.dims or n in da.coords), None)
+            if lat_name and lon_name:
+                try:
+                    da = da.interp(
+                        {lat_name: target_lat, lon_name: target_lon},
+                        method="linear",
+                    )
+                except Exception:
+                    pass  # Keep original resolution if regrid fails
+
+        arr = da.values.astype(np.float32)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        if arr.ndim == 1:
+            raise ValueError("Elevation field is 1-D; expected a 2-D lat/lon grid")
+        return arr

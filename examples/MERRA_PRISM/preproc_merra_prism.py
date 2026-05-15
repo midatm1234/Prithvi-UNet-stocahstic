@@ -34,6 +34,7 @@ from merra_prism_utils import (
     align_dates,
     discover_all_prism_targets,
     discover_merra2_files,
+    load_elevation,
     load_yaml,
     parse_date_range_from_config,
     resolve_path,
@@ -162,6 +163,21 @@ def preprocess(
     # Get target grid from first PRISM file
     target_grid, (target_lat, target_lon) = _get_target_grid(prism_files)
 
+    # Load static elevation and regrid to the PRISM target grid
+    elev_file = data_cfg.get("static_elevation_file", None)
+    elev_var = data_cfg.get("static_elevation_var", None)
+    elevation_arr: Optional[np.ndarray] = None
+    if elev_file:
+        elev_path = resolve_path(elev_file)
+        if elev_path.exists():
+            elevation_arr = load_elevation(
+                elev_path, var_name=elev_var or None,
+                target_lat=target_lat, target_lon=target_lon,
+            )
+            print(f"[preproc] loaded elevation {elevation_arr.shape} from {elev_path.name}")
+        else:
+            print(f"[preproc] WARN: elevation file not found: {elev_path}")
+
     # Build regridder from first MERRA2 file
     regridder = None
     first_merra_path = pred_map[aligned_dates[0]]
@@ -217,6 +233,9 @@ def preprocess(
             out_ds_vars[f"predictor_{var}"] = (("lat", "lon"), arr)
         for var, arr in tgt_arrays.items():
             out_ds_vars[f"target_{var}"] = (("lat", "lon"), arr)
+        # Embed static elevation so each preprocessed file is self-contained
+        if elevation_arr is not None:
+            out_ds_vars["static_elevation"] = (("lat", "lon"), elevation_arr)
 
         out_ds = xr.Dataset(
             out_ds_vars,
@@ -224,6 +243,7 @@ def preprocess(
             attrs={
                 "date": str(sample_date),
                 "source_merra2": str(merra_path),
+                "has_elevation": str(elevation_arr is not None),
                 "mode": mode,
             },
         )
