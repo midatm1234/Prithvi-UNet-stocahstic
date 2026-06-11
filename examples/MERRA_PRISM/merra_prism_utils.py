@@ -38,6 +38,25 @@ def resolve_path(raw: str | Path) -> Path:
     return (REPO_ROOT / p).resolve()
 
 
+def get_case_name(cfg: Any) -> str:
+    """Return the configured case name from a dict-like or object config."""
+    if isinstance(cfg, dict):
+        case_name = cfg.get("case_name")
+    else:
+        case_name = getattr(cfg, "case_name", None)
+    if not case_name:
+        raise ValueError("case_name must be set in the YAML config")
+    return str(case_name)
+
+
+def case_output_dir(base_dir: str | Path, case_name: str) -> Path:
+    """Resolve an archive root and append case_name unless it is already present."""
+    path = resolve_path(base_dir)
+    if path.name == case_name:
+        return path
+    return path / case_name
+
+
 # ---------------------------------------------------------------------------
 # Date helpers
 # ---------------------------------------------------------------------------
@@ -227,6 +246,35 @@ def validate_target_variables(
                 f"Target variable directory not found: {var_dir}. "
                 f"Expected layout: {target_dir}/<variable>/<YYYY>/*.nc"
             )
+
+
+# ---------------------------------------------------------------------------
+# Predictor variable expansion
+# ---------------------------------------------------------------------------
+
+def expand_predictor_variables(
+    predictor_cfg: Dict[str, Any],
+) -> List[Tuple[str, float]]:
+    """Expand a predictor_variables mapping into a list of (var_name, level) tuples.
+
+    The YAML format is::
+
+        predictor_variables:
+          QV: [500, 700, 850]
+          U:  [500, 700, 850]
+
+    Returns a flat list such as ``[("QV", 500.0), ("QV", 700.0), ..., ("U", 500.0), ...]``.
+    """
+    if not isinstance(predictor_cfg, dict):
+        raise TypeError(
+            "predictor_variables must be a mapping of variable names to pressure-level "
+            "lists, e.g.  QV: [500, 700, 850].  Got a flat list — update the YAML."
+        )
+    specs: List[Tuple[str, float]] = []
+    for var, levels in predictor_cfg.items():
+        for lev in levels:
+            specs.append((str(var), float(lev)))
+    return specs
 
 
 # ---------------------------------------------------------------------------

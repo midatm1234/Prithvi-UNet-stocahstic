@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping, MutableMapping, Sequence
 
 
-PHYSICALLY_NONNEGATIVE_VARS = {"pr", "precip", "precipitation"}
+PHYSICALLY_NONNEGATIVE_VARS = {"pr", "precip", "precipitation", "ppt"}
 ALLOWED_NONNEGATIVITY_METHODS = {"softplus", "exp", "none"}
 ALLOWED_SCALING_METHODS = {"divide_only", "zscore", "log1p_standardize"}
 ALLOWED_NORMALIZATION_MODES = {"global", "gridpoint"}

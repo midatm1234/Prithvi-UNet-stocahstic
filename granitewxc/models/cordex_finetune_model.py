@@ -14,7 +14,7 @@ from granitewxc.models.finetune_model import FinetuneWrapper
 from granitewxc.decoders.downscaling import ConvTransposeBlock, InterpBlock, PixelShuffleBlock
 
 
-PRECIP_VAR_NAMES = {"pr", "precip", "precipitation"}
+PRECIP_VAR_NAMES = {"pr", "precip", "precipitation", "ppt"}
 
 
 def _canonicalize_precip_model(value: str | None) -> str:

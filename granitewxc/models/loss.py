@@ -9,7 +9,14 @@ import torch.nn.functional as F
 
 
 def rmse_loss(y_hat: torch.Tensor, y: dict[str, torch.Tensor]) -> torch.Tensor:
-    return torch.sqrt(torch.mean((y_hat - y["y"]) ** 2))
+    # NaN-safe RMSE over valid target pixels only (PRISM is NaN over ocean).
+    target = y["y"]
+    valid = torch.isfinite(target)
+    if not bool(valid.any()):
+        return torch.zeros((), device=y_hat.device, dtype=y_hat.dtype)
+    diff = (y_hat - torch.where(valid, target, y_hat.detach())) ** 2
+    valid_f = valid.to(y_hat.dtype)
+    return torch.sqrt((diff * valid_f).sum() / valid_f.sum().clamp(min=1.0))
 
 
 def _coerce_mapping(value: Any) -> dict[str, Any]:
@@ -79,7 +86,7 @@ class BoundaryContinuityLossSpec:
     match_target: bool
 
 
-PRECIP_VAR_NAMES = {"pr", "precip", "precipitation"}
+PRECIP_VAR_NAMES = {"pr", "precip", "precipitation", "ppt"}
 
 
 def _canonicalize_precip_model(value: Any) -> str:
@@ -516,6 +523,28 @@ class CompositePredictandLoss:
         target_non_precip = target[:, keep_indices, ...]
         return torch.sqrt(torch.mean((pred_non_precip - target_non_precip) ** 2))
 
+    def _base_rmse_masked(
+        self, pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor
+    ) -> torch.Tensor:
+        """RMSE over VALID target pixels only (invalid/NaN cells are ignored).
+
+        ``valid`` is a boolean tensor with the same shape as ``target``. Invalid
+        target cells (PRISM ocean / outside-CONUS, ~44%) must not contribute to
+        the loss; otherwise the model is trained to predict zeros there.
+        """
+        if self._precip_hurdle is not None:
+            precip_idx = self._precip_hurdle.precip_index
+            keep_indices = [idx for idx in range(pred.shape[1]) if idx != precip_idx]
+            if not keep_indices:
+                return torch.zeros((), device=pred.device, dtype=pred.dtype)
+            pred = pred[:, keep_indices, ...]
+            target = target[:, keep_indices, ...]
+            valid = valid[:, keep_indices, ...]
+        valid_f = valid.to(pred.dtype)
+        sq_err = (pred - target) ** 2 * valid_f
+        denom = valid_f.sum().clamp(min=1.0)
+        return torch.sqrt(sq_err.sum() / denom)
+
     @staticmethod
     def _squeeze_single_channel(value: torch.Tensor) -> torch.Tensor:
         if value.ndim >= 2 and value.shape[1] == 1:
@@ -543,6 +572,12 @@ class CompositePredictandLoss:
 
         precip_idx = self._precip_hurdle.precip_index
         target = batch["y"][:, precip_idx, ...]
+        # Validity mask for the precip channel (NaN over ocean / outside CONUS).
+        valid_mask = batch.get("__valid_mask")
+        if isinstance(valid_mask, torch.Tensor):
+            vp = valid_mask[:, precip_idx, ...]
+        else:
+            vp = torch.isfinite(target)
 
         wet_logits_use = self._squeeze_single_channel(wet_logits)
         amount_pred_norm_use = self._squeeze_single_channel(amount_pred_norm)
@@ -558,12 +593,17 @@ class CompositePredictandLoss:
             )
 
         wet_target = (target > self._precip_hurdle.wet_threshold).to(dtype=wet_logits_use.dtype)
-        occ_loss = self._occ_loss_fn(wet_logits_use, wet_target)
+        # Occurrence loss over VALID precip pixels only (ignore missing cells).
+        if bool(vp.any().item()):
+            occ_loss = self._occ_loss_fn(wet_logits_use[vp], wet_target[vp])
+        else:
+            occ_loss = torch.zeros((), device=target.device, dtype=wet_logits_use.dtype)
 
         amount_target_norm = target.to(dtype=amount_pred_norm_use.dtype) / q95_use.to(
             dtype=amount_pred_norm_use.dtype
         )
-        wet_mask = wet_target > 0.5
+        # Amount loss over wet AND valid pixels only.
+        wet_mask = (wet_target > 0.5) & vp
         if bool(wet_mask.any().item()):
             amount_loss = self._amount_loss_fn(
                 amount_pred_norm_use[wet_mask],
@@ -585,9 +625,35 @@ class CompositePredictandLoss:
         return total, terms
 
     def __call__(self, y_hat: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        target = batch["y"]
-        total = self._base_rmse(y_hat, target)
-        terms: dict[str, float] = {"base.rmse": float(total.detach().item())}
+        raw_target = batch["y"]
+
+        # ------------------------------------------------------------------
+        # Missing-target handling. PRISM targets are NaN over ocean / outside
+        # CONUS (~44% of the grid). Those pixels must be IGNORED by the loss, not
+        # trained toward zero. We:
+        #   * build a validity mask (finite cells);
+        #   * sanitize the target by replacing invalid cells with the model's own
+        #     prediction (detached) so every difference-based auxiliary term
+        #     contributes exactly 0 there (and never produces NaN gradients);
+        #   * use an explicitly masked base RMSE over valid cells only;
+        #   * report the valid-pixel fraction.
+        # ------------------------------------------------------------------
+        valid = torch.isfinite(raw_target)
+        target = torch.where(valid, raw_target, y_hat.detach().to(raw_target.dtype))
+        batch = dict(batch)
+        batch["y"] = target
+        batch["__valid_mask"] = valid
+
+        n_valid = float(valid.sum().item())
+        n_total = float(valid.numel())
+        valid_fraction = n_valid / max(n_total, 1.0)
+
+        total = self._base_rmse_masked(y_hat, target, valid)
+        terms: dict[str, float] = {
+            "base.rmse": float(total.detach().item()),
+            "valid_fraction": valid_fraction,
+            "valid_pixels": n_valid,
+        }
 
         if self._precip_hurdle is not None:
             precip_loss, precip_terms = self._compute_precip_hurdle_loss(batch)

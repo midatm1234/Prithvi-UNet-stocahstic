@@ -25,6 +25,7 @@ from merra_prism_utils import (
     align_dates,
     discover_all_prism_targets,
     discover_merra2_files,
+    expand_predictor_variables,
     load_elevation,
     load_yaml,
     parse_date_range_from_config,
@@ -48,6 +49,14 @@ def _infer_coord_name(ds: Any, candidates: Sequence[str]) -> str:
     raise ValueError(f"Unable to find coordinate among {candidates} in dataset")
 
 
+def _find_numeric_datavar(ds: Any, path: Any) -> str:
+    """Return the first data variable with a numeric dtype, skipping metadata vars like 'crs'."""
+    for v in ds.data_vars:
+        if np.issubdtype(ds[v].dtype, np.number):
+            return v
+    raise ValueError(f"No numeric data variable found in {path}")
+
+
 class MerraPrismDataset(Dataset):
     """Pair daily MERRA2 predictors with daily PRISM targets.
 
@@ -58,8 +67,9 @@ class MerraPrismDataset(Dataset):
     mode : str
         ``"training"`` or ``"inference"`` — selects the date range from the
         YAML ``dates`` block.
-    predictor_variables : list[str] | None
-        Override predictor variable names (default reads from YAML).
+    predictor_variables : dict[str, list] | None
+        Override predictor variable config (default reads from YAML).
+        Format: ``{"QV": [500, 700, 850], "U": [500, 700, 850], ...}``.
     target_variables : list[str] | None
         Override target variable names (default reads from YAML).
     scalars_dir : str | Path | None
@@ -72,7 +82,7 @@ class MerraPrismDataset(Dataset):
         self,
         config_path: PathLike,
         mode: str = "training",
-        predictor_variables: Optional[Sequence[str]] = None,
+        predictor_variables: Optional[Dict[str, List]] = None,
         target_variables: Optional[Sequence[str]] = None,
         scalars_dir: Optional[PathLike] = None,
         dtype: torch.dtype = torch.float32,
@@ -88,8 +98,8 @@ class MerraPrismDataset(Dataset):
         self.predictor_dir = resolve_path(data_cfg["predictor_dir"])
         self.target_dir = resolve_path(data_cfg["target_dir"])
 
-        self.predictor_vars: List[str] = list(
-            predictor_variables or data_cfg.get("predictor_variables", [])
+        self.predictor_vars: List[Tuple[str, float]] = expand_predictor_variables(
+            predictor_variables or data_cfg.get("predictor_variables", {})
         )
         self.target_vars: List[str] = list(
             target_variables or data_cfg.get("target_variables", [])
@@ -130,21 +140,64 @@ class MerraPrismDataset(Dataset):
                 self._dates, list(self._target_maps[var].keys()), f"target ({var})"
             )
 
-        # Load scalars if available
-        scalar_dir_raw = scalars_dir or data_cfg.get("scalar_dir", "")
-        self._scalars = self._load_scalars(scalar_dir_raw)
+        # ------------------------------------------------------------------
+        # Fine (PRISM) target grid. Predictors are regridded onto THIS grid so
+        # that predictor and target are co-registered (same approach as the
+        # working CORDEX_ML dataset, which regrids coarse GCM fields onto the
+        # fine target grid before cropping).
+        # ------------------------------------------------------------------
+        self.fine_lat, self.fine_lon = self._load_fine_grid()
+        self.fine_shape: Tuple[int, int] = (len(self.fine_lat), len(self.fine_lon))
 
-        # Load static elevation (appended as the last input channel)
+        # Crop size (tile) used for training. Inference crops/tiles explicitly.
+        crop_lat = int(data_cfg.get("train_crop_size_lat", 256))
+        crop_lon = int(data_cfg.get("train_crop_size_lon", 256))
+        self.crop_size: Tuple[int, int] = (
+            min(crop_lat, self.fine_shape[0]),
+            min(crop_lon, self.fine_shape[1]),
+        )
+        # Random crops for training; deterministic (top-left) for everything else.
+        self.random_crop = mode == "training"
+        self._rng = np.random.default_rng(0)
+
+        # NOTE: the dataset deliberately does NOT z-score x or y. The model
+        # normalizes inputs and denormalizes outputs internally via its
+        # input/output scalers, and the loss is computed in physical units.
+        #
+        # For missing-data handling we DO load the precomputed input MEANS: NaN
+        # predictor cells (pressure levels below the surface over high terrain)
+        # are filled with their channel mean so that, after the model's internal
+        # z-score, they become the neutral value 0. A separate binary validity
+        # mask channel tells the model which cells were originally missing.
+        self._scalars: Dict[str, np.ndarray] = {}
+        scalar_dir = data_cfg.get("scalar_dir", "")
+        self._fill_means: Optional[np.ndarray] = None
+        if scalar_dir:
+            self._scalars = self._load_scalars(scalar_dir)
+            im = self._scalars.get("inputs_mean")
+            if im is not None:
+                # inputs_mean is [data_means(N), mask_means(N)] -> take the data
+                # half for neutral NaN-fill (mask means are 0).
+                n_data = len(self.predictor_vars) + 1  # + elevation
+                self._fill_means = np.asarray(im[:n_data], dtype=np.float32)
+
+        # Load static elevation ON THE PRISM GRID (appended as the last input
+        # channel) so it is co-registered with the regridded predictors.
         elev_file = data_cfg.get("static_elevation_file", None)
         elev_var = data_cfg.get("static_elevation_var", None)
         self._elevation: Optional[np.ndarray] = None
         if elev_file:
             elev_path = resolve_path(elev_file)
             if elev_path.exists():
-                self._elevation = load_elevation(elev_path, var_name=elev_var or None)
+                self._elevation = load_elevation(
+                    elev_path,
+                    var_name=elev_var or None,
+                    target_lat=self.fine_lat,
+                    target_lon=self.fine_lon,
+                )
                 print(
                     f"[dataset] loaded static elevation {self._elevation.shape} "
-                    f"from {elev_path.name}"
+                    f"(on PRISM grid) from {elev_path.name}"
                 )
             else:
                 import warnings as _w
@@ -153,6 +206,35 @@ class MerraPrismDataset(Dataset):
                     "elevation channel will be omitted.",
                     RuntimeWarning,
                 )
+
+    # ------------------------------------------------------------------
+    # Fine (target) grid helpers
+    # ------------------------------------------------------------------
+    def _load_fine_grid(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return the PRISM (fine) target lat/lon coordinate arrays."""
+        first_var = self.target_vars[0]
+        first_date = self._dates[0]
+        path = self._target_maps[first_var][first_date]
+        with xr.open_dataset(str(path)) as ds:
+            lat_name = _infer_coord_name(ds, LAT_CANDIDATES)
+            lon_name = _infer_coord_name(ds, LON_CANDIDATES)
+            return (
+                ds[lat_name].values.astype(np.float64),
+                ds[lon_name].values.astype(np.float64),
+            )
+
+    def _select_crop(self) -> Tuple[slice, slice]:
+        """Pick a (lat_slice, lon_slice) crop window on the fine grid."""
+        ch, cw = self.crop_size
+        if self.crop_size == self.fine_shape:
+            return slice(None), slice(None)
+        if self.random_crop:
+            lat0 = int(self._rng.integers(0, self.fine_shape[0] - ch + 1))
+            lon0 = int(self._rng.integers(0, self.fine_shape[1] - cw + 1))
+        else:
+            lat0 = (self.fine_shape[0] - ch) // 2
+            lon0 = (self.fine_shape[1] - cw) // 2
+        return slice(lat0, lat0 + ch), slice(lon0, lon0 + cw)
 
     # ------------------------------------------------------------------
     # Scalar loading
@@ -184,122 +266,133 @@ class MerraPrismDataset(Dataset):
             raise IndexError("Index out of range")
 
         sample_date = self._dates[index]
+        lat_slice, lon_slice = self._select_crop()
 
-        # Load predictors
-        x = self._load_predictor(sample_date)
-
-        # Load targets
-        y = self._load_targets(sample_date)
-
-        # Apply normalisation
-        x = self._normalize_input(x)
-        y = self._normalize_target(y)
+        # Raw, physical-unit predictors (regridded onto the PRISM crop) and
+        # targets. NO normalization here -- the model normalizes inputs and
+        # denormalizes outputs internally, and the loss is in physical units.
+        x = self._load_predictor(sample_date, lat_slice, lon_slice)
+        y = self._load_targets(sample_date, lat_slice, lon_slice)
 
         return {"x": x, "y": y, "date": str(sample_date)}
 
     # ------------------------------------------------------------------
     # I/O helpers
     # ------------------------------------------------------------------
-    def _load_predictor(self, sample_date: Any) -> torch.Tensor:
-        """Load MERRA2 predictor variables for a single date.
+    def _fine_coords(
+        self, lat_slice: slice, lon_slice: slice
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        return self.fine_lat[lat_slice], self.fine_lon[lon_slice]
 
-        The static elevation field (if configured) is appended as the
-        last channel so that the full tensor is
-        ``[dynamic_vars..., elevation]``.
+    def _load_predictor(
+        self,
+        sample_date: Any,
+        lat_slice: slice = slice(None),
+        lon_slice: slice = slice(None),
+    ) -> torch.Tensor:
+        """Load MERRA2 predictors for a date, regridded onto the PRISM crop.
+
+        Each predictor is bilinearly interpolated from the coarse MERRA2 grid
+        onto the exact PRISM crop coordinates (``lat_slice``/``lon_slice`` of the
+        fine grid). This co-registers the coarse predictors with the fine
+        target, exactly like the CORDEX_ML dataset's regridder step. The static
+        elevation field (already on the PRISM grid) is appended as the last
+        channel so the full tensor is ``[dynamic_vars..., elevation]``.
+        Returned values are RAW physical units.
         """
+        crop_lat, crop_lon = self._fine_coords(lat_slice, lon_slice)
         path = self._predictor_map[sample_date]
         arrays: List[np.ndarray] = []
         with xr.open_dataset(str(path)) as ds:
-            for var in self.predictor_vars:
+            lat_name = _infer_coord_name(ds, LAT_CANDIDATES)
+            lon_name = _infer_coord_name(ds, LON_CANDIDATES)
+            for var, level in self.predictor_vars:
                 if var not in ds.data_vars:
                     raise ValueError(
                         f"MERRA2 file {path} does not contain variable '{var}'"
                     )
                 da = ds[var]
-                # Collapse time dim if present
                 if "time" in da.dims:
                     da = da.isel(time=0, drop=True)
-                arr = da.values.astype(np.float32)
-                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-                if arr.ndim == 1:
-                    warnings.warn(f"Predictor '{var}' is 1-D; expanding to 2-D")
-                    arr = arr[np.newaxis, :]
+                if "lev" in da.dims:
+                    da = da.sel(lev=level, drop=True)
+                # Bilinear regrid (interp) of the coarse field onto the PRISM
+                # crop coordinates -> co-registered with the target. NaN cells
+                # (pressure levels below the surface over high terrain) are
+                # PRESERVED here; they are masked + filled below.
+                da = da.interp(
+                    {lat_name: crop_lat, lon_name: crop_lon}, method="linear"
+                )
+                arr = np.asarray(da.values, dtype=np.float32)
+                arr[np.isinf(arr)] = np.nan
                 arrays.append(arr)
         stacked = np.stack(arrays, axis=0)
 
-        # Append elevation as the final static channel
+        # Append elevation crop as the final static channel (always valid).
         if self._elevation is not None:
-            elev = self._elevation.astype(np.float32)
-            # Resize to match dynamic predictor spatial size if needed
-            if elev.shape != stacked.shape[-2:]:
-                elev = self._resize_elevation(elev, stacked.shape[-2:])
+            elev = self._elevation[lat_slice, lon_slice].astype(np.float32)
             stacked = np.concatenate([stacked, elev[np.newaxis]], axis=0)
 
-        return torch.from_numpy(stacked).to(self.dtype)
+        # ------------------------------------------------------------------
+        # Missing-data handling (NOT zero-filling):
+        #   * validity mask = 1 where the cell is finite, 0 where it was NaN
+        #     (below-surface / missing);
+        #   * fill the NaN data cells with the channel MEAN so that after the
+        #     model's internal z-score they become the neutral value 0 (we do
+        #     NOT inject physical zeros, which the model would read as real
+        #     cold/zero values);
+        #   * append the mask as extra channels so the model can learn the
+        #     spatial pattern of missing data over high terrain.
+        # Channel layout returned: [data_0..N-1, mask_0..N-1].
+        # ------------------------------------------------------------------
+        n_ch = stacked.shape[0]
+        valid = np.isfinite(stacked)
+        mask = valid.astype(np.float32)
 
-    def _load_targets(self, sample_date: Any) -> torch.Tensor:
-        """Load all PRISM target variables for a single date."""
+        if self._fill_means is not None and len(self._fill_means) >= n_ch:
+            fill = np.asarray(self._fill_means[:n_ch], dtype=np.float32)[:, None, None]
+        else:
+            # Fallback before scalars exist (e.g. first scalar pass): per-tile
+            # channel nanmean, then 0 for all-NaN channels.
+            with np.errstate(all="ignore"):
+                fill = np.nanmean(
+                    np.where(valid, stacked, np.nan), axis=(1, 2), keepdims=True
+                )
+            fill = np.nan_to_num(fill, nan=0.0)
+
+        filled = np.where(valid, stacked, fill).astype(np.float32)
+        out = np.concatenate([filled, mask], axis=0)
+        return torch.from_numpy(out).to(self.dtype)
+
+    def _load_targets(
+        self,
+        sample_date: Any,
+        lat_slice: slice = slice(None),
+        lon_slice: slice = slice(None),
+    ) -> torch.Tensor:
+        """Load all PRISM target variables (raw physical) for a date/crop.
+
+        NaN target cells (PRISM is missing over ocean / outside CONUS, ~44% of
+        the grid) are PRESERVED so the loss can mask them. They are NOT replaced
+        with zeros (which would be confused with real ppt=0 dry cells and with
+        real cold temperatures).
+        """
         arrays: List[np.ndarray] = []
         for var in self.target_vars:
             path = self._target_maps[var][sample_date]
             with xr.open_dataset(str(path)) as ds:
-                # Identify the data variable
-                data_vars = list(ds.data_vars)
-                if not data_vars:
-                    raise ValueError(f"No data variables in {path}")
-                # Use the first (usually only) data variable
-                da = ds[data_vars[0]]
+                # Identify the data variable (skip non-numeric metadata like 'crs')
+                da = ds[_find_numeric_datavar(ds, path)]
                 if "time" in da.dims:
                     da = da.isel(time=0, drop=True)
-                arr = da.values.astype(np.float32)
-                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-                if arr.ndim == 1:
-                    arr = arr[np.newaxis, :]
+                arr = np.asarray(da.values, dtype=np.float32)
+                arr = arr[lat_slice, lon_slice]
+                arr[np.isinf(arr)] = np.nan
                 arrays.append(arr)
 
         stacked = np.stack(arrays, axis=0)
         return torch.from_numpy(stacked).to(self.dtype)
 
-    # ------------------------------------------------------------------
-    # Normalisation
-    # ------------------------------------------------------------------
-    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
-        mean = self._scalars.get("inputs_mean")
-        std = self._scalars.get("inputs_std")
-        if mean is None or std is None:
-            return x
-        mean_t = torch.from_numpy(mean).to(self.dtype)
-        std_t = torch.from_numpy(std).to(self.dtype)
-        # Reshape for broadcasting: (C,) → (C, 1, 1) or keep spatial dims
-        while mean_t.ndim < x.ndim:
-            mean_t = mean_t.unsqueeze(-1)
-            std_t = std_t.unsqueeze(-1)
-        std_t = torch.clamp(std_t, min=1e-6)
-        return (x - mean_t) / std_t
-
-    def _normalize_target(self, y: torch.Tensor) -> torch.Tensor:
-        mean = self._scalars.get("targets_mean")
-        std = self._scalars.get("targets_std")
-        if mean is None or std is None:
-            return y
-        mean_t = torch.from_numpy(mean).to(self.dtype)
-        std_t = torch.from_numpy(std).to(self.dtype)
-        while mean_t.ndim < y.ndim:
-            mean_t = mean_t.unsqueeze(-1)
-            std_t = std_t.unsqueeze(-1)
-        std_t = torch.clamp(std_t, min=1e-6)
-        return (y - mean_t) / std_t
-
-    @staticmethod
-    def _resize_elevation(elev: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
-        """Bilinear resize of a 2-D elevation array to *target_shape* (H, W)."""
-        t = torch.from_numpy(elev).unsqueeze(0).unsqueeze(0)
-        resized = torch.nn.functional.interpolate(
-            t, size=target_shape, mode="bilinear", align_corners=False
-        )
-        return resized.squeeze(0).squeeze(0).numpy()
-
-    # ------------------------------------------------------------------
     # Metadata helpers
     # ------------------------------------------------------------------
     @property
@@ -308,8 +401,10 @@ class MerraPrismDataset(Dataset):
 
     @property
     def num_predictor_channels(self) -> int:
-        """Total input channels = dynamic MERRA2 vars + 1 elevation (if loaded)."""
-        return len(self.predictor_vars) + (1 if self._elevation is not None else 0)
+        """Total input channels = 2 × (dynamic MERRA2 vars + elevation):
+        N physical data channels followed by N binary validity-mask channels."""
+        n_data = len(self.predictor_vars) + (1 if self._elevation is not None else 0)
+        return 2 * n_data
 
     @property
     def num_target_channels(self) -> int:

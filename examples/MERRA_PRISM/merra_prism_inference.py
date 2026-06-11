@@ -14,7 +14,7 @@ import os
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -24,15 +24,30 @@ try:
 except ImportError:
     xr = None
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 from granitewxc.utils.config import get_config
 from granitewxc.utils.predictands import build_predictand_specs
 
 from merra_prism_dataset import MerraPrismDataset
-from merra_prism_utils import load_yaml, parse_date_range_from_config, resolve_path
+from merra_prism_utils import (
+    case_output_dir,
+    expand_predictor_variables,
+    get_case_name,
+    load_yaml,
+    parse_date_range_from_config,
+    resolve_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -43,20 +58,35 @@ def _find_checkpoint(cfg: Dict[str, Any], explicit: Optional[str]) -> str:
     """Locate the model checkpoint to use for inference."""
     if explicit:
         return str(resolve_path(explicit))
+    case_name = get_case_name(cfg)
     inf_cfg = cfg.get("inference", {})
     ckpt = inf_cfg.get("checkpoint_path")
     if ckpt:
         return str(resolve_path(ckpt))
-    # Fall back to run_dir / checkpoints / best.ckpt
-    run_dir = cfg.get("run_dir") or cfg.get("checkpoint_dir")
+
+    checkpoint_dir = cfg.get("checkpoint_dir")
+    if checkpoint_dir:
+        case_checkpoint_dir = case_output_dir(checkpoint_dir, case_name)
+        for candidate in ("best.ckpt", "last.ckpt"):
+            p = case_checkpoint_dir / candidate
+            if p.exists():
+                return str(p)
+
+    run_dir = cfg.get("run_dir")
     if run_dir:
-        best = resolve_path(run_dir) / "best.ckpt"
-        if best.exists():
-            return str(best)
-    # Final fallback
+        case_run_dir = case_output_dir(run_dir, case_name)
+        for candidate in ("best.ckpt", "last.ckpt"):
+            p = case_run_dir / candidate
+            if p.exists():
+                return str(p)
+        for candidate in ("best.ckpt", "last.ckpt"):
+            p = case_run_dir / "checkpoints" / candidate
+            if p.exists():
+                return str(p)
+
     exp = cfg.get("path_experiment", ".")
     for candidate in ("best.ckpt", "last.ckpt"):
-        p = resolve_path(exp) / "checkpoints" / candidate
+        p = case_output_dir(resolve_path(exp) / "checkpoints", case_name) / candidate
         if p.exists():
             return str(p)
     raise FileNotFoundError("Cannot locate a trained checkpoint. Pass --checkpoint explicitly.")
@@ -92,40 +122,105 @@ def _load_model(config: Any, checkpoint_path: str, device: torch.device) -> torc
     return model
 
 
-def _load_scalars(cfg: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
-    """Load target mean and std for denormalization."""
-    data_cfg = cfg.get("data", {})
-    scalers = data_cfg.get("scalers", {})
-    mean_path = scalers.get("targets_mean") or os.path.join(
-        str(data_cfg.get("scalar_dir", "")), "targets_mean.npy"
+# ---------------------------------------------------------------------------
+# Output metadata and physical-range sanity checks
+# ---------------------------------------------------------------------------
+#
+# IMPORTANT (root-cause note): the downscaling model used here
+# (``ClimateDownscaleFinetuneUNETModel``) applies the target output scalers
+# *internally* inside ``_decode_outputs`` (``decoded = normalized * sigma + mu``)
+# and ``forward`` returns the result in **physical units** already
+# (degC for tmax/tmin, mm/day for ppt). The inference loop must therefore NOT
+# denormalize a second time. A previous version multiplied the already-physical
+# output by the gridpoint std and re-added the gridpoint mean, which produced
+# impossible temperatures (e.g. -97 degC .. +92 degC). See ``run_inference``.
+
+# Physical units written into the NetCDF metadata for each target variable.
+VAR_UNITS: Dict[str, str] = {
+    "ppt": "mm/day",
+    "tmax": "degC",
+    "tmin": "degC",
+}
+
+# Physically plausible bounds (Celsius) for the temperature predictands. Values
+# outside this band indicate a normalization/denormalization or unit error.
+TEMP_PHYSICAL_MIN_C = -90.0
+TEMP_PHYSICAL_MAX_C = 70.0
+TEMP_VARS = ("tmax", "tmin")
+
+
+def _channel_stats(prediction: np.ndarray, channel: int) -> Tuple[float, float, float, float]:
+    """Return (min, max, mean, std) over finite values of one channel."""
+    a = prediction[:, channel, ...]
+    finite = a[np.isfinite(a)]
+    if finite.size == 0:
+        return (float("nan"),) * 4
+    return (
+        float(finite.min()),
+        float(finite.max()),
+        float(finite.mean()),
+        float(finite.std()),
     )
-    std_path = scalers.get("targets_std") or os.path.join(
-        str(data_cfg.get("scalar_dir", "")), "targets_std.npy"
-    )
-    mean_path = str(resolve_path(mean_path))
-    std_path = str(resolve_path(std_path))
-
-    if not os.path.exists(mean_path) or not os.path.exists(std_path):
-        raise FileNotFoundError(
-            f"Target scalars not found: {mean_path}, {std_path}. Run compute_scalars first."
-        )
-    return np.load(mean_path), np.load(std_path)
 
 
-def _denormalize(
+def _print_channel_stats(
     prediction: np.ndarray,
-    target_mean: np.ndarray,
-    target_std: np.ndarray,
-) -> np.ndarray:
-    """Reverse the normalisation: x = x_norm * std + mean."""
-    mean = target_mean.copy()
-    std = target_std.copy()
-    # Broadcast to match prediction shape
-    while mean.ndim < prediction.ndim:
-        mean = mean[..., np.newaxis]
-        std = std[..., np.newaxis]
-    std = np.maximum(std, 1e-6)
-    return prediction * std + mean
+    target_variables: Sequence[str],
+    header: str,
+) -> None:
+    """Print per-channel min/max/mean/std for a (B, C, H, W) prediction batch."""
+    print(header)
+    for ch_idx, var in enumerate(target_variables):
+        vmin, vmax, vmean, vstd = _channel_stats(prediction, ch_idx)
+        unit = VAR_UNITS.get(var, "")
+        print(
+            f"    {var:>5} [{unit}]: min={vmin:8.3f} max={vmax:8.3f} "
+            f"mean={vmean:8.3f} std={vstd:8.3f}"
+        )
+
+
+def _sanity_check_outputs(
+    prediction: np.ndarray,
+    target_variables: Sequence[str],
+    date_string: str,
+) -> None:
+    """Validate that the (already physical-unit) model output is reasonable.
+
+    Raises ``ValueError`` if any temperature channel falls outside the physically
+    plausible Celsius band. This is a guard against denormalization/unit bugs --
+    it does NOT clip the output (clipping would hide the real problem).
+    Cells where ``tmax < tmin`` are reported but not treated as fatal, since an
+    under-trained checkpoint can produce a small number of such crossings.
+    """
+    var_index = {v: i for i, v in enumerate(target_variables)}
+
+    for var in TEMP_VARS:
+        if var not in var_index:
+            continue
+        ch = var_index[var]
+        vmin, vmax, _, _ = _channel_stats(prediction, ch)
+        if vmin < TEMP_PHYSICAL_MIN_C or vmax > TEMP_PHYSICAL_MAX_C:
+            raise ValueError(
+                f"[{date_string}] '{var}' is outside the physical range "
+                f"[{TEMP_PHYSICAL_MIN_C}, {TEMP_PHYSICAL_MAX_C}] degC "
+                f"(min={vmin:.2f}, max={vmax:.2f}). This signals a "
+                f"normalization/denormalization or unit error -- the model "
+                f"output is already in physical units and must not be "
+                f"denormalized again."
+            )
+
+    if "tmax" in var_index and "tmin" in var_index:
+        tmax = prediction[:, var_index["tmax"], ...]
+        tmin = prediction[:, var_index["tmin"], ...]
+        valid = np.isfinite(tmax) & np.isfinite(tmin)
+        crossings = int(np.sum((tmax < tmin) & valid))
+        total = int(np.sum(valid))
+        if crossings:
+            pct = 100.0 * crossings / max(total, 1)
+            print(
+                f"[inference] {date_string}: tmax < tmin at {crossings}/{total} "
+                f"cells ({pct:.3f}%)"
+            )
 
 
 def _validate_output(
@@ -152,11 +247,147 @@ def _validate_output(
         print(f"[inference] WARNING: {n_bad} non-finite values detected in output")
 
 
+def _validate_prediction_batch(
+    prediction: np.ndarray,
+    target_lat: np.ndarray,
+    target_lon: np.ndarray,
+    target_variables: Sequence[str],
+) -> None:
+    """Run lightweight checks before streaming a batch to disk."""
+    if prediction.ndim != 4:
+        raise ValueError(f"Expected prediction shape (B, C, H, W), got {prediction.shape}")
+    n_vars = len(target_variables)
+    if prediction.shape[1] != n_vars:
+        raise ValueError(
+            f"Inference output has {prediction.shape[1]} variables, expected {n_vars}"
+        )
+    expected_hw = (len(target_lat), len(target_lon))
+    if prediction.shape[-2:] != expected_hw:
+        raise ValueError(
+            f"Inference output grid {prediction.shape[-2:]} does not match "
+            f"target grid {expected_hw}"
+        )
+    if np.any(~np.isfinite(prediction)):
+        n_bad = int(np.sum(~np.isfinite(prediction)))
+        print(f"[inference] WARNING: {n_bad} non-finite values detected in output batch")
+
+
+def _pad_to_multiple(x: torch.Tensor, multiple: int) -> torch.Tensor:
+    """Pad spatial dims (H, W) to the nearest multiple of ``multiple``."""
+    pad_h = (multiple - x.shape[-2] % multiple) % multiple
+    pad_w = (multiple - x.shape[-1] % multiple) % multiple
+    if pad_h == 0 and pad_w == 0:
+        return x
+    return torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+
+
+def _pad_multiple_from_config(config: Any) -> int:
+    mask_unit = getattr(config, "mask_unit_size", [16, 16])
+    patch_sz = getattr(getattr(config, "model", object()), "downscaling_patch_size", [2, 2])
+    mask_lat = mask_unit[0] if isinstance(mask_unit, list) else mask_unit
+    patch_lat = patch_sz[0] if isinstance(patch_sz, list) else patch_sz
+    return int(mask_lat) * int(patch_lat)
+
+
+def _tile_origins(total: int, tile: int, stride: int) -> List[int]:
+    """Return tile start indices covering [0, total) with the given stride.
+
+    The final tile is shifted so it ends exactly at ``total`` (no out-of-bounds,
+    full coverage of the domain edge).
+    """
+    if tile >= total:
+        return [0]
+    origins = list(range(0, total - tile + 1, stride))
+    if origins[-1] != total - tile:
+        origins.append(total - tile)
+    return origins
+
+
+def _hann_window_2d(h: int, w: int) -> np.ndarray:
+    """2-D separable Hann blend window with a small floor (avoids zero weight at
+    domain corners where only one tile contributes)."""
+    wy = np.hanning(h + 2)[1:-1] if h > 1 else np.ones(1)
+    wx = np.hanning(w + 2)[1:-1] if w > 1 else np.ones(1)
+    win = np.outer(wy, wx).astype(np.float32)
+    return np.maximum(win, 1e-3)
+
+
+class _ShapeOnlyTarget:
+    """Minimal target placeholder for models that only inspect batch["y"].shape."""
+
+    def __init__(self, batch_size: int, n_targets: int, target_shape: Tuple[int, int]) -> None:
+        self.shape = torch.Size((batch_size, n_targets, *target_shape))
+
+
+def _as_date_strings(batch_dates: Any) -> List[str]:
+    if isinstance(batch_dates, (list, tuple)):
+        return [str(d) for d in batch_dates]
+    if hasattr(batch_dates, "tolist"):
+        values = batch_dates.tolist()
+        if isinstance(values, list):
+            return [str(d) for d in values]
+    return [str(batch_dates)]
+
+
+def _date_strings_to_epoch_days(date_strings: Iterable[str]) -> np.ndarray:
+    dates = np.array([np.datetime64(str(d), "D") for d in date_strings])
+    epoch = np.datetime64("1970-01-01", "D")
+    return (dates - epoch).astype("timedelta64[D]").astype(np.int32)
+
+
+def _open_streaming_output(
+    out_path: Path,
+    target_variables: Sequence[str],
+    target_lat: np.ndarray,
+    target_lon: np.ndarray,
+    checkpoint_path: str,
+    inference_dates: Sequence[date],
+    case_name: str,
+) -> Any:
+    """Create a NetCDF3 file that can be filled along time without buffering."""
+    try:
+        from scipy.io import netcdf_file
+    except ImportError as exc:
+        raise ImportError("scipy is required for streaming inference output") from exc
+
+    if out_path.exists():
+        out_path.unlink()
+
+    nc = netcdf_file(str(out_path), "w", version=2)
+    nc.createDimension("time", None)
+    nc.createDimension("lat", len(target_lat))
+    nc.createDimension("lon", len(target_lon))
+
+    time_var = nc.createVariable("time", "i", ("time",))
+    time_var.units = "days since 1970-01-01"
+    time_var.calendar = "proleptic_gregorian"
+
+    lat_var = nc.createVariable("lat", "f", ("lat",))
+    lon_var = nc.createVariable("lon", "f", ("lon",))
+    lat_var[:] = target_lat.astype(np.float32)
+    lon_var[:] = target_lon.astype(np.float32)
+
+    for var in target_variables:
+        out_var = nc.createVariable(var, "f", ("time", "lat", "lon"))
+        out_var.long_name = var
+        # tmax/tmin are degC, ppt is mm/day; default to "" for unknown vars.
+        out_var.units = VAR_UNITS.get(var, "")
+
+    nc.description = "MERRA2-to-PRISM downscaling inference output"
+    nc.case_name = case_name
+    nc.checkpoint = checkpoint_path
+    nc.inference_start = str(inference_dates[0])
+    nc.inference_end = str(inference_dates[-1])
+    nc.flush()
+    return nc
+
+
 # ---------------------------------------------------------------------------
 # Main inference loop
 # ---------------------------------------------------------------------------
 
 def run_inference(
+    config_path: str,
     cfg: Dict[str, Any],
     config: Any,
     checkpoint_path: str,
@@ -164,144 +395,161 @@ def run_inference(
     device: torch.device,
     batch_size: int = 1,
 ) -> Path:
-    """Execute inference over the YAML-defined date range and write NetCDF output."""
+    """Execute inference over the YAML-defined date range and write daily NetCDF outputs.
+
+    The PRISM grid (~3105x7025) is far too large for a single forward pass, so
+    each day is predicted tile-by-tile and stitched with a Hann blend window.
+
+    Key correctness points (the previous version was broken on all three):
+      * Predictors are regridded onto each PRISM tile (co-registered with the
+        target) by the dataset's ``_load_predictor`` -- NOT fed as a raw,
+        whole-domain coarse array that the model would merely stretch.
+      * The dataset returns RAW physical inputs; the model normalizes them
+        internally. We must NOT normalize the input here.
+      * The model returns predictions in physical units (its ``_decode_outputs``
+        applies the output scalers). We must NOT denormalize the output here.
+    """
     if xr is None:
         raise ImportError("xarray is required for inference")
 
     data_cfg = cfg.get("data", {})
+    case_name = get_case_name(cfg)
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
 
     # Load model
     print(f"[inference] loading checkpoint: {checkpoint_path}")
     model = _load_model(config, checkpoint_path, device)
 
-    # Load scalars for denormalization
-    target_mean, target_std = _load_scalars(cfg)
+    # Co-registered, raw-physical dataset (same class used for training). It
+    # regrids MERRA2 onto the PRISM grid on the fly and exposes the fine grid.
+    dataset = MerraPrismDataset(config_path, mode="inference")
+    inference_dates = dataset.dates
+    target_lat = dataset.fine_lat
+    target_lon = dataset.fine_lon
+    fine_h, fine_w = dataset.fine_shape
+    n_vars = len(target_variables)
+    print(f"[inference] {len(inference_dates)} dates; PRISM grid {fine_h}x{fine_w}")
 
-    # Build inference dataset
-    dataset = MerraPrismDataset(
-        config_path=None,  # We'll override by passing cfg directly
-        mode="inference",
-    )
-    # Fallback: construct dataset from the config dict directly
-    # Re-initialize properly
-    from merra_prism_dataset import MerraPrismDataset as _DS
+    # Tile geometry (fine-grid pixels). Defaults mirror the training crop.
+    inf_cfg = cfg.get("inference", {})
+    tile_cfg = inf_cfg.get("inference_tile_size") or inf_cfg.get(
+        "boundary_mitigation", {}
+    ).get("tile_size") or [256, 256]
+    overlap_cfg = inf_cfg.get("inference_overlap") or inf_cfg.get(
+        "boundary_mitigation", {}
+    ).get("overlap") or [64, 64]
+    tile_h = min(int(tile_cfg[0]), fine_h)
+    tile_w = min(int(tile_cfg[1]), fine_w)
+    ov_h = int(overlap_cfg[0])
+    ov_w = int(overlap_cfg[1])
+    stride_h = max(1, tile_h - ov_h)
+    stride_w = max(1, tile_w - ov_w)
 
-    class _InferenceDS(_DS):
-        """Thin subclass that accepts a pre-loaded config dict."""
-        def __init__(self, cfg_dict, mode):
-            self.cfg = cfg_dict
-            import xarray  # ensure available
-            self.mode = mode
-            self.dtype = torch.float32
-            dc = cfg_dict.get("data", {})
-            self.predictor_dir = resolve_path(dc["predictor_dir"])
-            self.target_dir = resolve_path(dc["target_dir"])
-            self.predictor_vars = list(dc.get("predictor_variables", []))
-            self.target_vars = list(dc.get("target_variables", []))
-            from merra_prism_utils import (
-                align_dates, discover_all_prism_targets, discover_merra2_files,
-                parse_date_range_from_config, validate_dates_exist, validate_target_variables,
-            )
-            validate_target_variables(self.target_dir, self.target_vars)
-            self.start_date, self.end_date = parse_date_range_from_config(cfg_dict, mode)
-            merra_files = discover_merra2_files(self.predictor_dir, self.start_date, self.end_date)
-            prism_files = discover_all_prism_targets(
-                self.target_dir, self.target_vars, self.start_date, self.end_date
-            )
-            self._predictor_map = {d: p for d, p in merra_files}
-            self._target_maps = {}
-            for var, fl in prism_files.items():
-                self._target_maps[var] = {d: p for d, p in fl}
-            target_date_lists = {v: list(dm.keys()) for v, dm in self._target_maps.items()}
-            self._dates = align_dates(list(self._predictor_map.keys()), target_date_lists)
-            validate_dates_exist(self._dates, list(self._predictor_map.keys()), "predictor")
-            scalar_dir = dc.get("scalar_dir", "")
-            self._scalars = self._load_scalars(scalar_dir)
-
-    inf_dataset = _InferenceDS(cfg, "inference")
-    print(f"[inference] {len(inf_dataset)} dates in inference period")
-
-    loader = torch.utils.data.DataLoader(
-        inf_dataset, batch_size=batch_size, shuffle=False, num_workers=0,
+    pad_multiple = _pad_multiple_from_config(config)
+    lat_origins = _tile_origins(fine_h, tile_h, stride_h)
+    lon_origins = _tile_origins(fine_w, tile_w, stride_w)
+    n_tiles = len(lat_origins) * len(lon_origins)
+    print(
+        f"[inference] tiling: tile=({tile_h},{tile_w}) overlap=({ov_h},{ov_w}) "
+        f"-> {len(lat_origins)}x{len(lon_origins)} = {n_tiles} tiles/day"
     )
 
-    all_predictions: List[np.ndarray] = []
-    all_dates: List[date] = []
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    print(f"[inference] case_name={case_name}")
+    print(f"[inference] output_dir={output_path}")
 
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
-            x = batch["x"].to(device)
-            pred = model(x)
-            if isinstance(pred, dict):
-                pred = pred.get("y_hat", pred.get("output", next(iter(pred.values()))))
-            pred_np = pred.cpu().numpy()
-            all_predictions.append(pred_np)
-
-            # Collect dates
-            batch_dates = batch.get("date", [])
-            if isinstance(batch_dates, (list, tuple)):
-                all_dates.extend(batch_dates)
-            elif hasattr(batch_dates, "tolist"):
-                all_dates.extend(batch_dates.tolist())
-
-            if (batch_idx + 1) % 50 == 0:
-                print(f"[inference] processed batch {batch_idx + 1}")
-
-    predictions = np.concatenate(all_predictions, axis=0)  # (T, C, H, W)
-
-    # Denormalize
-    predictions = _denormalize(predictions, target_mean, target_std)
-
-    # Validate
-    inference_dates = inf_dataset.dates
-    # Get target grid from first PRISM file for metadata
-    first_var = target_variables[0]
-    first_date = inference_dates[0]
-    first_path = inf_dataset._target_maps[first_var][first_date]
-    with xr.open_dataset(str(first_path)) as ds_ref:
-        lat_candidates = ("lat", "latitude", "y")
-        lon_candidates = ("lon", "longitude", "x")
-        lat_name = next((n for n in lat_candidates if n in ds_ref.coords), None)
-        lon_name = next((n for n in lon_candidates if n in ds_ref.coords), None)
-        if lat_name is None or lon_name is None:
-            raise ValueError("Cannot find lat/lon in PRISM reference file")
-        target_lat = ds_ref[lat_name].values
-        target_lon = ds_ref[lon_name].values
-
-    _validate_output(predictions, target_lat, target_lon, target_variables, inference_dates)
-
-    # Write output NetCDF
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = Path(output_dir) / "merra_prism_inference.nc"
-
-    time_values = [np.datetime64(str(d)) for d in inference_dates]
-    data_vars = {}
-    for ch_idx, var in enumerate(target_variables):
-        data_vars[var] = (
-            ("time", "lat", "lon"),
-            predictions[:, ch_idx, :, :].astype(np.float32),
-            {"long_name": var, "units": ""},
+    date_iter = enumerate(inference_dates)
+    if tqdm is not None:
+        date_iter = tqdm(
+            list(enumerate(inference_dates)),
+            total=len(inference_dates),
+            desc="MERRA-PRISM inference (days)",
+            unit="day",
         )
 
-    out_ds = xr.Dataset(
-        data_vars,
-        coords={
-            "time": time_values,
-            "lat": target_lat,
-            "lon": target_lon,
-        },
-        attrs={
-            "description": "MERRA2-to-PRISM downscaling inference output",
-            "checkpoint": checkpoint_path,
-            "inference_start": str(inference_dates[0]),
-            "inference_end": str(inference_dates[-1]),
-        },
-    )
-    out_ds.to_netcdf(str(out_path))
-    print(f"[inference] output saved → {out_path}")
+    write_count = 0
+    with torch.inference_mode():
+        for _di, sample_date in date_iter:
+            date_string = str(sample_date)
 
-    return out_path
+            # Accumulators for the stitched full-grid prediction.
+            accum = np.zeros((n_vars, fine_h, fine_w), dtype=np.float32)
+            weight = np.zeros((fine_h, fine_w), dtype=np.float32)
+
+            for lat0 in lat_origins:
+                for lon0 in lon_origins:
+                    lat_slice = slice(lat0, lat0 + tile_h)
+                    lon_slice = slice(lon0, lon0 + tile_w)
+
+                    # Raw-physical, co-registered predictor tile (model
+                    # normalizes internally -> do NOT normalize here).
+                    x = dataset._load_predictor(sample_date, lat_slice, lon_slice)
+                    x = _pad_to_multiple(x.unsqueeze(0), pad_multiple).to(
+                        device, non_blocking=True
+                    )
+
+                    y_shape = _ShapeOnlyTarget(1, n_vars, x.shape[-2:])
+                    pred = model({"x": x, "y": y_shape})
+                    if isinstance(pred, dict):
+                        pred = pred.get(
+                            "y_hat", pred.get("output", next(iter(pred.values())))
+                        )
+                    # Crop away the reflect padding -> back to tile size.
+                    pred = pred[..., :tile_h, :tile_w]
+                    # Model output is already physical units -> write directly.
+                    pred_np = pred.detach().cpu().numpy().astype(np.float32)[0]
+
+                    win = _hann_window_2d(tile_h, tile_w)
+                    accum[:, lat_slice, lon_slice] += pred_np * win[np.newaxis]
+                    weight[lat_slice, lon_slice] += win
+
+                    del x, pred, pred_np
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+
+            # Blend: normalize by accumulated Hann weights -> (C, H, W).
+            prediction = accum / np.maximum(weight, 1e-6)[np.newaxis]
+            prediction = prediction[np.newaxis]  # (1, C, H, W) for the helpers
+
+            _validate_prediction_batch(prediction, target_lat, target_lon, target_variables)
+            _print_channel_stats(
+                prediction,
+                target_variables,
+                f"[inference] {date_string} stitched output statistics (physical units):",
+            )
+            # Physical-range guard (raises on impossible temperatures); reports
+            # tmax<tmin crossings without failing.
+            _sanity_check_outputs(prediction, target_variables, date_string)
+
+            date_token = np.datetime64(date_string, "D").astype(object).strftime("%Y%m%d")
+            out_path = output_path / f"{case_name}_inference_{date_token}.nc"
+            out_nc = _open_streaming_output(
+                out_path,
+                target_variables,
+                target_lat,
+                target_lon,
+                checkpoint_path,
+                [date_string],
+                case_name,
+            )
+            try:
+                out_nc.variables["time"][:] = _date_strings_to_epoch_days([date_string])
+                for ch_idx, var in enumerate(target_variables):
+                    out_nc.variables[var][0:1, :, :] = prediction[:, ch_idx, :, :]
+                out_nc.flush()
+            finally:
+                out_nc.close()
+            write_count += 1
+
+    if write_count != len(inference_dates):
+        raise RuntimeError(
+            f"Wrote {write_count} daily files, expected {len(inference_dates)}"
+        )
+
+    print(f"[inference] daily outputs saved -> {output_path}")
+
+    return output_path
 
 
 # ---------------------------------------------------------------------------
@@ -325,11 +573,13 @@ def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
     config = get_config(str(Path(args.config).resolve()))
+    case_name = get_case_name(cfg)
 
     checkpoint = _find_checkpoint(cfg, args.checkpoint)
-    output_dir = args.output_dir or str(
-        resolve_path(cfg.get("inference", {}).get("output_dir", "./examples/MERRA_PRISM/experiments/inference_output"))
+    output_root = args.output_dir or cfg.get("inference", {}).get(
+        "output_dir", "./examples/MERRA_PRISM/experiments/inference_output"
     )
+    output_dir = str(case_output_dir(output_root, case_name))
 
     device_str = args.device
     if device_str == "cuda" and not torch.cuda.is_available():
@@ -338,6 +588,7 @@ def main() -> None:
     device = torch.device(device_str)
 
     run_inference(
+        config_path=str(Path(args.config).resolve()),
         cfg=cfg,
         config=config,
         checkpoint_path=checkpoint,

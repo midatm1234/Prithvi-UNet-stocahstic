@@ -34,6 +34,7 @@ from merra_prism_utils import (
     align_dates,
     discover_all_prism_targets,
     discover_merra2_files,
+    expand_predictor_variables,
     load_elevation,
     load_yaml,
     parse_date_range_from_config,
@@ -47,11 +48,50 @@ LAT_CANDIDATES = ("lat", "latitude", "y")
 LON_CANDIDATES = ("lon", "longitude", "x")
 
 
+def _find_numeric_datavar(ds: Any, path: Any) -> str:
+    """Return the first data variable with a numeric dtype, skipping metadata vars like 'crs'."""
+    import numpy as np
+    for v in ds.data_vars:
+        if np.issubdtype(ds[v].dtype, np.number):
+            return v
+    raise ValueError(f"No numeric data variable found in {path}")
+
+
 def _infer_coord_name(ds: Any, candidates: Sequence[str]) -> str:
     for name in candidates:
         if name in ds.coords or name in ds.data_vars:
             return name
     raise ValueError(f"Cannot find coordinate among {candidates}")
+
+
+# Output NetCDF fill value for float fields. NaN is preserved on disk via this
+# _FillValue / missing_value so that below-surface (high-terrain) pressure-level
+# cells and ocean/outside-CONUS target cells remain MISSING rather than becoming
+# real zeros.
+FILL_VALUE = np.float32(np.nan)
+
+
+def _diagnose_field(name: str, level: Optional[float], arr: np.ndarray) -> int:
+    """Print NaN / zero / skipna-range diagnostics for one regridded field.
+
+    Returns the number of NaN cells so callers can sanity-check that masked
+    (below-surface) regions stayed NaN instead of collapsing to zeros.
+    """
+    total = arr.size
+    nan_mask = ~np.isfinite(arr)
+    n_nan = int(nan_mask.sum())
+    n_zero = int((arr == 0).sum())
+    finite = arr[~nan_mask]
+    if finite.size:
+        vmin, vmax, vmean = float(finite.min()), float(finite.max()), float(finite.mean())
+    else:
+        vmin = vmax = vmean = float("nan")
+    lvl = "" if level is None else f"@{int(level)}hPa"
+    print(
+        f"    [diag] {name}{lvl}: NaN={n_nan}/{total} ({100.0 * n_nan / total:.2f}%) "
+        f"zeros={n_zero} min={vmin:.3f} max={vmax:.3f} mean={vmean:.3f} (skipna)"
+    )
+    return n_nan
 
 
 def _build_grid(ds: Any, lat_name: str, lon_name: str) -> Any:
@@ -125,7 +165,7 @@ def preprocess(
     predictor_dir = resolve_path(data_cfg["predictor_dir"])
     target_dir = resolve_path(data_cfg["target_dir"])
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
-    predictor_variables: List[str] = list(data_cfg.get("predictor_variables", []))
+    predictor_variables = expand_predictor_variables(data_cfg.get("predictor_variables", {}))
     regrid_method: str = data_cfg.get("regrid_method", "bilinear")
 
     output_dir = resolve_path(data_cfg.get("preprocessed_dir", "./preprocessed"))
@@ -193,39 +233,74 @@ def preprocess(
         if out_file.exists() and not overwrite:
             continue
 
-        # Read MERRA2 predictors and regrid
+        # Read MERRA2 predictors and regrid. NaNs (e.g. pressure levels that lie
+        # BELOW the surface over high terrain — MERRA stores these as missing)
+        # are PRESERVED, not converted to zero. Bilinear interp/regrid propagates
+        # NaN, which conservatively grows the below-surface mask by one stencil.
         merra_path = pred_map[sample_date]
         pred_arrays: Dict[str, np.ndarray] = {}
+        pred_levels: Dict[str, Optional[float]] = {}
         with xr.open_dataset(str(merra_path)) as ds_pred:
-            for var in predictor_variables:
+            for var, level in predictor_variables:
+                channel_name = f"{var}_{int(level)}"
+                pred_levels[channel_name] = level
                 if var not in ds_pred.data_vars:
-                    print(f"[preproc] WARN: variable '{var}' missing in {merra_path}, filling with zeros")
-                    pred_arrays[var] = np.zeros((len(target_lat), len(target_lon)), dtype=np.float32)
+                    # Entire variable missing: write NaN (missing), NOT zeros, so
+                    # downstream masking treats it as invalid rather than real 0.
+                    print(f"[preproc] WARN: variable '{var}' missing in {merra_path}, filling with NaN")
+                    pred_arrays[channel_name] = np.full(
+                        (len(target_lat), len(target_lon)), np.nan, dtype=np.float32
+                    )
                     continue
                 da = ds_pred[var]
                 if "time" in da.dims:
                     da = da.isel(time=0, drop=True)
+                if "lev" in da.dims:
+                    da = da.sel(lev=level, drop=True)
                 da = _rename_lat_lon(da, pred_lat_name, pred_lon_name)
                 if regridder is not None:
                     regridded = regridder(da)
                     arr = regridded.values.astype(np.float32)
                 else:
                     arr = da.interp(lat=target_lat, lon=target_lon, method="linear").values.astype(np.float32)
-                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-                pred_arrays[var] = arr
+                # Keep +/-inf out (shouldn't occur) but DO NOT touch NaN.
+                arr[np.isinf(arr)] = np.nan
+                pred_arrays[channel_name] = arr
 
-        # Read PRISM targets
+        # Read PRISM targets. PRISM is NaN over ocean / outside CONUS (~44%);
+        # preserve that so the loss can ignore those pixels. ppt keeps its real
+        # zeros (dry) which are distinct from NaN (missing).
         tgt_arrays: Dict[str, np.ndarray] = {}
         for var in target_variables:
             tgt_path = target_maps[var][sample_date]
             with xr.open_dataset(str(tgt_path)) as ds_tgt:
-                dvar = list(ds_tgt.data_vars)[0]
+                dvar = _find_numeric_datavar(ds_tgt, tgt_path)
                 da = ds_tgt[dvar]
                 if "time" in da.dims:
                     da = da.isel(time=0, drop=True)
                 arr = da.values.astype(np.float32)
-                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                arr[np.isinf(arr)] = np.nan
                 tgt_arrays[var] = arr
+
+        # Diagnostics: confirm below-surface predictor cells stayed NaN and warn
+        # if a pressure-level field collapsed to suspiciously many zeros (a sign
+        # NaNs were silently converted to 0 somewhere upstream).
+        if (i + 1) % 100 == 0 or i == 0:
+            print(f"[preproc] {sample_date:%Y-%m-%d} field diagnostics:")
+            for channel_name, arr in pred_arrays.items():
+                n_nan = _diagnose_field(channel_name, pred_levels.get(channel_name), arr)
+                lvl = pred_levels.get(channel_name)
+                # Upper-air 700/850 hPa fields are expected to be NaN over high
+                # terrain; a near-total absence of NaN combined with many exact
+                # zeros usually means the missing-data mask was lost.
+                n_zero = int((arr == 0).sum())
+                if lvl is not None and lvl >= 700 and n_nan == 0 and n_zero > 0:
+                    print(
+                        f"    [preproc] WARNING: {channel_name} has 0 NaN but {n_zero} "
+                        f"exact zeros — below-surface cells may have been zero-filled."
+                    )
+            for var, arr in tgt_arrays.items():
+                _diagnose_field(f"target_{var}", None, arr)
 
         # Build output dataset
         out_ds_vars: Dict[str, Any] = {}
@@ -245,9 +320,20 @@ def preprocess(
                 "source_merra2": str(merra_path),
                 "has_elevation": str(elevation_arr is not None),
                 "mode": mode,
+                "missing_value_note": (
+                    "NaN marks missing data: pressure-level predictors below the "
+                    "surface over high terrain, and PRISM targets over ocean / "
+                    "outside CONUS. These are NOT physical zeros."
+                ),
             },
         )
-        out_ds.to_netcdf(str(out_file))
+        # Preserve NaN explicitly via _FillValue / missing_value on every float
+        # field so the missing-data mask survives a NetCDF round-trip.
+        encoding = {
+            name: {"_FillValue": FILL_VALUE, "dtype": "float32"}
+            for name in out_ds_vars
+        }
+        out_ds.to_netcdf(str(out_file), encoding=encoding)
 
         if (i + 1) % 100 == 0 or i == 0:
             print(f"[preproc] processed {i + 1}/{len(aligned_dates)} dates")

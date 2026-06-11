@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+blocked_ext_re='[.](nc|nc4|cdf|h5|hdf5|ckpt|pt|pth|onnx|npy|npz|pkl|pickle|parquet|arrow|bin)$'
+
+mapfile -t staged_paths < <(
+  git diff --cached --name-only --diff-filter=ACMR -z | xargs -0 -r -n1 printf '%s\n'
+)
+
+blocked=()
+for path in "${staged_paths[@]}"; do
+  lower_path=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
+  if [[ "$lower_path" =~ $blocked_ext_re ]]; then
+    blocked+=("$path")
+  fi
+done
+
+while IFS=$'\t' read -r added deleted path; do
+  if [[ "$added" == "-" && "$deleted" == "-" ]]; then
+    blocked+=("$path")
+  fi
+done < <(git diff --cached --numstat --diff-filter=ACMR)
+
+if ((${#blocked[@]})); then
+  printf '%s\n' "ERROR: refusing to commit binary/data/model artifacts:" >&2
+  printf '  %s\n' "${blocked[@]}" | sort -u >&2
+  printf '%s\n' "Move these files outside Git or keep them ignored." >&2
+  exit 1
+fi

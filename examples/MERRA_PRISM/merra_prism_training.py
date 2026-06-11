@@ -48,6 +48,7 @@ from granitewxc.utils.config import ExperimentConfig, get_config
 from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.distributed import init_ddp
 from granitewxc.utils.trainer import train_model
+from merra_prism_utils import case_output_dir, get_case_name
 
 try:
     from torch.distributed.fsdp import (
@@ -138,17 +139,62 @@ def _wrap_fsdp(model: torch.nn.Module, local_rank: int, config: ExperimentConfig
 # ---------------------------------------------------------------------------
 
 class _WrappedDataset(torch.utils.data.Dataset):
-    """Adapt MerraPrismDataset output dict to the model's expected format."""
+    """Adapt MerraPrismDataset output dict to the model's expected format.
 
-    def __init__(self, base: MerraPrismDataset) -> None:
+    Pads the input ``x`` spatial dimensions to the nearest multiple of
+    ``mask_unit_size × patch_size`` (default 32) so the Prithvi backbone
+    assertion ``n_lats % mask_unit_size_px == 0`` is satisfied.
+    The model auto-interpolates its output to ``batch['y'].shape[-2:]``,
+    so no padding is needed on ``y``.
+
+    If the base dataset has a static elevation channel appended to ``x``,
+    this wrapper can split it out into ``static_x`` / ``static_y`` when
+    ``num_static_channels > 0``.
+    """
+
+    def __init__(
+        self,
+        base: MerraPrismDataset,
+        num_static_channels: int = 0,
+        pad_multiple: int = 32,
+    ) -> None:
         self.base = base
+        self.num_static_channels = num_static_channels
+        self.pad_multiple = pad_multiple
+        self._static_y: Optional[torch.Tensor] = None
+        if num_static_channels > 0 and base._elevation is not None:
+            elev = torch.from_numpy(base._elevation.astype("float32"))
+            self._static_y = elev.unsqueeze(0)  # (1, H_target, W_target)
 
     def __len__(self) -> int:
         return len(self.base)
 
+    def _pad_to_multiple(self, x: torch.Tensor) -> torch.Tensor:
+        """Pad spatial dims (H, W) to the nearest multiple of pad_multiple."""
+        m = self.pad_multiple
+        _, H, W = x.shape[-3], x.shape[-2], x.shape[-1]
+        pad_h = (m - H % m) % m
+        pad_w = (m - W % m) % m
+        if pad_h == 0 and pad_w == 0:
+            return x
+        # F.pad pads from last dim inward: (left, right, top, bottom)
+        return torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.base[idx]
-        return {"x": sample["x"], "y": sample["y"]}
+        x_full = sample["x"]  # (C_dyn [+ num_static], H_in, W_in)
+
+        if self.num_static_channels > 0 and self._static_y is not None:
+            x_dyn = x_full[: -self.num_static_channels]
+            static_x = x_full[-self.num_static_channels:]
+            return {
+                "x": self._pad_to_multiple(x_dyn),
+                "y": sample["y"],
+                "static_x": self._pad_to_multiple(static_x),
+                "static_y": self._static_y,
+            }
+
+        return {"x": self._pad_to_multiple(x_full), "y": sample["y"]}
 
 
 def _build_dataloader(
@@ -162,7 +208,14 @@ def _build_dataloader(
     world_size: int,
 ) -> DataLoader:
     base = MerraPrismDataset(config_path, mode=mode)
-    dataset = _WrappedDataset(base)
+    num_static = int(getattr(getattr(config, "model", object()), "num_static_channels", 0))
+    # Compute required padding multiple: mask_unit_size × patch_size
+    mask_unit = getattr(config, "mask_unit_size", [16, 16])
+    patch_sz = getattr(getattr(config, "model", object()), "downscaling_patch_size", [2, 2])
+    pad_multiple = (mask_unit[0] if isinstance(mask_unit, list) else mask_unit) * (
+        patch_sz[0] if isinstance(patch_sz, list) else patch_sz
+    )
+    dataset = _WrappedDataset(base, num_static_channels=num_static, pad_multiple=pad_multiple)
 
     sampler = None
     if distributed:
@@ -232,11 +285,36 @@ def load_pretrained_weights(model: torch.nn.Module, weights_path: str) -> Tuple[
 
 
 def create_finetune_model(config: ExperimentConfig, verbose: bool = True) -> torch.nn.Module:
-    if not hasattr(config.data, "input_static_surface_vars"):
-        config.data.input_static_surface_vars = []
-    output_vars = list(getattr(config.data, "output_vars", getattr(config.data, "target_variables", [])))
+    # Safety guards for fields that must exist before calling get_finetune_model_UNET.
+    # These are normally provided by MERRA_PRISM.yaml but we guard here for robustness.
+    for attr in ("input_static_surface_vars", "input_surface_vars", "other",
+                 "vertical_level1_vars", "input_level1",
+                 "vertical_level2_vars", "input_level2"):
+        if not hasattr(config.data, attr):
+            setattr(config.data, attr, [])
+
+    output_vars = list(getattr(config.data, "output_vars",
+                               getattr(config.data, "target_variables", [])))
     if not output_vars:
         output_vars = list(getattr(config.data, "target_variables", []))
+    if not hasattr(config.data, "output_vars") or not config.data.output_vars:
+        config.data.output_vars = output_vars
+
+    if not hasattr(config.data, "input_vars") or not config.data.input_vars:
+        pred_vars = getattr(config.data, "predictor_variables", {})
+        config.data.input_vars = list(pred_vars.keys()) if isinstance(pred_vars, dict) else []
+    if not hasattr(config.data, "input_levels") or not config.data.input_levels:
+        pred_vars = getattr(config.data, "predictor_variables", {})
+        all_levels: set = set()
+        if isinstance(pred_vars, dict):
+            for levels in pred_vars.values():
+                if isinstance(levels, list):
+                    all_levels.update(levels)
+        config.data.input_levels = sorted(all_levels) if all_levels else [0]
+    if not hasattr(config.data, "vertical_pres_vars") or not config.data.vertical_pres_vars:
+        config.data.vertical_pres_vars = list(config.data.input_vars)
+    if not hasattr(config.data, "input_level_pres") or not config.data.input_level_pres:
+        config.data.input_level_pres = list(config.data.input_levels)
     predictand_specs = build_predictand_specs(config, output_vars=output_vars)
     if verbose:
         print("[model] predictand configuration:")
@@ -357,6 +435,15 @@ def run_training(
     save_every: int = 5,
 ) -> Tuple[Optional[List[float]], Optional[List[float]]]:
     """Launch training (single- or multi-GPU) and return (train_losses, val_losses)."""
+    case_name = get_case_name(config)
+    checkpoint_root = getattr(config, "checkpoint_dir", None)
+    if checkpoint_root:
+        config.checkpoint_dir = str(case_output_dir(checkpoint_root, case_name))
+    elif getattr(config, "path_experiment", None):
+        config.checkpoint_dir = str(case_output_dir(Path(config.path_experiment) / "weights", case_name))
+    print(f"[training] case_name={case_name}")
+    print(f"[training] checkpoint_dir={config.checkpoint_dir}")
+
     use_gpu = _should_use_gpu(config)
 
     if not use_gpu:

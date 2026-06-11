@@ -163,3 +163,28 @@ cython_debug/
 
 # VS Code
 .vscode/
+
+# MERRA_PRISM generated data and model artifacts
+examples/MERRA_PRISM/preprocessed/
+examples/MERRA_PRISM/experiments/inference_output/
+examples/MERRA_PRISM/experiments/checkpoints/
+examples/MERRA_PRISM/scalars/
+
+# Binary data/model artifacts must stay out of Git
+*.nc
+*.nc4
+*.cdf
+*.h5
+*.hdf5
+*.zarr/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.parquet
+*.arrow
+*.bin
