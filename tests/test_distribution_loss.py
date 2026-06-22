@@ -47,3 +47,25 @@ def test_composite_moment_loss_adds_terms():
     assert "base.rmse" in terms
     assert "tasmax.distribution.moment" in terms
     assert "tasmax.distribution.moment.weighted" in terms
+
+
+def test_nan_only_targets_have_zero_finite_gradients():
+    pred = torch.randn((1, 2, 4, 4), dtype=torch.float32, requires_grad=True)
+    target = torch.full_like(pred, float("nan"))
+
+    loss = rmse_loss(pred, _batch(pred, target))
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()
+    assert torch.count_nonzero(pred.grad) == 0
+
+    pred = torch.randn((1, 2, 4, 4), dtype=torch.float32, requires_grad=True)
+    config = SimpleNamespace(loss={"base": "rmse"})
+    loss_fn = build_loss_fn(config, output_vars=["pr", "tasmax"])
+    loss = loss_fn(pred, _batch(pred, target))
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert pred.grad is not None
+    assert torch.isfinite(pred.grad).all()
+    assert torch.count_nonzero(pred.grad) == 0

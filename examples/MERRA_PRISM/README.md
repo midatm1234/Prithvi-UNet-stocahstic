@@ -57,6 +57,7 @@ hyper-parameters are controlled by a single YAML file.
 | `data.scalers.*` | Paths to the four `.npy` scalar files |
 | `dates.training.start / end` | Training date range |
 | `dates.inference.start / end` | Inference date range |
+| `case_name` | Required run/case name used as an output subfolder |
 | `predictands.*` | Per-variable normalization & loss options |
 | `model.*` | Architecture hyper-parameters |
 | `training.*` | Distributed / batch / accumulation settings |
@@ -104,8 +105,9 @@ python preproc_merra_prism.py \
 
 `--mode` accepts `training`, `inference`, or `both` (default).
 
-**Outputs:** One NetCDF per aligned date in `<preprocessed_dir>/training/`
-and `<preprocessed_dir>/inference/`.
+**Outputs:** One NetCDF per aligned date in
+`<preprocessed_dir>/training/<case_name>/` and
+`<preprocessed_dir>/inference/<case_name>/`.
 
 ---
 
@@ -122,7 +124,7 @@ python merra_prism_finetune.py \
 
 - The script loads all settings from the YAML file.
 - Supports single-GPU and multi-GPU (DDP / FSDP) training.
-- Checkpoints and logs are saved under `path_experiment`.
+- Checkpoints are saved under `checkpoint_dir/<case_name>/`.
 
 ---
 
@@ -143,8 +145,8 @@ Optional flags:
 - `--batch-size` — inference batch size (default 1).
 - `--device cpu` — force CPU inference.
 
-**Outputs:** A single NetCDF file
-`<inference.output_dir>/merra_prism_inference.nc` containing:
+**Outputs:** Daily NetCDF files under
+`<inference.output_dir>/<case_name>/` containing:
 
 | Dimension | Description |
 |-----------|-------------|
@@ -160,9 +162,9 @@ Optional flags:
 | Step | Output location |
 |------|-----------------|
 | Scalars | `data.scalar_dir` (`.npy` + `metadata.json`) |
-| Preprocessing | `data.preprocessed_dir/{training,inference}/` |
-| Training | `path_experiment/checkpoints/` |
-| Inference | `inference.output_dir/merra_prism_inference.nc` |
+| Preprocessing | `data.preprocessed_dir/{training,inference}/<case_name>/` |
+| Training | `checkpoint_dir/<case_name>/` |
+| Inference | `inference.output_dir/<case_name>/` |
 
 ---
 

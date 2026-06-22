@@ -5,6 +5,7 @@ import os
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.nn.utils import clip_grad_norm_
 from torch import autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -135,6 +136,21 @@ def _checkpoint_requires_all_ranks(model: torch.nn.Module) -> bool:
     if not (dist.is_available() and dist.is_initialized()):
         return False
     return _is_fsdp_wrapped_model(model)
+
+
+def _assert_finite_scalar(value: torch.Tensor, name: str, local_rank: int) -> None:
+    """Raise on every distributed rank if any rank sees a non-finite scalar."""
+    is_bad = torch.zeros(1, device=value.device, dtype=torch.int32)
+    if not torch.isfinite(value.detach()).all():
+        is_bad.fill_(1)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(is_bad, op=dist.ReduceOp.SUM)
+    if int(is_bad.item()) > 0:
+        local_value = _to_scalar(value)
+        raise FloatingPointError(
+            f"Non-finite {name} detected on rank {local_rank}: {local_value}. "
+            "Stopping before optimizer/checkpoint state is corrupted."
+        )
 
 
 def _collect_checkpoint_states(
@@ -377,6 +393,7 @@ def train_one_epoch(
 
     benchmark_batch_mean = np.zeros(2)
     accumulation_steps = max(1, int(kwargs.get("gradient_accumulation_steps", 1)))
+    max_grad_norm = float(kwargs.get("max_grad_norm", 0.0) or 0.0)
     optimizer_steps = 0
     max_steps = min(limit_steps, len(train_loader)) if 0 < limit_steps else len(train_loader)
     optimizer.zero_grad(set_to_none=True)
@@ -396,6 +413,7 @@ def train_one_epoch(
         loss = batch_step(
             batch, model, loss_func, gpu, local_rank
         )
+        _assert_finite_scalar(loss, "training loss", local_rank)
         
         benchmark_forward[0] += time() - benchmark_timer
         benchmark_forward[1] += 1
@@ -417,14 +435,24 @@ def train_one_epoch(
 
         should_step = ((i + 1) % accumulation_steps == 0) or ((i + 1) >= max_steps)
         if should_step:
+            grad_norm = None
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+            if max_grad_norm > 0.0:
+                grad_norm = clip_grad_norm_(model.parameters(), max_grad_norm)
+                _assert_finite_scalar(grad_norm, "gradient norm", local_rank)
             if scaler is None:
                 optimizer.step()
+                did_step = True
             else:
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                did_step = scaler.get_scale() >= scale_before
             optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-            optimizer_steps += 1
+            if did_step:
+                scheduler.step()
+                optimizer_steps += 1
 
         benchmark_optimizer[0] += time() - benchmark_timer
         benchmark_optimizer[1] += 1
@@ -467,6 +495,7 @@ def train_one_epoch(
         'train.num_gpus': node_count,
         'train.benchmark.data.batch_mean': benchmark_batch_mean[0] / benchmark_batch_mean[1],
         'train.gradient_accumulation_steps': accumulation_steps,
+        'train.max_grad_norm': max_grad_norm,
         'train.optimizer_steps': optimizer_steps,
     }
 
@@ -746,6 +775,7 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
                 limit_steps=config.limit_steps_train,
                 num_epochs=config.num_epochs,
                 gradient_accumulation_steps=int(getattr(config, "gradient_accumulation_steps", 1)),
+                max_grad_norm=float(getattr(config, "max_grad_norm", 0.0) or 0.0),
             )
 
             # Free cached training allocations before validation to reduce fragmentation/OOM risk.
@@ -769,17 +799,22 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
         except Exception as exc:
             write_checkpoint = (not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0)
             must_participate = write_checkpoint or _checkpoint_requires_all_ranks(model)
-            if must_participate:
-                fallback_train = (
-                    float(curr_train_loss_scalar)
-                    if curr_train_loss_scalar is not None
-                    else (float(train_loss[-1]) if train_loss else float("inf"))
-                )
-                fallback_val = (
-                    float(curr_val_loss_scalar)
-                    if curr_val_loss_scalar is not None
-                    else (float(val_loss[-1]) if val_loss else float("inf"))
-                )
+            fallback_train = (
+                float(curr_train_loss_scalar)
+                if curr_train_loss_scalar is not None
+                else (float(train_loss[-1]) if train_loss else float("inf"))
+            )
+            fallback_val = (
+                float(curr_val_loss_scalar)
+                if curr_val_loss_scalar is not None
+                else (float(val_loss[-1]) if val_loss else float("inf"))
+            )
+            finite_failure = (
+                not isinstance(exc, FloatingPointError)
+                and np.isfinite(fallback_train)
+                and np.isfinite(fallback_val)
+            )
+            if must_participate and finite_failure:
                 try:
                     save_checkpoint(
                         config=config,
@@ -807,6 +842,11 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
                 except Exception as save_exc:
                     if write_checkpoint:
                         print(f"[checkpoint] failed to write emergency checkpoint: {save_exc}")
+            elif write_checkpoint:
+                print(
+                    "[checkpoint] skipped emergency last.ckpt because the failure "
+                    f"may involve non-finite state: {exc}"
+                )
             raise
 
         train_loss.append(curr_train_loss_scalar)

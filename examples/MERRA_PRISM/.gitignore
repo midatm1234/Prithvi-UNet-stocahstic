@@ -1,0 +1,9 @@
+experiments/
+logs/
+scalars_with_H/
+notebooks/*_executed.ipynb
+*.nc
+*.npy
+*.npz
+*.png
+*.gif

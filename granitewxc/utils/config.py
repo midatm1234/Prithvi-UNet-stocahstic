@@ -209,4 +209,8 @@ class ExperimentConfig:
 
 def get_config(config_path: str) -> ExperimentConfig:
     cfg = yaml.safe_load(open(config_path, 'r'))
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Expected a mapping at the top level of {config_path}")
+    if not cfg.get("case_name"):
+        raise ValueError(f"case_name must be set in the YAML config: {config_path}")
     return ExperimentConfig.from_dict(cfg)

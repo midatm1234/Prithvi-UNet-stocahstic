@@ -27,6 +27,7 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
         data = yaml.safe_load(fh)
     if not isinstance(data, dict):
         raise ValueError(f"Expected a mapping at the top level of {path}")
+    get_case_name(data)
     return data
 
 
@@ -50,7 +51,7 @@ def get_case_name(cfg: Any) -> str:
 
 
 def case_output_dir(base_dir: str | Path, case_name: str) -> Path:
-    """Resolve an archive root and append case_name unless it is already present."""
+    """Resolve an output root and append case_name unless it is already present."""
     path = resolve_path(base_dir)
     if path.name == case_name:
         return path

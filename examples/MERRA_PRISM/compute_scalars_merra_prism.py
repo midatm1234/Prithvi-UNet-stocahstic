@@ -13,7 +13,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -112,10 +112,72 @@ def _find_numeric_datavar(ds: Any, path: Any) -> str:
     raise ValueError(f"No numeric data variable found in {path}")
 
 
+def _coord_subset_slice(
+    coords: np.ndarray,
+    lower: Optional[float],
+    upper: Optional[float],
+    axis_name: str,
+) -> slice:
+    """Return a contiguous index slice for inclusive coordinate bounds."""
+    if lower is None and upper is None:
+        return slice(None)
+
+    lo = float(np.nanmin(coords) if lower is None else lower)
+    hi = float(np.nanmax(coords) if upper is None else upper)
+    if hi < lo:
+        lo, hi = hi, lo
+
+    coord_min = float(np.nanmin(coords))
+    coord_max = float(np.nanmax(coords))
+    if hi < coord_min or lo > coord_max:
+        raise ValueError(
+            f"spatial_subset {axis_name} bounds [{lo}, {hi}] do not overlap "
+            f"grid range [{coord_min}, {coord_max}]"
+        )
+
+    diffs = np.diff(np.asarray(coords, dtype=np.float64))
+    finite_diffs = np.abs(diffs[np.isfinite(diffs) & (diffs != 0)])
+    tol = 0.0 if finite_diffs.size == 0 else float(np.nanmedian(finite_diffs)) * 0.51
+
+    mask = (coords >= lo - tol) & (coords <= hi + tol)
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        raise ValueError(
+            f"spatial_subset {axis_name} bounds [{lo}, {hi}] selected no grid cells"
+        )
+    return slice(int(idx[0]), int(idx[-1]) + 1)
+
+
+def _spatial_subset_slices(
+    lat_vals: np.ndarray,
+    lon_vals: np.ndarray,
+    data_cfg: Dict[str, Any],
+) -> Tuple[slice, slice]:
+    spatial_subset = data_cfg.get("spatial_subset", {}) or {}
+    if not bool(spatial_subset.get("enabled", False)):
+        return slice(None), slice(None)
+
+    lat_slice = _coord_subset_slice(
+        lat_vals,
+        spatial_subset.get("lat_min"),
+        spatial_subset.get("lat_max"),
+        "latitude",
+    )
+    lon_slice = _coord_subset_slice(
+        lon_vals,
+        spatial_subset.get("lon_min"),
+        spatial_subset.get("lon_max"),
+        "longitude",
+    )
+    return lat_slice, lon_slice
+
+
 def _load_target_arrays(
     target_maps: Dict[str, Dict[Any, Path]],
     target_variables: Sequence[str],
     sample_date: Any,
+    lat_slice: slice = slice(None),
+    lon_slice: slice = slice(None),
 ) -> np.ndarray:
     """Load all PRISM target variables for a single date → (C, H, W)."""
     arrays: List[np.ndarray] = []
@@ -127,7 +189,11 @@ def _load_target_arrays(
             if "time" in da.dims:
                 da = da.isel(time=0, drop=True)
             arr = da.values.astype(np.float32)
-            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            if arr.ndim >= 2:
+                arr = arr[lat_slice, lon_slice]
+            # Preserve PRISM missing cells as NaN so ocean/outside-CONUS pixels
+            # do not bias target mean/std toward zero. Only scrub +/-inf.
+            arr[np.isinf(arr)] = np.nan
             if arr.ndim == 1:
                 arr = arr[np.newaxis, :]
             arrays.append(arr)
@@ -185,6 +251,9 @@ def compute_scalars(
         _lonn = next((n for n in ("lon", "longitude", "x") if n in _tds.coords), "lon")
         fine_lat = _tds[_latn].values.astype(np.float64)
         fine_lon = _tds[_lonn].values.astype(np.float64)
+    lat_slice, lon_slice = _spatial_subset_slices(fine_lat, fine_lon, data_cfg)
+    fine_lat = fine_lat[lat_slice]
+    fine_lon = fine_lon[lon_slice]
     sub_lat = fine_lat[::stride]
     sub_lon = fine_lon[::stride]
     print(f"[scalars] estimating on strided PRISM grid {sub_lat.size}x{sub_lon.size} (stride={stride})")
@@ -220,7 +289,7 @@ def compute_scalars(
     # Per-gridpoint accumulators for targets (allocated lazily)
     y_grid_sum: Optional[np.ndarray] = None
     y_grid_sumsq: Optional[np.ndarray] = None
-    y_grid_count = 0
+    y_grid_count: Optional[np.ndarray] = None
 
     for idx, sample_date in enumerate(aligned_dates):
         # Predictors regridded onto the strided PRISM grid (co-registered).
@@ -240,7 +309,13 @@ def compute_scalars(
         x_count += x_valid.sum(axis=1)
 
         # Targets subsampled on the same strided grid (PRISM is NaN over ocean).
-        y = _load_target_arrays(target_maps, target_variables, sample_date)
+        y = _load_target_arrays(
+            target_maps,
+            target_variables,
+            sample_date,
+            lat_slice=lat_slice,
+            lon_slice=lon_slice,
+        )
         y = y[:, ::stride, ::stride]
         y_flat = y.reshape(n_tgt, -1).astype(np.float64)
         y_valid = np.isfinite(y_flat)
@@ -249,13 +324,15 @@ def compute_scalars(
         y_count += y_valid.sum(axis=1)
 
         # Gridpoint accumulators (only used if a predictand requests gridpoint).
-        y0 = np.nan_to_num(y.astype(np.float64), nan=0.0)
+        y0 = np.where(np.isfinite(y), y.astype(np.float64), 0.0)
+        y_valid_grid = np.isfinite(y)
         if y_grid_sum is None:
             y_grid_sum = np.zeros_like(y0, dtype=np.float64)
             y_grid_sumsq = np.zeros_like(y0, dtype=np.float64)
+            y_grid_count = np.zeros_like(y0, dtype=np.float64)
         y_grid_sum += y0
         y_grid_sumsq += y0 ** 2
-        y_grid_count += 1
+        y_grid_count += y_valid_grid.astype(np.float64)
 
         if progress_interval > 0 and (idx + 1) % progress_interval == 0:
             print(f"[scalars] processed {idx + 1}/{len(aligned_dates)} dates")
@@ -280,11 +357,23 @@ def compute_scalars(
     targets_std = np.sqrt(y_var).astype(np.float32)
 
     # Gridpoint scalars
-    targets_grid_mean = (y_grid_sum / y_grid_count).astype(np.float32)
+    assert y_grid_sum is not None
+    assert y_grid_sumsq is not None
+    assert y_grid_count is not None
+    if np.any(y_grid_count == 0):
+        print(
+            "[scalars] WARN: some target grid cells have no finite PRISM values; "
+            "their gridpoint scalers will be set to neutral values."
+        )
+    safe_grid_count = np.maximum(y_grid_count, 1.0)
+    targets_grid_mean = (y_grid_sum / safe_grid_count).astype(np.float32)
     targets_grid_var = np.maximum(
-        y_grid_sumsq / y_grid_count - (y_grid_sum / y_grid_count) ** 2, 0.0
+        y_grid_sumsq / safe_grid_count - (y_grid_sum / safe_grid_count) ** 2, 0.0
     )
     targets_grid_std = np.sqrt(targets_grid_var).astype(np.float32)
+    missing_grid = y_grid_count == 0
+    targets_grid_mean[missing_grid] = 0.0
+    targets_grid_std[missing_grid] = 1.0
 
     # Apply predictand-aware target scaling. This MUST run regardless of whether
     # any variable uses gridpoint normalization: e.g. ppt uses divide_only/global
@@ -370,7 +459,7 @@ def compute_scalars(
         "targets_grid_std": targets_grid_std,
         "input_pixel_count": x_count.tolist(),
         "target_pixel_count": y_count.tolist(),
-        "target_grid_sample_count": y_grid_count,
+        "target_grid_sample_count": len(aligned_dates),
     }
 
 
@@ -405,7 +494,7 @@ def main() -> None:
 
     # Save metadata
     metadata = {
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "config": args.config,
         "num_aligned_dates": stats["target_grid_sample_count"],
         "input_channels": int(stats["inputs_mean"].shape[0]),

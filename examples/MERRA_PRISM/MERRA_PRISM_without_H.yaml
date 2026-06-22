@@ -95,12 +95,12 @@ data:
   - tmin
   use_static: false
   preprocessed_dir: ./examples/MERRA_PRISM/preprocessed
-  scalar_dir: ./examples/MERRA_PRISM/scalars_smoke
+  scalar_dir: ./examples/MERRA_PRISM/scalars
   scalers:
-    inputs_mean: ./examples/MERRA_PRISM/scalars_smoke/inputs_mean.npy
-    inputs_std: ./examples/MERRA_PRISM/scalars_smoke/inputs_std.npy
-    targets_mean: ./examples/MERRA_PRISM/scalars_smoke/targets_mean.npy
-    targets_std: ./examples/MERRA_PRISM/scalars_smoke/targets_std.npy
+    inputs_mean: ./examples/MERRA_PRISM/scalars/inputs_mean.npy
+    inputs_std: ./examples/MERRA_PRISM/scalars/inputs_std.npy
+    targets_mean: ./examples/MERRA_PRISM/scalars/targets_mean.npy
+    targets_std: ./examples/MERRA_PRISM/scalars/targets_std.npy
   input_size_lat: 32
   input_size_lon: 32
   target_size_lat: 256
@@ -113,7 +113,6 @@ data:
   downsample_factor: 8
   n_input_timestamps: 1
   regrid_method: bilinear
-  scalar_stride: 16
   spatial_subset:
     enabled: false
     lat_min: null
@@ -122,11 +121,11 @@ data:
     lon_max: null
 dates:
   training:
-    start: '2015-01-01'
-    end: '2015-01-15'
+    start: '1996-01-01'
+    end: '2015-12-31'
   inference:
-    start: '2016-01-03'
-    end: '2016-01-03'
+    start: '2016-01-01'
+    end: '2025-12-31'
 normalization:
   predictor_method: standardize
   target_method: per_variable
@@ -175,10 +174,10 @@ predictands:
       mode: global
       eps_std: 1.0e-06
 model:
-  input_mu: ./examples/MERRA_PRISM/scalars_smoke/inputs_mean.npy
-  input_sigma: ./examples/MERRA_PRISM/scalars_smoke/inputs_std.npy
-  target_mu: ./examples/MERRA_PRISM/scalars_smoke/targets_mean.npy
-  target_sigma: ./examples/MERRA_PRISM/scalars_smoke/targets_std.npy
+  input_mu: ./examples/MERRA_PRISM/scalars/inputs_mean.npy
+  input_sigma: ./examples/MERRA_PRISM/scalars/inputs_std.npy
+  target_mu: ./examples/MERRA_PRISM/scalars/targets_mean.npy
+  target_sigma: ./examples/MERRA_PRISM/scalars/targets_std.npy
   embed_dim: 1024
   n_blocks_encoder: 8
   mlp_multiplier: 4
@@ -215,15 +214,15 @@ model:
   - 3
   - 3
 job_id: MERRA_PRISM
-case_name: merra_prism_smoke
+case_name: merra_prism_v1
 type_training: full_dataset
 batch_size: 1
-num_epochs: 1
-dl_num_workers: 0
+num_epochs: 10
+dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 5.0e-05
-limit_steps_train: 30
-limit_steps_valid: 4
+limit_steps_train: 100000
+limit_steps_valid: 100
 min_lr: 1.0e-06
 max_lr: 0.0001
 warm_up_steps: 0
@@ -243,14 +242,14 @@ backbone_prefix: encoder.
 finetune_w_static: false
 strict_matching: false
 device_target: cuda
-distributed_strategy: none
+distributed_strategy: fsdp
 fsdp_precision: bf16
 fsdp_min_num_params: 5000000
 backbone_gradient_checkpointing: true
 skip_activation_offload: true
 training:
-  distributed: none
-  num_gpus: 1
+  distributed: fsdp
+  num_gpus: 2
   per_device_batch_size: 1
   gradient_accumulation_steps: 16
   auto_resume_if_checkpoint_exists: false
@@ -347,11 +346,11 @@ inference:
     use_seam_deblocking: false
     seam_deblocking_strength: 0.1
   inference_tile_size:
-  - 256
-  - 256
+  - 96
+  - 96
   inference_overlap:
-  - 64
-  - 64
+  - 32
+  - 32
   inference_blend_window: hann
   inference_blend_sigma: 0.35
   force_full_frame: false

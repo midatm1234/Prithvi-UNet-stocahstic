@@ -73,6 +73,12 @@ def get_scalers(config: ExperimentConfig):
             tensor = torch.from_numpy(array)
             if tensor.dtype != torch.float32:
                 tensor = tensor.float()
+            if not torch.isfinite(tensor).all():
+                bad = int((~torch.isfinite(tensor)).sum().item())
+                raise ValueError(
+                    f"Scaler file {path} contains {bad} non-finite value(s). "
+                    "Recompute scalers before training."
+                )
             if tensor.device != device:
                 tensor = tensor.to(device)
             return tensor
@@ -81,6 +87,16 @@ def get_scalers(config: ExperimentConfig):
         input_sigma_full = load_array(config.model.input_sigma)
         target_mu = load_array(config.model.target_mu)
         target_sigma = load_array(config.model.target_sigma)
+        for name, sigma in (
+            ("input_sigma", input_sigma_full),
+            ("target_sigma", target_sigma),
+        ):
+            if torch.any(sigma <= 0):
+                bad = int((sigma <= 0).sum().item())
+                raise ValueError(
+                    f"{name} contains {bad} non-positive value(s). "
+                    "Recompute scalers before training."
+                )
         if target_mu.numel() < len(specs) or target_sigma.numel() < len(specs):
             raise ValueError(
                 "Loaded target scalers have fewer channels than config.data.output_vars. "

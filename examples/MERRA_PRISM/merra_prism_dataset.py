@@ -57,6 +57,53 @@ def _find_numeric_datavar(ds: Any, path: Any) -> str:
     raise ValueError(f"No numeric data variable found in {path}")
 
 
+def _tile_origins(size: int, tile_size: int, stride: int) -> List[int]:
+    """Return deterministic origins that cover an axis with fixed-size tiles."""
+    tile_size = min(tile_size, size)
+    stride = max(1, stride)
+    origins = list(range(0, max(size - tile_size + 1, 1), stride))
+    final_origin = size - tile_size
+    if not origins or origins[-1] != final_origin:
+        origins.append(final_origin)
+    return sorted(set(int(origin) for origin in origins))
+
+
+def _coord_subset_slice(
+    coords: np.ndarray,
+    lower: Optional[float],
+    upper: Optional[float],
+    axis_name: str,
+) -> slice:
+    """Return a contiguous index slice for inclusive coordinate bounds."""
+    if lower is None and upper is None:
+        return slice(None)
+
+    lo = float(np.nanmin(coords) if lower is None else lower)
+    hi = float(np.nanmax(coords) if upper is None else upper)
+    if hi < lo:
+        lo, hi = hi, lo
+
+    coord_min = float(np.nanmin(coords))
+    coord_max = float(np.nanmax(coords))
+    if hi < coord_min or lo > coord_max:
+        raise ValueError(
+            f"spatial_subset {axis_name} bounds [{lo}, {hi}] do not overlap "
+            f"grid range [{coord_min}, {coord_max}]"
+        )
+
+    diffs = np.diff(np.asarray(coords, dtype=np.float64))
+    finite_diffs = np.abs(diffs[np.isfinite(diffs) & (diffs != 0)])
+    tol = 0.0 if finite_diffs.size == 0 else float(np.nanmedian(finite_diffs)) * 0.51
+
+    mask = (coords >= lo - tol) & (coords <= hi + tol)
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        raise ValueError(
+            f"spatial_subset {axis_name} bounds [{lo}, {hi}] selected no grid cells"
+        )
+    return slice(int(idx[0]), int(idx[-1]) + 1)
+
+
 class MerraPrismDataset(Dataset):
     """Pair daily MERRA2 predictors with daily PRISM targets.
 
@@ -146,8 +193,35 @@ class MerraPrismDataset(Dataset):
         # working CORDEX_ML dataset, which regrids coarse GCM fields onto the
         # fine target grid before cropping).
         # ------------------------------------------------------------------
-        self.fine_lat, self.fine_lon = self._load_fine_grid()
+        self._full_fine_lat, self._full_fine_lon = self._load_fine_grid()
+        spatial_subset = data_cfg.get("spatial_subset", {}) or {}
+        subset_enabled = bool(spatial_subset.get("enabled", False))
+        if subset_enabled:
+            self._domain_lat_slice = _coord_subset_slice(
+                self._full_fine_lat,
+                spatial_subset.get("lat_min"),
+                spatial_subset.get("lat_max"),
+                "latitude",
+            )
+            self._domain_lon_slice = _coord_subset_slice(
+                self._full_fine_lon,
+                spatial_subset.get("lon_min"),
+                spatial_subset.get("lon_max"),
+                "longitude",
+            )
+        else:
+            self._domain_lat_slice = slice(None)
+            self._domain_lon_slice = slice(None)
+
+        self.fine_lat = self._full_fine_lat[self._domain_lat_slice]
+        self.fine_lon = self._full_fine_lon[self._domain_lon_slice]
         self.fine_shape: Tuple[int, int] = (len(self.fine_lat), len(self.fine_lon))
+        if subset_enabled:
+            print(
+                f"[dataset] spatial subset: lat {self.fine_lat[0]:.4f}.."
+                f"{self.fine_lat[-1]:.4f}, lon {self.fine_lon[0]:.4f}.."
+                f"{self.fine_lon[-1]:.4f}, shape={self.fine_shape}"
+            )
 
         # Crop size (tile) used for training. Inference crops/tiles explicitly.
         crop_lat = int(data_cfg.get("train_crop_size_lat", 256))
@@ -156,9 +230,60 @@ class MerraPrismDataset(Dataset):
             min(crop_lat, self.fine_shape[0]),
             min(crop_lon, self.fine_shape[1]),
         )
-        # Random crops for training; deterministic (top-left) for everything else.
-        self.random_crop = mode == "training"
+        self.training_spatial_sampling = str(
+            data_cfg.get("training_spatial_sampling", "random")
+        ).lower()
+        self.training_tile_stride: Tuple[int, int] = (
+            int(data_cfg.get("training_tile_stride_lat", self.crop_size[0])),
+            int(data_cfg.get("training_tile_stride_lon", self.crop_size[1])),
+        )
+        self._tile_slices: Optional[List[Tuple[slice, slice]]] = None
         self._rng = np.random.default_rng(0)
+        self.min_valid_target_fraction = float(
+            data_cfg.get("min_valid_target_fraction", 1.0e-4)
+        )
+        self.max_crop_retries = max(1, int(data_cfg.get("max_crop_retries", 32)))
+        self.skip_empty_target_tiles = bool(
+            data_cfg.get("skip_empty_target_tiles", True)
+        )
+        self._target_valid_mask: Optional[np.ndarray] = None
+
+        if mode == "training" and self.training_spatial_sampling == "tiled":
+            lat_origins = _tile_origins(
+                self.fine_shape[0], self.crop_size[0], self.training_tile_stride[0]
+            )
+            lon_origins = _tile_origins(
+                self.fine_shape[1], self.crop_size[1], self.training_tile_stride[1]
+            )
+            candidate_tiles = [
+                (
+                    slice(lat0, lat0 + self.crop_size[0]),
+                    slice(lon0, lon0 + self.crop_size[1]),
+                )
+                for lat0 in lat_origins
+                for lon0 in lon_origins
+            ]
+            if self.skip_empty_target_tiles and self.min_valid_target_fraction > 0.0:
+                self._tile_slices = [
+                    tile
+                    for tile in candidate_tiles
+                    if self.target_valid_fraction(*tile) >= self.min_valid_target_fraction
+                ]
+            else:
+                self._tile_slices = candidate_tiles
+            if not self._tile_slices:
+                raise ValueError(
+                    "No deterministic training tiles remain after target-mask filtering"
+                )
+            print(
+                f"[dataset] deterministic training tiles: "
+                f"{len(lat_origins)}x{len(lon_origins)}={len(candidate_tiles)} "
+                f"candidate, {len(self._tile_slices)} kept, tile={self.crop_size}, "
+                f"stride={self.training_tile_stride}"
+            )
+
+        # Random crops for ordinary training; tiled training enumerates fixed windows.
+        self.random_crop = mode == "training" and self._tile_slices is None
 
         # NOTE: the dataset deliberately does NOT z-score x or y. The model
         # normalizes inputs and denormalizes outputs internally via its
@@ -189,12 +314,15 @@ class MerraPrismDataset(Dataset):
         if elev_file:
             elev_path = resolve_path(elev_file)
             if elev_path.exists():
-                self._elevation = load_elevation(
+                full_elevation = load_elevation(
                     elev_path,
                     var_name=elev_var or None,
-                    target_lat=self.fine_lat,
-                    target_lon=self.fine_lon,
+                    target_lat=self._full_fine_lat,
+                    target_lon=self._full_fine_lon,
                 )
+                self._elevation = full_elevation[
+                    self._domain_lat_slice, self._domain_lon_slice
+                ]
                 print(
                     f"[dataset] loaded static elevation {self._elevation.shape} "
                     f"(on PRISM grid) from {elev_path.name}"
@@ -223,8 +351,13 @@ class MerraPrismDataset(Dataset):
                 ds[lon_name].values.astype(np.float64),
             )
 
-    def _select_crop(self) -> Tuple[slice, slice]:
+    def _select_crop(self, tile_index: Optional[int] = None) -> Tuple[slice, slice]:
         """Pick a (lat_slice, lon_slice) crop window on the fine grid."""
+        if self._tile_slices is not None:
+            if tile_index is None:
+                raise ValueError("tile_index is required for tiled training")
+            return self._tile_slices[tile_index]
+
         ch, cw = self.crop_size
         if self.crop_size == self.fine_shape:
             return slice(None), slice(None)
@@ -235,6 +368,36 @@ class MerraPrismDataset(Dataset):
             lat0 = (self.fine_shape[0] - ch) // 2
             lon0 = (self.fine_shape[1] - cw) // 2
         return slice(lat0, lat0 + ch), slice(lon0, lon0 + cw)
+
+    def _load_target_valid_mask(self) -> np.ndarray:
+        """Return a subdomain mask where any target variable is finite."""
+        if self._target_valid_mask is not None:
+            return self._target_valid_mask
+
+        first_date = self._dates[0]
+        valid_mask: Optional[np.ndarray] = None
+        abs_lat_slice, abs_lon_slice = self._absolute_slices(slice(None), slice(None))
+        for var in self.target_vars:
+            path = self._target_maps[var][first_date]
+            with xr.open_dataset(str(path)) as ds:
+                da = ds[_find_numeric_datavar(ds, path)]
+                if "time" in da.dims:
+                    da = da.isel(time=0, drop=True)
+                arr = np.asarray(da.values, dtype=np.float32)[
+                    abs_lat_slice, abs_lon_slice
+                ]
+            finite = np.isfinite(arr)
+            valid_mask = finite if valid_mask is None else (valid_mask | finite)
+
+        if valid_mask is None:
+            raise ValueError("Could not build target valid mask")
+        self._target_valid_mask = valid_mask
+        return valid_mask
+
+    def target_valid_fraction(self, lat_slice: slice, lon_slice: slice) -> float:
+        """Fraction of cells with finite PRISM targets for a local subdomain tile."""
+        mask = self._load_target_valid_mask()
+        return float(mask[lat_slice, lon_slice].mean())
 
     # ------------------------------------------------------------------
     # Scalar loading
@@ -257,6 +420,8 @@ class MerraPrismDataset(Dataset):
     # Dataset protocol
     # ------------------------------------------------------------------
     def __len__(self) -> int:
+        if self._tile_slices is not None:
+            return len(self._dates) * len(self._tile_slices)
         return len(self._dates)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
@@ -265,16 +430,43 @@ class MerraPrismDataset(Dataset):
         if index < 0 or index >= len(self):
             raise IndexError("Index out of range")
 
-        sample_date = self._dates[index]
-        lat_slice, lon_slice = self._select_crop()
+        if self._tile_slices is not None:
+            date_index = index // len(self._tile_slices)
+            tile_index = index % len(self._tile_slices)
+        else:
+            date_index = index
+            tile_index = None
+
+        sample_date = self._dates[date_index]
+        lat_slice, lon_slice = self._select_crop(tile_index)
+        y = self._load_targets(sample_date, lat_slice, lon_slice)
+
+        # Random PRISM crops can land entirely over missing ocean/outside-CONUS
+        # pixels. The loss masks those safely, but such samples provide no
+        # learning signal and used to trigger zero-RMSE edge cases. During
+        # training, retry a few crop windows until at least a tiny target
+        # fraction is finite.
+        if self.random_crop and self.min_valid_target_fraction > 0.0:
+            valid_fraction = float(torch.isfinite(y).to(torch.float32).mean().item())
+            attempts = 1
+            while (
+                valid_fraction < self.min_valid_target_fraction
+                and attempts < self.max_crop_retries
+            ):
+                lat_slice, lon_slice = self._select_crop()
+                y = self._load_targets(sample_date, lat_slice, lon_slice)
+                valid_fraction = float(torch.isfinite(y).to(torch.float32).mean().item())
+                attempts += 1
 
         # Raw, physical-unit predictors (regridded onto the PRISM crop) and
         # targets. NO normalization here -- the model normalizes inputs and
         # denormalizes outputs internally, and the loss is in physical units.
         x = self._load_predictor(sample_date, lat_slice, lon_slice)
-        y = self._load_targets(sample_date, lat_slice, lon_slice)
 
-        return {"x": x, "y": y, "date": str(sample_date)}
+        sample = {"x": x, "y": y, "date": str(sample_date)}
+        if tile_index is not None:
+            sample["tile_index"] = tile_index
+        return sample
 
     # ------------------------------------------------------------------
     # I/O helpers
@@ -283,6 +475,23 @@ class MerraPrismDataset(Dataset):
         self, lat_slice: slice, lon_slice: slice
     ) -> Tuple[np.ndarray, np.ndarray]:
         return self.fine_lat[lat_slice], self.fine_lon[lon_slice]
+
+    @staticmethod
+    def _slice_start(s: slice) -> int:
+        return 0 if s.start is None else int(s.start)
+
+    def _absolute_slices(self, lat_slice: slice, lon_slice: slice) -> Tuple[slice, slice]:
+        """Translate local subdomain slices to absolute PRISM-grid slices."""
+        domain_lat0 = self._slice_start(self._domain_lat_slice)
+        domain_lon0 = self._slice_start(self._domain_lon_slice)
+        local_lat0 = self._slice_start(lat_slice)
+        local_lon0 = self._slice_start(lon_slice)
+        local_lat1 = len(self.fine_lat) if lat_slice.stop is None else int(lat_slice.stop)
+        local_lon1 = len(self.fine_lon) if lon_slice.stop is None else int(lon_slice.stop)
+        return (
+            slice(domain_lat0 + local_lat0, domain_lat0 + local_lat1),
+            slice(domain_lon0 + local_lon0, domain_lon0 + local_lon1),
+        )
 
     def _load_predictor(
         self,
@@ -364,6 +573,21 @@ class MerraPrismDataset(Dataset):
         out = np.concatenate([filled, mask], axis=0)
         return torch.from_numpy(out).to(self.dtype)
 
+    def _load_predictor_day(
+        self,
+        sample_date: Any,
+    ) -> torch.Tensor:
+        """Load one full day of predictors regridded onto the PRISM grid.
+
+        Inference uses many overlapping tiles from the same day. Calling
+        ``_load_predictor`` for every tile reopens the same NetCDF file and
+        repeats xarray interpolation hundreds or thousands of times. This
+        helper performs the same interpolation and missing-data fill once on
+        the full PRISM grid, so tile inference can slice from the cached tensor
+        without changing the predictor values.
+        """
+        return self._load_predictor(sample_date, slice(None), slice(None))
+
     def _load_targets(
         self,
         sample_date: Any,
@@ -386,7 +610,10 @@ class MerraPrismDataset(Dataset):
                 if "time" in da.dims:
                     da = da.isel(time=0, drop=True)
                 arr = np.asarray(da.values, dtype=np.float32)
-                arr = arr[lat_slice, lon_slice]
+                abs_lat_slice, abs_lon_slice = self._absolute_slices(
+                    lat_slice, lon_slice
+                )
+                arr = arr[abs_lat_slice, abs_lon_slice]
                 arr[np.isinf(arr)] = np.nan
                 arrays.append(arr)
 

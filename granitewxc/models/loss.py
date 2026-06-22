@@ -13,10 +13,10 @@ def rmse_loss(y_hat: torch.Tensor, y: dict[str, torch.Tensor]) -> torch.Tensor:
     target = y["y"]
     valid = torch.isfinite(target)
     if not bool(valid.any()):
-        return torch.zeros((), device=y_hat.device, dtype=y_hat.dtype)
+        return y_hat.sum() * 0.0
     diff = (y_hat - torch.where(valid, target, y_hat.detach())) ** 2
     valid_f = valid.to(y_hat.dtype)
-    return torch.sqrt((diff * valid_f).sum() / valid_f.sum().clamp(min=1.0))
+    return torch.sqrt((diff * valid_f).sum() / valid_f.sum().clamp(min=1.0) + 1e-12)
 
 
 def _coerce_mapping(value: Any) -> dict[str, Any]:
@@ -350,7 +350,19 @@ class CompositePredictandLoss:
             return self._cdf_loss(pred, target, spec)
         raise ValueError(f"Unsupported distribution loss method: {spec.method}")
 
-    def _compute_spatial_gradient_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _masked_mean_abs(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask_f = mask.to(dtype=value.dtype)
+        if not bool(mask.any().item()):
+            return torch.zeros((), device=value.device, dtype=value.dtype)
+        return (torch.abs(value) * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+
+    def _compute_spatial_gradient_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
         weights = torch.tensor(
             self._spatial_gradient.channel_weights,
             device=pred.device,
@@ -366,11 +378,14 @@ class CompositePredictandLoss:
 
             pred_ch = pred[:, ch_idx : ch_idx + 1, ...]
             target_ch = target[:, ch_idx : ch_idx + 1, ...]
+            valid_ch = valid[:, ch_idx : ch_idx + 1, ...]
 
             pred_dx = pred_ch[..., :, 1:] - pred_ch[..., :, :-1]
             pred_dy = pred_ch[..., 1:, :] - pred_ch[..., :-1, :]
             target_dx = target_ch[..., :, 1:] - target_ch[..., :, :-1]
             target_dy = target_ch[..., 1:, :] - target_ch[..., :-1, :]
+            valid_x = valid_ch[..., :, 1:] & valid_ch[..., :, :-1]
+            valid_y = valid_ch[..., 1:, :] & valid_ch[..., :-1, :]
 
             if (
                 self._spatial_gradient.precipitation_wet_only
@@ -380,24 +395,17 @@ class CompositePredictandLoss:
                 wet_x = (
                     (target_ch[..., :, 1:] > wet_threshold)
                     | (target_ch[..., :, :-1] > wet_threshold)
-                ).to(dtype=pred.dtype)
+                ) & valid_x
                 wet_y = (
                     (target_ch[..., 1:, :] > wet_threshold)
                     | (target_ch[..., :-1, :] > wet_threshold)
-                ).to(dtype=pred.dtype)
+                ) & valid_y
 
-                if bool(wet_x.any().item()):
-                    loss_x = (torch.abs(pred_dx - target_dx) * wet_x).sum() / wet_x.sum().clamp_min(1.0)
-                else:
-                    loss_x = torch.zeros((), device=pred.device, dtype=pred.dtype)
-
-                if bool(wet_y.any().item()):
-                    loss_y = (torch.abs(pred_dy - target_dy) * wet_y).sum() / wet_y.sum().clamp_min(1.0)
-                else:
-                    loss_y = torch.zeros((), device=pred.device, dtype=pred.dtype)
+                loss_x = self._masked_mean_abs(pred_dx - target_dx, wet_x)
+                loss_y = self._masked_mean_abs(pred_dy - target_dy, wet_y)
             else:
-                loss_x = torch.mean(torch.abs(pred_dx - target_dx))
-                loss_y = torch.mean(torch.abs(pred_dy - target_dy))
+                loss_x = self._masked_mean_abs(pred_dx - target_dx, valid_x)
+                loss_y = self._masked_mean_abs(pred_dy - target_dy, valid_y)
 
             channel_loss = 0.5 * (loss_x + loss_y)
             total = total + weight * channel_loss
@@ -431,19 +439,31 @@ class CompositePredictandLoss:
             return torch.zeros((), device=pred.device, dtype=pred.dtype)
         return total / total_weight
 
-    def _compute_multiscale_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _compute_multiscale_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
         terms: list[torch.Tensor] = []
+        valid_f = valid.to(dtype=pred.dtype)
         for scale in self._multiscale.scales:
             if pred.shape[-2] < scale or pred.shape[-1] < scale:
                 continue
-            pred_ds = F.avg_pool2d(pred, kernel_size=scale, stride=scale)
-            target_ds = F.avg_pool2d(target, kernel_size=scale, stride=scale)
+            count_ds = F.avg_pool2d(valid_f, kernel_size=scale, stride=scale)
+            block_valid = count_ds > 0.0
+            if not bool(block_valid.any().item()):
+                continue
+            denom = count_ds.clamp_min(1.0 / float(scale * scale))
+            pred_ds = F.avg_pool2d(pred * valid_f, kernel_size=scale, stride=scale) / denom
+            target_ds = F.avg_pool2d(target * valid_f, kernel_size=scale, stride=scale) / denom
+            diff = pred_ds[block_valid] - target_ds[block_valid]
             if self._multiscale.loss_type == "l2":
-                term = torch.mean((pred_ds - target_ds) ** 2)
+                term = torch.mean(diff ** 2)
             elif self._multiscale.loss_type == "rmse":
-                term = torch.sqrt(torch.mean((pred_ds - target_ds) ** 2) + 1e-12)
+                term = torch.sqrt(torch.mean(diff ** 2) + 1e-12)
             else:
-                term = torch.mean(torch.abs(pred_ds - target_ds))
+                term = torch.mean(torch.abs(diff))
             terms.append(term)
         if not terms:
             return torch.zeros((), device=pred.device, dtype=pred.dtype)
@@ -543,7 +563,7 @@ class CompositePredictandLoss:
         valid_f = valid.to(pred.dtype)
         sq_err = (pred - target) ** 2 * valid_f
         denom = valid_f.sum().clamp(min=1.0)
-        return torch.sqrt(sq_err.sum() / denom)
+        return torch.sqrt(sq_err.sum() / denom + 1e-12)
 
     @staticmethod
     def _squeeze_single_channel(value: torch.Tensor) -> torch.Tensor:
@@ -647,6 +667,14 @@ class CompositePredictandLoss:
         n_valid = float(valid.sum().item())
         n_total = float(valid.numel())
         valid_fraction = n_valid / max(n_total, 1.0)
+        if n_valid <= 0.0:
+            total = y_hat.sum() * 0.0
+            self._last_terms = {
+                "base.rmse": 0.0,
+                "valid_fraction": 0.0,
+                "valid_pixels": 0.0,
+            }
+            return total
 
         total = self._base_rmse_masked(y_hat, target, valid)
         terms: dict[str, float] = {
@@ -665,7 +693,14 @@ class CompositePredictandLoss:
                 continue
             if self._precip_hurdle is not None and ch_idx == self._precip_hurdle.precip_index:
                 continue
-            dist_term = self._compute_distribution_loss(y_hat[:, ch_idx, ...], target[:, ch_idx, ...], spec)
+            ch_valid = valid[:, ch_idx, ...]
+            if not bool(ch_valid.any().item()):
+                continue
+            dist_term = self._compute_distribution_loss(
+                y_hat[:, ch_idx, ...][ch_valid],
+                target[:, ch_idx, ...][ch_valid],
+                spec,
+            )
             weighted = dist_term * spec.weight
             total = total + weighted
             name = self.output_vars[ch_idx]
@@ -673,7 +708,7 @@ class CompositePredictandLoss:
             terms[f"{name}.distribution.{spec.method}.weighted"] = float(weighted.detach().item())
 
         if self._spatial_gradient.enabled:
-            grad_term = self._compute_spatial_gradient_loss(y_hat, target)
+            grad_term = self._compute_spatial_gradient_loss(y_hat, target, valid)
             weighted_grad = grad_term * self._spatial_gradient.weight
             total = total + weighted_grad
             terms["spatial_gradient"] = float(grad_term.detach().item())
@@ -687,7 +722,7 @@ class CompositePredictandLoss:
             terms["tv.weighted"] = float(weighted_tv.detach().item())
 
         if self._multiscale.enabled:
-            multiscale_term = self._compute_multiscale_loss(y_hat, target)
+            multiscale_term = self._compute_multiscale_loss(y_hat, target, valid)
             weighted_multiscale = multiscale_term * self._multiscale.weight
             total = total + weighted_multiscale
             terms["multiscale"] = float(multiscale_term.detach().item())

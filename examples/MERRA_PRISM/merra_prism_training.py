@@ -37,7 +37,13 @@ try:
     from granitewxc.models.loss import build_loss_fn, rmse_loss
 except ModuleNotFoundError:
     def rmse_loss(y_hat: torch.Tensor, y: dict[str, torch.Tensor]) -> torch.Tensor:
-        return torch.sqrt(torch.mean((y_hat - y["y"]) ** 2))
+        target = y["y"]
+        valid = torch.isfinite(target)
+        if not bool(valid.any()):
+            return y_hat.sum() * 0.0
+        diff = (y_hat - torch.where(valid, target, y_hat.detach())) ** 2
+        valid_f = valid.to(y_hat.dtype)
+        return torch.sqrt((diff * valid_f).sum() / valid_f.sum().clamp(min=1.0) + 1e-12)
 
     def build_loss_fn(config, output_vars):
         del config, output_vars
@@ -440,7 +446,10 @@ def run_training(
     if checkpoint_root:
         config.checkpoint_dir = str(case_output_dir(checkpoint_root, case_name))
     elif getattr(config, "path_experiment", None):
-        config.checkpoint_dir = str(case_output_dir(Path(config.path_experiment) / "weights", case_name))
+        config.checkpoint_dir = str(
+            case_output_dir(Path(config.path_experiment) / "weights", case_name)
+        )
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
     print(f"[training] case_name={case_name}")
     print(f"[training] checkpoint_dir={config.checkpoint_dir}")
 

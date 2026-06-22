@@ -32,9 +32,11 @@ except Exception:
 
 from merra_prism_utils import (
     align_dates,
+    case_output_dir,
     discover_all_prism_targets,
     discover_merra2_files,
     expand_predictor_variables,
+    get_case_name,
     load_elevation,
     load_yaml,
     parse_date_range_from_config,
@@ -105,6 +107,66 @@ def _build_grid(ds: Any, lat_name: str, lon_name: str) -> Any:
     return xr.Dataset({"lat": lat, "lon": lon})
 
 
+def _coord_subset_slice(
+    coords: np.ndarray,
+    lower: Optional[float],
+    upper: Optional[float],
+    axis_name: str,
+) -> slice:
+    """Return a contiguous index slice for inclusive coordinate bounds."""
+    if lower is None and upper is None:
+        return slice(None)
+
+    lo = float(np.nanmin(coords) if lower is None else lower)
+    hi = float(np.nanmax(coords) if upper is None else upper)
+    if hi < lo:
+        lo, hi = hi, lo
+
+    coord_min = float(np.nanmin(coords))
+    coord_max = float(np.nanmax(coords))
+    if hi < coord_min or lo > coord_max:
+        raise ValueError(
+            f"spatial_subset {axis_name} bounds [{lo}, {hi}] do not overlap "
+            f"grid range [{coord_min}, {coord_max}]"
+        )
+
+    diffs = np.diff(np.asarray(coords, dtype=np.float64))
+    finite_diffs = np.abs(diffs[np.isfinite(diffs) & (diffs != 0)])
+    tol = 0.0 if finite_diffs.size == 0 else float(np.nanmedian(finite_diffs)) * 0.51
+
+    mask = (coords >= lo - tol) & (coords <= hi + tol)
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        raise ValueError(
+            f"spatial_subset {axis_name} bounds [{lo}, {hi}] selected no grid cells"
+        )
+    return slice(int(idx[0]), int(idx[-1]) + 1)
+
+
+def _spatial_subset_slices(
+    lat_vals: np.ndarray,
+    lon_vals: np.ndarray,
+    data_cfg: Dict[str, Any],
+) -> Tuple[slice, slice]:
+    spatial_subset = data_cfg.get("spatial_subset", {}) or {}
+    if not bool(spatial_subset.get("enabled", False)):
+        return slice(None), slice(None)
+
+    lat_slice = _coord_subset_slice(
+        lat_vals,
+        spatial_subset.get("lat_min"),
+        spatial_subset.get("lat_max"),
+        "latitude",
+    )
+    lon_slice = _coord_subset_slice(
+        lon_vals,
+        spatial_subset.get("lon_min"),
+        spatial_subset.get("lon_max"),
+        "longitude",
+    )
+    return lat_slice, lon_slice
+
+
 def _rename_lat_lon(da: Any, lat_name: str, lon_name: str) -> Any:
     rename_map = {}
     if lat_name in da.dims and lat_name != "lat":
@@ -137,7 +199,10 @@ def _build_regridder(
     return None
 
 
-def _get_target_grid(prism_files: Dict[str, List[Tuple[Any, Path]]]) -> Tuple[Any, Any]:
+def _get_target_grid(
+    prism_files: Dict[str, List[Tuple[Any, Path]]],
+    data_cfg: Dict[str, Any],
+) -> Tuple[Any, Any, Tuple[slice, slice]]:
     """Open the first available PRISM file and extract its lat/lon grid."""
     for var, flist in prism_files.items():
         if flist:
@@ -145,10 +210,13 @@ def _get_target_grid(prism_files: Dict[str, List[Tuple[Any, Path]]]) -> Tuple[An
             with xr.open_dataset(str(first_path)) as ds:
                 lat_name = _infer_coord_name(ds, LAT_CANDIDATES)
                 lon_name = _infer_coord_name(ds, LON_CANDIDATES)
-                grid = _build_grid(ds, lat_name, lon_name)
                 lat_vals = ds[lat_name].values
                 lon_vals = ds[lon_name].values
-                return grid, (lat_vals, lon_vals)
+                lat_slice, lon_slice = _spatial_subset_slices(lat_vals, lon_vals, data_cfg)
+                lat_vals = lat_vals[lat_slice]
+                lon_vals = lon_vals[lon_slice]
+                grid = xr.Dataset({"lat": ("lat", lat_vals), "lon": ("lon", lon_vals)})
+                return grid, (lat_vals, lon_vals), (lat_slice, lon_slice)
     raise RuntimeError("No PRISM target files found to extract grid")
 
 
@@ -168,9 +236,14 @@ def preprocess(
     predictor_variables = expand_predictor_variables(data_cfg.get("predictor_variables", {}))
     regrid_method: str = data_cfg.get("regrid_method", "bilinear")
 
-    output_dir = resolve_path(data_cfg.get("preprocessed_dir", "./preprocessed"))
-    output_dir = output_dir / mode
+    case_name = get_case_name(cfg)
+    output_dir = case_output_dir(
+        resolve_path(data_cfg.get("preprocessed_dir", "./preprocessed")) / mode,
+        case_name,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[preproc] case_name={case_name}")
+    print(f"[preproc] output_dir={output_dir}")
 
     validate_target_variables(target_dir, target_variables)
 
@@ -201,7 +274,8 @@ def preprocess(
     target_maps = {var: {d: p for d, p in fl} for var, fl in prism_files.items()}
 
     # Get target grid from first PRISM file
-    target_grid, (target_lat, target_lon) = _get_target_grid(prism_files)
+    target_grid, (target_lat, target_lon), target_slices = _get_target_grid(prism_files, data_cfg)
+    print(f"[preproc] PRISM target grid {len(target_lat)}x{len(target_lon)}")
 
     # Load static elevation and regrid to the PRISM target grid
     elev_file = data_cfg.get("static_elevation_file", None)
@@ -279,6 +353,9 @@ def preprocess(
                 if "time" in da.dims:
                     da = da.isel(time=0, drop=True)
                 arr = da.values.astype(np.float32)
+                lat_slice, lon_slice = target_slices
+                if arr.ndim >= 2:
+                    arr = arr[lat_slice, lon_slice]
                 arr[np.isinf(arr)] = np.nan
                 tgt_arrays[var] = arr
 
