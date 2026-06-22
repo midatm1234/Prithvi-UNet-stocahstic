@@ -117,12 +117,8 @@ data:
     inputs_std: ./examples/MERRA_PRISM/scalars_with_H/inputs_std.npy
     targets_mean: ./examples/MERRA_PRISM/scalars_with_H/targets_mean.npy
     targets_std: ./examples/MERRA_PRISM/scalars_with_H/targets_std.npy
-  input_size_lat: 32
-  input_size_lon: 32
   # Full-domain coverage via deterministic fixed-size spatial tiles.
   # Edge tiles are shifted inward so every sample remains 256x256.
-  target_size_lat: 256
-  target_size_lon: 256
   train_crop_size_lat: 256
   train_crop_size_lon: 256
   training_spatial_sampling: tiled
@@ -131,7 +127,6 @@ data:
   min_valid_target_fraction: 1.0e-04
   max_crop_retries: 32
   skip_empty_target_tiles: true
-  downsample_factor: 8
   n_input_timestamps: 1
   regrid_method: bilinear
   spatial_subset:
@@ -140,10 +135,10 @@ data:
     # PRISM grid range in this dataset is roughly:
     #   latitude  24.07 .. 49.93
     #   longitude -125.02 .. -66.48
-    lat_min: 32.8
-    lat_max: 34.925
-    lon_min: -119.5
-    lon_max: -117.375
+    lat_min: 32.55
+    lat_max: 41.075
+    lon_min: -124.45
+    lon_max: -115.925
 dates:
   training:
     start: '1996-01-01'
