@@ -70,7 +70,7 @@ def _find_checkpoint(cfg: Dict[str, Any], explicit: Optional[str]) -> str:
     checkpoint_dir = cfg.get("checkpoint_dir")
     if checkpoint_dir:
         case_checkpoint_dir = case_output_dir(checkpoint_dir, case_name)
-        for candidate in ("best.ckpt", "last.ckpt"):
+        for candidate in ("last.ckpt", "best.ckpt"):
             p = case_checkpoint_dir / candidate
             if p.exists():
                 return str(p)
@@ -78,17 +78,17 @@ def _find_checkpoint(cfg: Dict[str, Any], explicit: Optional[str]) -> str:
     run_dir = cfg.get("run_dir")
     if run_dir:
         case_run_dir = case_output_dir(run_dir, case_name)
-        for candidate in ("best.ckpt", "last.ckpt"):
+        for candidate in ("last.ckpt", "best.ckpt"):
             p = case_run_dir / candidate
             if p.exists():
                 return str(p)
-        for candidate in ("best.ckpt", "last.ckpt"):
+        for candidate in ("last.ckpt", "best.ckpt"):
             p = case_run_dir / "checkpoints" / candidate
             if p.exists():
                 return str(p)
 
     exp = cfg.get("path_experiment", ".")
-    for candidate in ("best.ckpt", "last.ckpt"):
+    for candidate in ("last.ckpt", "best.ckpt"):
         p = case_output_dir(resolve_path(exp) / "checkpoints", case_name) / candidate
         if p.exists():
             return str(p)
@@ -649,7 +649,12 @@ def run_inference(
     print(f"[inference] output_dir={output_path}")
 
     date_iter = enumerate(inference_dates)
-    if tqdm is not None:
+    disable_progress = os.environ.get("MERRA_PRISM_DISABLE_TQDM", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if tqdm is not None and not disable_progress:
         date_iter = tqdm(
             list(enumerate(inference_dates)),
             total=len(inference_dates),
@@ -863,6 +868,7 @@ def run_parallel_inference(
         f"{','.join(gpu_ids)} for {total_dates} dates -> {output_path}",
         flush=True,
     )
+    run_start_time = time.time()
     procs: List[subprocess.Popen] = []
     log_handles: List[Any] = []
     worker_logs: List[Path] = []
@@ -870,6 +876,8 @@ def run_parallel_inference(
         for shard_idx, gpu_id in enumerate(gpu_ids):
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            env["MERRA_PRISM_DISABLE_TQDM"] = "1"
+            env["TQDM_DISABLE"] = "1"
             env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
             log_path = output_path / f"parallel_worker_{shard_idx}_gpu{gpu_id}.log"
             cmd = [
@@ -910,32 +918,71 @@ def run_parallel_inference(
             )
 
         failures: List[Tuple[int, int]] = []
-        last_done = -1
-        last_report = 0.0
-        while True:
-            done = len(list(output_path.glob(f"{case_name}_inference_*.nc")))
-            now = time.monotonic()
-            if done != last_done or now - last_report >= 60.0:
-                pct = 100.0 * done / max(total_dates, 1)
-                live = sum(1 for proc in procs if proc.poll() is None)
-                print(
-                    f"[parallel] completed {done}/{total_dates} daily files "
-                    f"({pct:.1f}%); live_workers={live}",
-                    flush=True,
-                )
-                last_done = done
-                last_report = now
+        output_glob = f"{case_name}_inference_*.nc"
 
-            failures = [
-                (worker_idx, proc.returncode)
-                for worker_idx, proc in enumerate(procs)
-                if proc.poll() not in (None, 0)
-            ]
-            if failures:
-                break
-            if all(proc.poll() is not None for proc in procs):
-                break
-            time.sleep(15.0)
+        def _completed_this_run() -> int:
+            completed = 0
+            for output_file in output_path.glob(output_glob):
+                try:
+                    stat = output_file.stat()
+                except FileNotFoundError:
+                    continue
+                if stat.st_size > 0 and stat.st_mtime >= run_start_time:
+                    completed += 1
+            return min(completed, total_dates)
+
+        progress = None
+        if tqdm is not None:
+            progress = tqdm(
+                total=total_dates,
+                desc="MERRA-PRISM parallel inference (days)",
+                unit="day",
+            )
+        else:
+            print(
+                "[parallel] tqdm is unavailable; falling back to periodic text progress.",
+                flush=True,
+            )
+
+        last_done = 0
+        last_report = time.monotonic()
+        try:
+            while True:
+                done = _completed_this_run()
+                if progress is not None and done > progress.n:
+                    progress.update(done - progress.n)
+
+                live = sum(1 for proc in procs if proc.poll() is None)
+                if progress is not None:
+                    progress.set_postfix(live_workers=live, refresh=False)
+
+                now = time.monotonic()
+                if progress is None and (done != last_done or now - last_report >= 60.0):
+                    pct = 100.0 * done / max(total_dates, 1)
+                    print(
+                        f"[parallel] completed {done}/{total_dates} daily files "
+                        f"({pct:.1f}%); live_workers={live}",
+                        flush=True,
+                    )
+                    last_report = now
+                last_done = done
+
+                failures = [
+                    (worker_idx, proc.returncode)
+                    for worker_idx, proc in enumerate(procs)
+                    if proc.poll() not in (None, 0)
+                ]
+                if failures:
+                    break
+                if all(proc.poll() is not None for proc in procs):
+                    break
+                time.sleep(15.0)
+        finally:
+            if progress is not None:
+                done = _completed_this_run()
+                if done > progress.n:
+                    progress.update(done - progress.n)
+                progress.close()
 
         if failures:
             for log_fh in log_handles:
