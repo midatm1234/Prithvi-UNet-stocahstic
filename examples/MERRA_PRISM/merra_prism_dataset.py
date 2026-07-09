@@ -34,6 +34,8 @@ from merra_prism_utils import (
     validate_target_variables,
 )
 
+from granitewxc.utils import normalization as norm
+
 
 PathLike = Union[str, os.PathLike[str]]
 
@@ -120,7 +122,9 @@ class MerraPrismDataset(Dataset):
     target_variables : list[str] | None
         Override target variable names (default reads from YAML).
     scalars_dir : str | Path | None
-        Override scalar directory (default reads from YAML ``data.scalar_dir``).
+        Override scalar directory (default: case-scoped
+        ``<preprocessed_dir>/<case_name>/scalars``, resolved via
+        ``normalization.resolve_scalar_dir``).
     dtype : torch.dtype
         Tensor dtype for returned samples.
     """
@@ -295,12 +299,25 @@ class MerraPrismDataset(Dataset):
         # z-score, they become the neutral value 0. A separate binary validity
         # mask channel tells the model which cells were originally missing.
         self._scalars: Dict[str, np.ndarray] = {}
-        scalar_dir = data_cfg.get("scalar_dir", "")
+        # Resolve the scaler directory to the case-scoped location so the NaN-fill
+        # means loaded here are byte-for-byte the same per-channel scalers the
+        # model uses for its internal z-score (single source of truth).
+        if scalars_dir is not None:
+            scalar_dir = str(scalars_dir)
+        else:
+            # Case-scoped resolution only. Never fall back to a shared/flat
+            # scalar_dir: that historically mixed another case's stale
+            # per-gridpoint scalers into this run. A missing case_name raises a
+            # clear error here (a config bug); merely-absent scalers resolve to
+            # the canonical (empty) dir and are tolerated for the first scalar
+            # pass below.
+            scalar_dir = str(norm.resolve_scalar_dir(self.cfg, for_writing=False))
         self._fill_means: Optional[np.ndarray] = None
         if scalar_dir:
             self._scalars = self._load_scalars(scalar_dir)
             im = self._scalars.get("inputs_mean")
             if im is not None:
+                norm.assert_channel_only("inputs_mean", im)
                 # inputs_mean is [data_means(N), mask_means(N)] -> take the data
                 # half for neutral NaN-fill (mask means are 0).
                 n_data = len(self.predictor_vars) + 1  # + elevation
@@ -463,7 +480,19 @@ class MerraPrismDataset(Dataset):
         # denormalizes outputs internally, and the loss is in physical units.
         x = self._load_predictor(sample_date, lat_slice, lon_slice)
 
-        sample = {"x": x, "y": y, "date": str(sample_date)}
+        sample = {
+            "x": x,
+            "y": y,
+            "date": str(sample_date),
+            # Legacy hook for per-gridpoint (spatial) scalers: the model uses it
+            # only when scalers are [C,H,W] to crop the matching tile. With the
+            # default per-channel (global) scalers the model broadcasts [C,1,1]
+            # and ignores this offset, so MERRA and NARR share one code path.
+            "__scaler_offset": torch.tensor(
+                [self._slice_start(lat_slice), self._slice_start(lon_slice)],
+                dtype=torch.long,
+            ),
+        }
         if tile_index is not None:
             sample["tile_index"] = tile_index
         return sample
@@ -492,6 +521,34 @@ class MerraPrismDataset(Dataset):
             slice(domain_lat0 + local_lat0, domain_lat0 + local_lat1),
             slice(domain_lon0 + local_lon0, domain_lon0 + local_lon1),
         )
+
+    def _check_predictor_alignment(
+        self,
+        stacked: np.ndarray,
+        crop_lat: np.ndarray,
+        crop_lon: np.ndarray,
+    ) -> None:
+        """Sanity check: predictors must be on the PRISM grid BEFORE tiling.
+
+        Each continuous predictor was bilinearly interpolated onto the exact
+        PRISM crop coordinates, so the regridded stack must match the crop grid
+        cell-for-cell. If it does not, the low-resolution predictors would be
+        spatially misaligned with the high-resolution target and produce
+        low-resolution block artifacts in the downscaled output.
+        """
+        exp_hw = (len(crop_lat), len(crop_lon))
+        if stacked.shape[-2:] != exp_hw:
+            raise ValueError(
+                f"Predictor regrid misaligned with PRISM grid: got "
+                f"{tuple(stacked.shape[-2:])}, expected {exp_hw} (the PRISM crop)."
+            )
+        if not getattr(self, "_alignment_logged", False):
+            print(
+                "[dataset] predictor->PRISM alignment OK: continuous predictors "
+                f"bilinearly regridded onto the PRISM target grid {exp_hw} "
+                "(coarse->fine, max|dlat|=max|dlon|=0 by construction) before tiling."
+            )
+            self._alignment_logged = True
 
     def _load_predictor(
         self,
@@ -536,6 +593,8 @@ class MerraPrismDataset(Dataset):
                 arr[np.isinf(arr)] = np.nan
                 arrays.append(arr)
         stacked = np.stack(arrays, axis=0)
+
+        self._check_predictor_alignment(stacked, crop_lat, crop_lon)
 
         # Append elevation crop as the final static channel (always valid).
         if self._elevation is not None:

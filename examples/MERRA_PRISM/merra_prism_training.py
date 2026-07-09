@@ -51,6 +51,12 @@ except ModuleNotFoundError:
 
 from granitewxc.models.model import get_finetune_model_UNET
 from granitewxc.utils.config import ExperimentConfig, get_config
+from granitewxc.utils.normalization import (
+    apply_scalar_paths,
+    assert_scalars_available,
+    log_case_context,
+    log_scalar_summary,
+)
 from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.distributed import init_ddp
 from granitewxc.utils.trainer import train_model
@@ -453,6 +459,15 @@ def run_training(
     print(f"[training] case_name={case_name}")
     print(f"[training] checkpoint_dir={config.checkpoint_dir}")
 
+    # Wire the model + dataset to the per-case, per-channel scalers and fail
+    # fast if they are missing. Centralized here so BOTH the CLI entry point and
+    # the notebook (which calls run_training directly) consume the SAME
+    # case-scoped scalers instead of the YAML's default (flat) scaler paths.
+    log_case_context(config, "finetune")
+    assert_scalars_available(config, role="finetune")
+    apply_scalar_paths(config)
+    log_scalar_summary(config, "training")
+
     use_gpu = _should_use_gpu(config)
 
     if not use_gpu:
@@ -478,14 +493,19 @@ def run_training(
             num_gpus = 1
     num_gpus = min(num_gpus, available_gpus)
 
-    manager = mp.Manager()
-    return_dict = manager.dict()
-
     if num_gpus <= 1:
         print("[training] single-GPU mode")
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        mp.spawn(_single_gpu_worker, args=(config, config_path, save_every, return_dict), nprocs=1)
+        # Default to GPU 0, but honor an explicit external CUDA_VISIBLE_DEVICES
+        # (e.g. to target a less-contended GPU on a shared machine).
+        _cvd = os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        print(f"[training] CUDA_VISIBLE_DEVICES={_cvd}")
+        # Run in-process for single-GPU so notebook outputs keep one live tqdm
+        # bar per epoch (mp.spawn child-process stdout tends to fragment bars).
+        return_dict: Dict[str, Any] = {}
+        _single_gpu_worker(0, config, config_path, save_every, return_dict)
     else:
+        manager = mp.Manager()
+        return_dict = manager.dict()
         print(f"[training] distributed mode ({num_gpus} GPUs)")
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = _pick_free_port()

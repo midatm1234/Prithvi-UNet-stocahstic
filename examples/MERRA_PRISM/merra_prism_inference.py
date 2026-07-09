@@ -41,6 +41,16 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from granitewxc.utils.config import get_config
 from granitewxc.utils.predictands import build_predictand_specs
+from granitewxc.utils.normalization import (
+    apply_scalar_paths,
+    assert_scalars_available,
+    assert_target_grid_matches,
+    log_case_context,
+    log_scalar_summary,
+    resolve_scalar_dir,
+    seam_gradient_ratio,
+    targets_are_spatial,
+)
 
 from merra_prism_dataset import MerraPrismDataset
 from merra_prism_utils import (
@@ -534,6 +544,18 @@ def run_inference(
     case_name = get_case_name(cfg)
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
 
+    # Log the active case + case-scoped directories, then require the per-case
+    # scalers to exist. Inference must denormalize with the SAME per-case
+    # scalers used at training; never silently borrow another case's files.
+    log_case_context(cfg, "inference")
+    assert_scalars_available(cfg, role="inference")
+
+    # Point the model at the per-case scalers. The notebook calls run_inference
+    # directly with a fresh config, so we must not rely on the CLI having wired
+    # them; log shapes + sha256 to prove train/infer used identical files.
+    apply_scalar_paths(config)
+    log_scalar_summary(config, "inference")
+
     # Load model
     print(f"[inference] loading checkpoint: {checkpoint_path}")
     model = _load_model(config, checkpoint_path, device, data_parallel=data_parallel)
@@ -593,7 +615,7 @@ def run_inference(
     ).get("tile_size") or [256, 256]
     overlap_cfg = inf_cfg.get("inference_overlap") or inf_cfg.get(
         "boundary_mitigation", {}
-    ).get("overlap") or [64, 64]
+    ).get("overlap") or [128, 128]
     tile_h = min(int(tile_cfg[0]), fine_h)
     tile_w = min(int(tile_cfg[1]), fine_w)
     ov_h = int(overlap_cfg[0])
@@ -602,6 +624,27 @@ def run_inference(
     stride_w = max(1, tile_w - ov_w)
 
     pad_multiple = _pad_multiple_from_config(config)
+    # Per-gridpoint (spatial) target scalers are cropped per tile by the model
+    # using each tile's origin. Padding a tile would push edge-tile offsets past
+    # the scaler grid (silent wrong bilinear fallback), so require pad-free tiles
+    # and a scaler grid that matches this inference domain. Channel-only scalers
+    # are grid-agnostic and skip all of this.
+    scalar_dir = resolve_scalar_dir(config, for_writing=False)
+    spatial_targets = targets_are_spatial(scalar_dir)
+    if spatial_targets:
+        if tile_h % pad_multiple != 0 or tile_w % pad_multiple != 0:
+            raise ValueError(
+                f"Per-gridpoint target scalers require pad-free tiles, but tile "
+                f"({tile_h},{tile_w}) is not a multiple of pad_multiple={pad_multiple}. "
+                f"Choose an inference_tile size divisible by {pad_multiple}."
+            )
+        _tmean = np.load(os.path.join(str(scalar_dir), "targets_mean.npy"), mmap_mode="r")
+        assert_target_grid_matches("targets_mean", _tmean, fine_h, fine_w)
+        print(
+            f"[inference] per-gridpoint target scalers active: grid "
+            f"{tuple(_tmean.shape[-2:])} == domain ({fine_h},{fine_w}); "
+            f"passing per-tile __scaler_offset"
+        )
     lat_origins = _tile_origins(fine_h, tile_h, stride_h)
     lon_origins = _tile_origins(fine_w, tile_w, stride_w)
     candidate_tile_positions = [
@@ -730,7 +773,14 @@ def run_inference(
                         else nullcontext()
                     )
                     with amp_context:
-                        pred = model({"x": xb, "y": yb})
+                        # Per-tile crop origins (domain frame) for spatial target
+                        # scalers; harmless (ignored) for channel-only scalers.
+                        scaler_offset = torch.tensor(
+                            [[int(lat0), int(lon0)] for lat0, lon0 in chunk],
+                            dtype=torch.long,
+                            device=device,
+                        )
+                        pred = model({"x": xb, "y": yb, "__scaler_offset": scaler_offset})
                     if isinstance(pred, dict):
                         pred = pred.get(
                             "y_hat", pred.get("output", next(iter(pred.values())))
@@ -791,6 +841,25 @@ def run_inference(
             # Physical-range guard (raises on impossible temperatures); reports
             # tmax<tmin crossings without failing.
             _sanity_check_outputs(prediction, target_variables, date_string)
+
+            # Seam / block-artifact sanity metric: ratio of the mean |gradient|
+            # at tile boundaries to the interior mean. ~1.0 means seams are
+            # indistinguishable from the interior (good Hann blend); >~1.5
+            # indicates visible low-resolution block edges at the tile grid.
+            for _ci, _vname in enumerate(target_variables):
+                _field = prediction[0, _ci]
+                _r_lat = seam_gradient_ratio(_field, lat_origins, axis=0)
+                _r_lon = seam_gradient_ratio(_field, lon_origins, axis=1)
+                _flag = (
+                    "  <-- possible block artifact"
+                    if (np.isfinite(_r_lat) and _r_lat > 1.5)
+                    or (np.isfinite(_r_lon) and _r_lon > 1.5)
+                    else ""
+                )
+                print(
+                    f"[inference] {date_string} seam-gradient ratio {_vname}: "
+                    f"lat={_r_lat:.2f} lon={_r_lon:.2f} (1.0=no seam){_flag}"
+                )
             _add_time(day_times, "postprocess", time.perf_counter() - t0)
 
             date_token = np.datetime64(date_string, "D").astype(object).strftime("%Y%m%d")
@@ -847,6 +916,11 @@ def run_parallel_inference(
     """
     cfg = load_yaml(config_path)
     case_name = get_case_name(cfg)
+    # Fail fast with a clear, case-specific message before spawning workers if
+    # the per-case scalers are missing (this is where the stale shared-scalar
+    # crash used to surface).
+    log_case_context(cfg, "inference")
+    assert_scalars_available(cfg, role="inference")
     output_path = case_output_dir(output_dir, case_name)
     output_path.mkdir(parents=True, exist_ok=True)
     dataset = MerraPrismDataset(config_path, mode="inference")
@@ -1051,6 +1125,9 @@ def main() -> None:
     config = get_config(str(Path(args.config).resolve()))
     case_name = get_case_name(cfg)
 
+    # Scaler resolution + wiring + logging happen inside run_inference /
+    # run_parallel_inference so the notebook (which calls those directly)
+    # behaves identically to this CLI entry point.
     checkpoint = _find_checkpoint(cfg, args.checkpoint)
     output_root = args.output_dir or cfg.get("inference", {}).get(
         "output_dir", "./examples/MERRA_PRISM/experiments/inference_output"

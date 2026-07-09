@@ -49,6 +49,8 @@ except ImportError:
     PredictandSpec = None
     build_predictand_specs = None
 
+from granitewxc.utils import normalization as norm
+
 EPS = 1e-6
 
 
@@ -61,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Override scalar output directory (default: from YAML data.scalar_dir)",
+        help="Override scalar output directory (default: <preprocessed_dir>/<case_name>/scalars)",
     )
     parser.add_argument(
         "--progress-interval",
@@ -245,6 +247,21 @@ def compute_scalars(
     # Predictors are regridded onto these coords (co-registered with targets) so
     # input scalars match what the dataset feeds the model.
     stride = int(data_cfg.get("scalar_stride", 8))
+    predictands_cfg = cfg.get("predictands", {})
+    use_target_gridpoint = any(
+        ((predictands_cfg.get(var, {}) or {}).get("normalization", {}) or {}).get("mode")
+        == "gridpoint"
+        for var in target_variables
+    )
+    if use_target_gridpoint and stride != 1:
+        # Per-gridpoint TARGET scalers are a native-resolution climatology; a
+        # strided (coarse) estimate would reintroduce block artifacts. Force
+        # full resolution.
+        print(
+            "[scalars] a predictand uses normalization.mode: gridpoint -> forcing "
+            f"scalar_stride={stride} to 1 for a full-resolution target climatology"
+        )
+        stride = 1
     first_tpath = target_maps[target_variables[0]][aligned_dates[0]]
     with xr.open_dataset(str(first_tpath)) as _tds:
         _latn = next((n for n in ("lat", "latitude", "y") if n in _tds.coords), "lat")
@@ -381,20 +398,20 @@ def compute_scalars(
     # this whole block was gated behind `use_gridpoint`, so in the all-global
     # configuration ppt kept its raw mean (~1.2) instead of 0, breaking the
     # model's divide_only output scaler.
-    predictands_cfg = cfg.get("predictands", {})
-    use_gridpoint = any(
-        predictands_cfg.get(var, {}).get("normalization", {}).get("mode") == "gridpoint"
-        for var in target_variables
-    )
+    # (predictands_cfg was resolved above, next to the stride guard.)
 
-    # Start from global per-channel stats; per-variable rules below override.
+    # Phase A resolves a per-CHANNEL SCALAR for every target (used directly for
+    # global channels and as the broadcast fill for gridpoint channels). Spatial
+    # (per-gridpoint) maps are only assembled in Phase B, so we never store a 2-D
+    # field inside the 1-D (C,) array (which would raise).
     final_targets_mean = targets_mean.copy()
     final_targets_std = targets_std.copy()
+    gridpoint_channels: List[int] = []
 
     for ch_idx, var in enumerate(target_variables):
         var_cfg = predictands_cfg.get(var, {})
         scaling_cfg = var_cfg.get("scaling", {})
-        norm_cfg = var_cfg.get("normalization", {})
+        norm_cfg = var_cfg.get("normalization", {}) or {}
         # The active method comes from scaling.method (divide_only|zscore); fall
         # back to the normalization.method for older configs.
         method = scaling_cfg.get("method", norm_cfg.get("method", "zscore"))
@@ -403,36 +420,53 @@ def compute_scalars(
         mode = norm_cfg.get("mode", "global")
         eps = max(float(norm_cfg.get("eps_std", EPS)), EPS)
 
+        if mode == "gridpoint" and method == "divide_only":
+            raise ValueError(
+                f"Target '{var}' requests normalization.mode: gridpoint with "
+                f"scaling.method: divide_only, which is not supported. Keep "
+                f"divide_only variables (e.g. ppt) at normalization.mode: global, "
+                f"or switch to zscore for per-gridpoint targets."
+            )
+
         if method == "divide_only":
             # Divide-only channels (ppt): centre at 0, scale by the mean so the
             # model's get_scalers divide_only guard (target_mu == 0) holds.
             final_targets_mean[ch_idx] = 0.0
-            if mode == "gridpoint":
-                final_targets_std[ch_idx] = np.maximum(targets_grid_mean[ch_idx], eps)
-            else:
-                final_targets_std[ch_idx] = max(float(targets_mean[ch_idx]), eps)
-        else:  # zscore / standardize
-            if mode == "gridpoint":
-                final_targets_mean[ch_idx] = targets_grid_mean[ch_idx]
-                final_targets_std[ch_idx] = np.maximum(targets_grid_std[ch_idx], eps)
-            else:
-                final_targets_mean[ch_idx] = targets_mean[ch_idx]
-                final_targets_std[ch_idx] = max(float(targets_std[ch_idx]), eps)
+            final_targets_std[ch_idx] = max(float(targets_mean[ch_idx]), eps)
+        else:  # zscore / standardize -> per-channel global scalar
+            final_targets_mean[ch_idx] = targets_mean[ch_idx]
+            final_targets_std[ch_idx] = max(float(targets_std[ch_idx]), eps)
 
-    # If any variable is gridpoint, the saved arrays must be gridpoint-shaped so
-    # the model can broadcast per-pixel scalers; otherwise they stay (C,).
+        if mode == "gridpoint":
+            gridpoint_channels.append(ch_idx)
+
+    # If any target is per-gridpoint, promote the scalers to (C, H, W): broadcast
+    # every channel's resolved scalar across the grid, then overwrite the
+    # gridpoint channels with their native-resolution PRISM climatology. The
+    # climatology grid matches the (unstrided) PRISM domain because gridpoint
+    # targets forced scalar_stride == 1 above.
+    use_gridpoint = len(gridpoint_channels) > 0
     if use_gridpoint:
-        gp_mean = targets_grid_mean.copy()
-        gp_std = np.maximum(targets_grid_std.copy(), EPS)
-        for ch_idx, var in enumerate(target_variables):
-            # Broadcast the per-channel scalar resolved above across the grid for
-            # any channel that is NOT itself gridpoint (keeps shapes consistent).
-            mode = predictands_cfg.get(var, {}).get("normalization", {}).get("mode", "global")
-            if mode != "gridpoint":
-                gp_mean[ch_idx] = final_targets_mean[ch_idx]
-                gp_std[ch_idx] = final_targets_std[ch_idx]
-        final_targets_mean = gp_mean
-        final_targets_std = gp_std
+        H, W = int(targets_grid_mean.shape[1]), int(targets_grid_mean.shape[2])
+        c = final_targets_mean.shape[0]
+        gp_mean = np.broadcast_to(final_targets_mean.reshape(c, 1, 1), (c, H, W)).copy()
+        gp_std = np.broadcast_to(final_targets_std.reshape(c, 1, 1), (c, H, W)).copy()
+        for ch_idx in gridpoint_channels:
+            eps = max(
+                float(
+                    ((predictands_cfg.get(target_variables[ch_idx], {}) or {})
+                     .get("normalization", {}) or {}).get("eps_std", EPS)
+                ),
+                EPS,
+            )
+            gp_mean[ch_idx] = targets_grid_mean[ch_idx]
+            gp_std[ch_idx] = np.maximum(targets_grid_std[ch_idx], eps)
+        final_targets_mean = gp_mean.astype(np.float32)
+        final_targets_std = gp_std.astype(np.float32)
+        print(
+            f"[scalars] per-gridpoint target scalers active for channels "
+            f"{gridpoint_channels} -> targets_mean/std shape {final_targets_mean.shape}"
+        )
 
     # ------------------------------------------------------------------
     # Append validity-mask channel scalers. The dataset adds one binary mask
@@ -480,17 +514,37 @@ def main() -> None:
     cfg = load_yaml(args.config)
     data_cfg = cfg.get("data", {})
 
-    output_dir = args.output_dir or str(data_cfg.get("scalar_dir", "./examples/MERRA_PRISM/scalars"))
-    output_dir = str(resolve_path(output_dir))
+    if args.output_dir:
+        output_dir = str(resolve_path(args.output_dir))
+    else:
+        # Save per-channel scalers under the owning case_name so training and
+        # inference load exactly these files (single source of truth):
+        # <preprocessed_dir>/<case_name>/scalars.
+        output_dir = str(norm.resolve_scalar_dir(cfg, for_writing=True))
     os.makedirs(output_dir, exist_ok=True)
+
+    case_name = norm.get_case_name(cfg)
+    print(f"[scalars] Using case_name: {case_name}")
+    print(f"[scalars] Using preprocessing directory: {norm.case_preprocess_dir(cfg)}")
+    print(f"[scalars] Writing scalars to: {output_dir}")
 
     stats = compute_scalars(cfg, progress_interval=args.progress_interval)
 
-    # Save .npy files
+    # Save .npy files. Predictor scalers MUST stay per-channel [n_variables]
+    # (coarse fields -> a per-gridpoint predictor scaler bakes in blocks). Target
+    # scalers may be per-channel [C] OR per-gridpoint [C, lat, lon] -- native PRISM
+    # climatology for anomaly-style downscaling.
+    for key in ("inputs_mean", "inputs_std"):
+        norm.assert_predictor_channel_only(key, stats[key])
+    for key in ("targets_mean", "targets_std"):
+        norm.assert_valid_target_scaler(key, stats[key])
     for key in ("inputs_mean", "inputs_std", "targets_mean", "targets_std"):
         path = os.path.join(output_dir, f"{key}.npy")
         np.save(path, stats[key])
-        print(f"[scalars] saved {path}  shape={stats[key].shape}")
+        print(
+            f"[scalars] saved {path}  shape={stats[key].shape}  "
+            f"({norm.scaler_kind(stats[key])})"
+        )
 
     # Save metadata
     metadata = {
@@ -513,6 +567,21 @@ def main() -> None:
         json.dump(metadata, fh, indent=2)
 
     print(f"[scalars] metadata → {meta_path}")
+
+    # Provenance manifest (sha256 + shapes + training date range) so training
+    # and inference can assert they consumed byte-for-byte identical scalers.
+    try:
+        train_start, train_end = parse_date_range_from_config(cfg, "training")
+        train_range = [str(train_start), str(train_end)]
+    except Exception:
+        train_range = None
+    manifest_path = norm.write_manifest(
+        output_dir,
+        case_name=norm.get_case_name(cfg),
+        predictor_mode=str((cfg.get("normalization", {}) or {}).get("predictor_mode", "global")),
+        train_date_range=train_range,
+    )
+    print(f"[scalars] normalization manifest → {manifest_path}")
     print("[scalars] done.")
 
 

@@ -40,6 +40,8 @@ def main() -> None:
     config = get_config(config_path)
     print(f"[finetune] config={config_path}")
 
+    # Scaler wiring + case-context logging + missing-scaler guard live in
+    # run_training so the CLI and notebook paths behave identically.
     train_losses, val_losses = run_training(
         config=config,
         config_path=config_path,

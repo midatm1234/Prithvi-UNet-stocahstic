@@ -1,13 +1,13 @@
-"""Preprocess MERRA2 predictors and PRISM targets for the downscaling workflow.
+"""Preprocess MERRA2 predictors and optional PRISM targets for downscaling.
 
 Steps performed:
-  1. Read daily MERRA2 files and PRISM target files for the requested period.
-  2. Align predictor and target dates.
+  1. Read daily MERRA2 files and, when required, PRISM target files.
+  2. Align predictor and target dates for train/validation/evaluation outputs.
   3. Regrid / interpolate MERRA2 predictors to the PRISM target grid.
   4. Write preprocessed NetCDF files (one per date) to the output directory.
 
 Usage:
-    python preproc_merra_prism.py --config MERRA_PRISM.yaml [--mode training|inference]
+    python preproc_merra_prism.py --config MERRA_PRISM.yaml [--mode training|validation|inference]
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ except Exception:
 
 from merra_prism_utils import (
     align_dates,
-    case_output_dir,
     discover_all_prism_targets,
     discover_merra2_files,
     expand_predictor_variables,
@@ -44,6 +43,12 @@ from merra_prism_utils import (
     validate_dates_exist,
     validate_target_variables,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from granitewxc.utils import normalization as norm
 
 
 LAT_CANDIDATES = ("lat", "latitude", "y")
@@ -220,30 +225,93 @@ def _get_target_grid(
     raise RuntimeError("No PRISM target files found to extract grid")
 
 
+def _preprocess_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return cfg.get("preprocess", {}) or {}
+
+
+def _mode_saves_targets(cfg: Dict[str, Any], mode: str) -> bool:
+    pp_cfg = _preprocess_cfg(cfg)
+    if mode == "training":
+        return bool(pp_cfg.get("save_train_targets", True))
+    if mode == "validation":
+        return bool(pp_cfg.get("save_val_targets", True))
+    if mode == "inference":
+        return bool(
+            pp_cfg.get("save_inference_targets", False)
+            or pp_cfg.get("inference_include_observed_targets_for_eval", False)
+        )
+    raise ValueError(f"Unsupported preprocessing mode: {mode}")
+
+
+def _write_preprocessed_dataset(
+    out_file: Path,
+    *,
+    pred_arrays: Dict[str, np.ndarray],
+    tgt_arrays: Dict[str, np.ndarray],
+    elevation_arr: Optional[np.ndarray],
+    target_lat: np.ndarray,
+    target_lon: np.ndarray,
+    attrs: Dict[str, Any],
+) -> List[str]:
+    out_ds_vars: Dict[str, Any] = {}
+    for var, arr in pred_arrays.items():
+        out_ds_vars[f"predictor_{var}"] = (("lat", "lon"), arr)
+    for var, arr in tgt_arrays.items():
+        out_ds_vars[f"target_{var}"] = (("lat", "lon"), arr)
+    if elevation_arr is not None:
+        out_ds_vars["static_elevation"] = (("lat", "lon"), elevation_arr)
+
+    out_ds = xr.Dataset(
+        out_ds_vars,
+        coords={"lat": target_lat, "lon": target_lon},
+        attrs=attrs,
+    )
+    encoding = {
+        name: {"_FillValue": FILL_VALUE, "dtype": "float32"}
+        for name in out_ds_vars
+    }
+    out_ds.to_netcdf(str(out_file), encoding=encoding)
+    return list(out_ds_vars)
+
+
 def preprocess(
     cfg: Dict[str, Any],
     mode: str = "training",
     overwrite: bool = False,
 ) -> Path:
-    """Run the full preprocessing pipeline for *mode* (training | inference)."""
+    """Run preprocessing for *mode* (training | validation | inference)."""
     if xr is None:
         raise ImportError("xarray is required for preprocessing")
+    if mode not in {"training", "validation", "inference"}:
+        raise ValueError(f"Unsupported preprocessing mode: {mode}")
 
     data_cfg = cfg.get("data", {})
+    pp_cfg = _preprocess_cfg(cfg)
     predictor_dir = resolve_path(data_cfg["predictor_dir"])
     target_dir = resolve_path(data_cfg["target_dir"])
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
     predictor_variables = expand_predictor_variables(data_cfg.get("predictor_variables", {}))
     regrid_method: str = data_cfg.get("regrid_method", "bilinear")
+    include_targets = _mode_saves_targets(cfg, mode)
 
     case_name = get_case_name(cfg)
-    output_dir = case_output_dir(
-        resolve_path(data_cfg.get("preprocessed_dir", "./preprocessed")) / mode,
-        case_name,
-    )
+    # Case-scoped layout: <preprocessed_dir>/<case_name>/<mode>. Isolating by
+    # case ensures reruns for a different YAML/case never overwrite another
+    # case's normalized predictors/targets.
+    output_dir = norm.case_preprocess_dir(cfg) / mode
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[preproc] case_name={case_name}")
-    print(f"[preproc] output_dir={output_dir}")
+    print(f"[preproc] Using case_name: {case_name}")
+    print(f"[preproc] Using preprocessing directory: {norm.case_preprocess_dir(cfg)}")
+    print(f"[preproc] Writing {mode} outputs to: {output_dir}")
+    print(f"[preproc] target_variables={target_variables}")
+    print(
+        f"[preproc] include_targets={include_targets} "
+        f"(mode={mode}, save_train_targets={pp_cfg.get('save_train_targets', True)}, "
+        f"save_val_targets={pp_cfg.get('save_val_targets', True)}, "
+        f"save_inference_targets={pp_cfg.get('save_inference_targets', False)}, "
+        "inference_include_observed_targets_for_eval="
+        f"{pp_cfg.get('inference_include_observed_targets_for_eval', False)})"
+    )
 
     validate_target_variables(target_dir, target_variables)
 
@@ -341,23 +409,25 @@ def preprocess(
                 arr[np.isinf(arr)] = np.nan
                 pred_arrays[channel_name] = arr
 
-        # Read PRISM targets. PRISM is NaN over ocean / outside CONUS (~44%);
-        # preserve that so the loss can ignore those pixels. ppt keeps its real
-        # zeros (dry) which are distinct from NaN (missing).
+        # Read PRISM targets only for modes that need embedded truth. PRISM is
+        # NaN over ocean / outside CONUS (~44%); preserve that so the loss and
+        # optional evaluation can ignore those pixels. ppt keeps its real zeros
+        # (dry), distinct from NaN (missing).
         tgt_arrays: Dict[str, np.ndarray] = {}
-        for var in target_variables:
-            tgt_path = target_maps[var][sample_date]
-            with xr.open_dataset(str(tgt_path)) as ds_tgt:
-                dvar = _find_numeric_datavar(ds_tgt, tgt_path)
-                da = ds_tgt[dvar]
-                if "time" in da.dims:
-                    da = da.isel(time=0, drop=True)
-                arr = da.values.astype(np.float32)
-                lat_slice, lon_slice = target_slices
-                if arr.ndim >= 2:
-                    arr = arr[lat_slice, lon_slice]
-                arr[np.isinf(arr)] = np.nan
-                tgt_arrays[var] = arr
+        if include_targets:
+            for var in target_variables:
+                tgt_path = target_maps[var][sample_date]
+                with xr.open_dataset(str(tgt_path)) as ds_tgt:
+                    dvar = _find_numeric_datavar(ds_tgt, tgt_path)
+                    da = ds_tgt[dvar]
+                    if "time" in da.dims:
+                        da = da.isel(time=0, drop=True)
+                    arr = da.values.astype(np.float32)
+                    lat_slice, lon_slice = target_slices
+                    if arr.ndim >= 2:
+                        arr = arr[lat_slice, lon_slice]
+                    arr[np.isinf(arr)] = np.nan
+                    tgt_arrays[var] = arr
 
         # Diagnostics: confirm below-surface predictor cells stayed NaN and warn
         # if a pressure-level field collapsed to suspiciously many zeros (a sign
@@ -376,44 +446,46 @@ def preprocess(
                         f"    [preproc] WARNING: {channel_name} has 0 NaN but {n_zero} "
                         f"exact zeros — below-surface cells may have been zero-filled."
                     )
-            for var, arr in tgt_arrays.items():
-                _diagnose_field(f"target_{var}", None, arr)
+            if tgt_arrays:
+                for var, arr in tgt_arrays.items():
+                    _diagnose_field(f"target_{var}", None, arr)
+            else:
+                print("    [diag] targets omitted from this inference preprocessing file")
 
-        # Build output dataset
-        out_ds_vars: Dict[str, Any] = {}
-        for var, arr in pred_arrays.items():
-            out_ds_vars[f"predictor_{var}"] = (("lat", "lon"), arr)
-        for var, arr in tgt_arrays.items():
-            out_ds_vars[f"target_{var}"] = (("lat", "lon"), arr)
-        # Embed static elevation so each preprocessed file is self-contained
-        if elevation_arr is not None:
-            out_ds_vars["static_elevation"] = (("lat", "lon"), elevation_arr)
-
-        out_ds = xr.Dataset(
-            out_ds_vars,
-            coords={"lat": target_lat, "lon": target_lon},
+        saved_vars = _write_preprocessed_dataset(
+            out_file,
+            pred_arrays=pred_arrays,
+            tgt_arrays=tgt_arrays,
+            elevation_arr=elevation_arr,
+            target_lat=target_lat,
+            target_lon=target_lon,
             attrs={
                 "date": str(sample_date),
                 "source_merra2": str(merra_path),
                 "has_elevation": str(elevation_arr is not None),
                 "mode": mode,
+                "target_variables": ",".join(target_variables),
+                "predictor_channels": ",".join(pred_arrays.keys()),
+                "lag_offsets": "0",
+                "selected_levels": ",".join(
+                    f"{var}:{int(level)}" for var, level in predictor_variables
+                ),
+                "input_scaler": str(data_cfg.get("scalers", {}).get("inputs_mean", "")),
+                "target_scaler": str(data_cfg.get("scalers", {}).get("targets_mean", "")),
+                "contains_targets": str(bool(tgt_arrays)),
+                "targets_are_optional_evaluation_data": str(mode == "inference" and bool(tgt_arrays)),
                 "missing_value_note": (
                     "NaN marks missing data: pressure-level predictors below the "
-                    "surface over high terrain, and PRISM targets over ocean / "
-                    "outside CONUS. These are NOT physical zeros."
+                    "surface over high terrain. When target_* variables are present "
+                    "they are optional observed PRISM evaluation data, and target "
+                    "NaNs mark ocean / outside-CONUS cells. These are NOT physical zeros."
                 ),
             },
         )
-        # Preserve NaN explicitly via _FillValue / missing_value on every float
-        # field so the missing-data mask survives a NetCDF round-trip.
-        encoding = {
-            name: {"_FillValue": FILL_VALUE, "dtype": "float32"}
-            for name in out_ds_vars
-        }
-        out_ds.to_netcdf(str(out_file), encoding=encoding)
 
         if (i + 1) % 100 == 0 or i == 0:
             print(f"[preproc] processed {i + 1}/{len(aligned_dates)} dates")
+            print(f"[preproc] saved variables ({mode}): {saved_vars}")
 
     print(f"[preproc] {mode} preprocessing complete → {output_dir}")
     return output_dir
@@ -427,7 +499,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True, help="Path to MERRA_PRISM.yaml")
     parser.add_argument(
         "--mode",
-        choices=["training", "inference", "both"],
+        choices=["training", "validation", "inference", "both"],
         default="both",
         help="Which date range to preprocess",
     )
@@ -439,7 +511,14 @@ def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
 
-    modes = ["training", "inference"] if args.mode == "both" else [args.mode]
+    if args.mode == "both":
+        modes = ["training"]
+        validation = (cfg.get("dates") or {}).get("validation") or {}
+        if validation.get("start") and validation.get("end"):
+            modes.append("validation")
+        modes.append("inference")
+    else:
+        modes = [args.mode]
     for mode in modes:
         preprocess(cfg, mode=mode, overwrite=args.overwrite)
 
