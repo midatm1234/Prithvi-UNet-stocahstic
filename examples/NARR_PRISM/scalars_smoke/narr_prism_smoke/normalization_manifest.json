@@ -1,0 +1,39 @@
+{
+  "created_at": "2026-07-08T22:52:17.766291Z",
+  "case_name": "narr_prism_smoke",
+  "predictor_mode": "global",
+  "train_date_range": [
+    "2015-01-01",
+    "2015-01-06"
+  ],
+  "scalers": {
+    "inputs_mean": {
+      "shape": [
+        32
+      ],
+      "sha256": "a5344b63c531dc033f1c4af07cdc255ac326be058f7f2371554e39912f1526ff",
+      "n_channels": 32
+    },
+    "inputs_std": {
+      "shape": [
+        32
+      ],
+      "sha256": "0d401f7f6648ff2b1b3c234445a3405593a39296d2ab3d2dbc1ab757e550df36",
+      "n_channels": 32
+    },
+    "targets_mean": {
+      "shape": [
+        3
+      ],
+      "sha256": "5b0d3eef2b71d5404c45c30240792e4d29785ee57033f36f4d52367f4aefb748",
+      "n_channels": 3
+    },
+    "targets_std": {
+      "shape": [
+        3
+      ],
+      "sha256": "95a0a5ec7b53e708949b2d1401f18729b305a30ded1f51d7df4188a0be126d69",
+      "n_channels": 3
+    }
+  }
+}

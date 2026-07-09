@@ -51,6 +51,92 @@ def _reshape_output_scaler_tensor(name: str, tensor: torch.Tensor | None) -> tor
     )
 
 
+def _resolve_spatial_scalers(
+    name: str,
+    mu_full: torch.Tensor,
+    sigma_full: torch.Tensor,
+    reference: torch.Tensor,
+    scaler_offset: object | None = None,
+    *,
+    resize_mode: str = "bilinear",
+    align_corners: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return scaler tensors that align with ``reference`` spatial dimensions.
+
+    Scalers may be channel-only ``[1,C,1,1]`` or spatial ``[1,C,H,W]``. For
+    spatial scalers and cropped batches, ``scaler_offset`` can be ``(y, x)`` or
+    a batched ``[B,2]`` tensor/list so each sample receives the matching slice.
+    """
+    batch = int(reference.shape[0])
+    h, w = reference.shape[-2:]
+
+    if mu_full.shape[-2:] == (1, 1) and sigma_full.shape[-2:] == (1, 1):
+        return mu_full, sigma_full
+
+    if mu_full.shape[-2:] == (h, w) and sigma_full.shape[-2:] == (h, w):
+        return mu_full, sigma_full
+
+    def _offsets() -> list[tuple[int, int]]:
+        if scaler_offset is None:
+            return []
+        if torch.is_tensor(scaler_offset):
+            offset_tensor = scaler_offset.detach().cpu()
+            if offset_tensor.ndim == 1:
+                return [(int(offset_tensor[0].item()), int(offset_tensor[1].item()))]
+            return [
+                (int(row[0].item()), int(row[1].item()))
+                for row in offset_tensor.reshape(-1, 2)
+            ]
+        if isinstance(scaler_offset, (list, tuple)):
+            if len(scaler_offset) == 2 and not isinstance(scaler_offset[0], (list, tuple)):
+                return [(int(scaler_offset[0]), int(scaler_offset[1]))]
+            return [(int(row[0]), int(row[1])) for row in scaler_offset]
+        return []
+
+    offsets = _offsets()
+    if offsets:
+        if len(offsets) == 1 and batch > 1:
+            offsets = offsets * batch
+        if len(offsets) == batch:
+            mu_parts = []
+            sigma_parts = []
+            for y0, x0 in offsets:
+                y1, x1 = y0 + h, x0 + w
+                if (
+                    y0 < 0
+                    or x0 < 0
+                    or y1 > mu_full.shape[-2]
+                    or x1 > mu_full.shape[-1]
+                ):
+                    break
+                mu_parts.append(mu_full[..., y0:y1, x0:x1])
+                sigma_parts.append(sigma_full[..., y0:y1, x0:x1])
+            else:
+                return torch.cat(mu_parts, dim=0), torch.cat(sigma_parts, dim=0)
+
+    if resize_mode in {"bilinear", "bicubic"}:
+        return (
+            F.interpolate(
+                mu_full,
+                size=(h, w),
+                mode=resize_mode,
+                align_corners=align_corners,
+            ),
+            F.interpolate(
+                sigma_full,
+                size=(h, w),
+                mode=resize_mode,
+                align_corners=align_corners,
+            ),
+        )
+    if resize_mode not in {"nearest", "area"}:
+        raise ValueError(f"Unsupported {name} scaler resize mode: {resize_mode}")
+    return (
+        F.interpolate(mu_full, size=(h, w), mode=resize_mode),
+        F.interpolate(sigma_full, size=(h, w), mode=resize_mode),
+    )
+
+
 class ClimateECCCFinetuneWrapper(FinetuneWrapper):
     """ General purpose wrapper class to finetune using us configurable head and backbone """
 
@@ -231,10 +317,12 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
         # Input shape [batch, time x parameter, lat, lon]
         self.input_scalers_mu = torch.nn.Parameter(
-            input_scalers_mu.reshape(1, -1, 1, 1), requires_grad=False
+            _reshape_output_scaler_tensor("input_scalers_mu", input_scalers_mu),
+            requires_grad=False,
         )
         self.input_scalers_sigma = torch.nn.Parameter(
-            input_scalers_sigma.reshape(1, -1, 1, 1), requires_grad=False
+            _reshape_output_scaler_tensor("input_scalers_sigma", input_scalers_sigma),
+            requires_grad=False,
         )
         self.input_scalers_epsilon = input_scalers_epsilon
 
@@ -501,38 +589,32 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             mu_full = self.output_scalers_mu.to(device=constrained.device, dtype=constrained.dtype)
         else:
             mu_full = torch.zeros_like(sigma_full)
+        return _resolve_spatial_scalers(
+            "output",
+            mu_full,
+            sigma_full,
+            constrained,
+            scaler_offset=scaler_offset,
+            resize_mode=self.output_scaler_resize_mode,
+            align_corners=self.output_scaler_align_corners,
+        )
 
-        h, w = constrained.shape[-2:]
-        if sigma_full.shape[-2:] == (1, 1) or sigma_full.shape[-2:] == (h, w):
-            return mu_full, sigma_full
-
-        if scaler_offset is not None:
-            y0, x0 = int(scaler_offset[0]), int(scaler_offset[1])
-            y1, x1 = y0 + h, x0 + w
-            if 0 <= y0 and 0 <= x0 and y1 <= sigma_full.shape[-2] and x1 <= sigma_full.shape[-1]:
-                return (
-                    mu_full[..., y0:y1, x0:x1],
-                    sigma_full[..., y0:y1, x0:x1],
-                )
-
-        # Conservative fallback for mismatched grids.
-        if self.output_scaler_resize_mode in {"bilinear", "bicubic"}:
-            sigma = F.interpolate(
-                sigma_full,
-                size=(h, w),
-                mode=self.output_scaler_resize_mode,
-                align_corners=self.output_scaler_align_corners,
-            )
-            mu = F.interpolate(
-                mu_full,
-                size=(h, w),
-                mode=self.output_scaler_resize_mode,
-                align_corners=self.output_scaler_align_corners,
-            )
-        else:
-            sigma = F.interpolate(sigma_full, size=(h, w), mode=self.output_scaler_resize_mode)
-            mu = F.interpolate(mu_full, size=(h, w), mode=self.output_scaler_resize_mode)
-        return mu, sigma
+    def _resolve_input_scalers(
+        self,
+        reference: torch.Tensor,
+        scaler_offset: object | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mu_full = self.input_scalers_mu.to(device=reference.device, dtype=reference.dtype)
+        sigma_full = self.input_scalers_sigma.to(device=reference.device, dtype=reference.dtype)
+        return _resolve_spatial_scalers(
+            "input",
+            mu_full,
+            sigma_full,
+            reference,
+            scaler_offset=scaler_offset,
+            resize_mode=self.output_scaler_resize_mode,
+            align_corners=self.output_scaler_align_corners,
+        )
 
     def _decode_outputs(
         self,
@@ -651,8 +733,13 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         B, _, H, W = batch['x'].shape
         # Scale inputs
         x_sep_time = batch['x'].view(B, self.n_input_timestamps, -1, H, W) # [batch, time x parameter, lat, lon] -> [batch, time, parameter, lat, lon]
-        x_scale = (x_sep_time - self.input_scalers_mu.view(1, 1, -1, 1, 1)) / ( 
-                self.input_scalers_sigma.view(1, 1, -1, 1, 1) + self.input_scalers_epsilon)
+        scaler_offset = batch.get("__scaler_offset")
+        input_mu, input_sigma = self._resolve_input_scalers(
+            batch["x"],
+            scaler_offset=scaler_offset,
+        )
+        x_scale = (x_sep_time - input_mu.unsqueeze(1)) / (
+                input_sigma.unsqueeze(1) + self.input_scalers_epsilon)
         x = x_scale.view(B, -1, H, W) # [batch, time, parameter, lat, lon] -> [batch, time x parameter, lat, lon]
         use_static = self.use_static and self.embedding_static is not None
 
@@ -666,8 +753,8 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
             if self.residual == 'climate':
                 # Scale climatology
-                climate = (batch['climate_x'] - self.input_scalers_mu) / (
-                    self.input_scalers_sigma + self.input_scalers_epsilon
+                climate = (batch['climate_x'] - input_mu) / (
+                    input_sigma + self.input_scalers_epsilon
                 )
 
                 # concat with static in channels dimension
@@ -1165,37 +1252,32 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
             mu_full = self.output_scalers_mu.to(device=constrained.device, dtype=constrained.dtype)
         else:
             mu_full = torch.zeros_like(sigma_full)
+        return _resolve_spatial_scalers(
+            "output",
+            mu_full,
+            sigma_full,
+            constrained,
+            scaler_offset=scaler_offset,
+            resize_mode=self.output_scaler_resize_mode,
+            align_corners=self.output_scaler_align_corners,
+        )
 
-        h, w = constrained.shape[-2:]
-        if sigma_full.shape[-2:] == (1, 1) or sigma_full.shape[-2:] == (h, w):
-            return mu_full, sigma_full
-
-        if scaler_offset is not None:
-            y0, x0 = int(scaler_offset[0]), int(scaler_offset[1])
-            y1, x1 = y0 + h, x0 + w
-            if 0 <= y0 and 0 <= x0 and y1 <= sigma_full.shape[-2] and x1 <= sigma_full.shape[-1]:
-                return (
-                    mu_full[..., y0:y1, x0:x1],
-                    sigma_full[..., y0:y1, x0:x1],
-                )
-
-        if self.output_scaler_resize_mode in {"bilinear", "bicubic"}:
-            sigma = F.interpolate(
-                sigma_full,
-                size=(h, w),
-                mode=self.output_scaler_resize_mode,
-                align_corners=self.output_scaler_align_corners,
-            )
-            mu = F.interpolate(
-                mu_full,
-                size=(h, w),
-                mode=self.output_scaler_resize_mode,
-                align_corners=self.output_scaler_align_corners,
-            )
-        else:
-            sigma = F.interpolate(sigma_full, size=(h, w), mode=self.output_scaler_resize_mode)
-            mu = F.interpolate(mu_full, size=(h, w), mode=self.output_scaler_resize_mode)
-        return mu, sigma
+    def _resolve_input_scalers(
+        self,
+        reference: torch.Tensor,
+        scaler_offset: object | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mu_full = self.input_scalers_mu.to(device=reference.device, dtype=reference.dtype)
+        sigma_full = self.input_scalers_sigma.to(device=reference.device, dtype=reference.dtype)
+        return _resolve_spatial_scalers(
+            "input",
+            mu_full,
+            sigma_full,
+            reference,
+            scaler_offset=scaler_offset,
+            resize_mode=self.output_scaler_resize_mode,
+            align_corners=self.output_scaler_align_corners,
+        )
 
     def _decode_outputs(
         self,
@@ -1263,8 +1345,13 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
         B, _, H, W = batch['x'].shape
         # Scale inputs
         x_sep_time = batch['x'].view(B, self.n_input_timestamps, -1, H, W) # [batch, time x parameter, lat, lon] -> [batch, time, parameter, lat, lon]
-        x_scale = (x_sep_time - self.input_scalers_mu.view(1, 1, -1, 1, 1)) / ( 
-                self.input_scalers_sigma.view(1, 1, -1, 1, 1) + self.input_scalers_epsilon)
+        scaler_offset = batch.get("__scaler_offset")
+        input_mu, input_sigma = self._resolve_input_scalers(
+            batch["x"],
+            scaler_offset=scaler_offset,
+        )
+        x_scale = (x_sep_time - input_mu.unsqueeze(1)) / (
+                input_sigma.unsqueeze(1) + self.input_scalers_epsilon)
         x = x_scale.view(B, -1, H, W) # [batch, time, parameter, lat, lon] -> [batch, time x parameter, lat, lon]
 
         use_static = self.use_static and self.embedding_static is not None
@@ -1278,8 +1365,8 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
 
             if self.residual == 'climate':
                 # Scale climatology
-                climate = (batch['climate_x'] - self.input_scalers_mu) / (
-                    self.input_scalers_sigma + self.input_scalers_epsilon
+                climate = (batch['climate_x'] - input_mu) / (
+                    input_sigma + self.input_scalers_epsilon
                 )
 
                 # concat with static in channels dimension
@@ -1363,7 +1450,6 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
             x_out = self.output_scalers_sigma * x + batch['climate_y']
             x_pre_inverse = x
         else:
-            scaler_offset = batch.get("__scaler_offset")
             x_out, x_pre_inverse = self._decode_outputs(raw_out, scaler_offset=scaler_offset)
 
         if return_pre_inverse and return_raw_output:

@@ -129,6 +129,7 @@ data:
   downsample_factor: 8
   n_input_timestamps: 1
   regrid_method: bilinear
+  scalar_stride: 1
   spatial_subset:
     enabled: false
     lat_min: null
@@ -142,6 +143,11 @@ dates:
   inference:
     start: '2016-01-01'
     end: '2025-12-31'
+preprocess:
+  save_train_targets: true
+  save_val_targets: true
+  save_inference_targets: false
+  inference_include_observed_targets_for_eval: false
 normalization:
   predictor_method: standardize
   target_method: per_variable
@@ -368,8 +374,8 @@ inference:
   - 256
   - 256
   inference_overlap:
-  - 64
-  - 64
+  - 128
+  - 128
   inference_blend_window: hann
   inference_blend_sigma: 0.35
   force_full_frame: false

@@ -1,0 +1,48 @@
+{
+  "created_at": "2026-07-09T00:06:26.637932Z",
+  "case_name": "narr_prism_smoke_gp",
+  "predictor_mode": "global",
+  "target_mode": "spatial",
+  "train_date_range": [
+    "2015-01-01",
+    "2015-01-06"
+  ],
+  "scalers": {
+    "inputs_mean": {
+      "shape": [
+        32
+      ],
+      "sha256": "af834a980a0066779bc322d0e5c3f3571a246191f1d3c03c80b299840f9b4e58",
+      "n_channels": 32,
+      "kind": "channel"
+    },
+    "inputs_std": {
+      "shape": [
+        32
+      ],
+      "sha256": "3cf96a2e9258d5c90e1be5dd0d19212cb171e4bbbbc80d1336e09875eeae07c3",
+      "n_channels": 32,
+      "kind": "channel"
+    },
+    "targets_mean": {
+      "shape": [
+        3,
+        517,
+        517
+      ],
+      "sha256": "a87f29bf5ec365f97d1a740236fcf45ffa38d46f0fd882d381d2395f95f38812",
+      "n_channels": 3,
+      "kind": "spatial"
+    },
+    "targets_std": {
+      "shape": [
+        3,
+        517,
+        517
+      ],
+      "sha256": "eed38f3ca5a6f0cd5ca154a9c69620aabdcf8ca7cddf62cdced3f14c30a7d4e9",
+      "n_channels": 3,
+      "kind": "spatial"
+    }
+  }
+}

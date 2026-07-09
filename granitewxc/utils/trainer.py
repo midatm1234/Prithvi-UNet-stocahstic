@@ -8,7 +8,7 @@ import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
 from torch import autocast
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from time import time
 
 from granitewxc.utils.distributed import is_main_process
@@ -34,6 +34,26 @@ def _to_scalar(value):
             return value.detach().cpu().item()
         return value.detach().cpu().float().mean().item()
     return value
+
+
+def _loader_step_count(loader: DataLoader, limit_steps: int = 0) -> int:
+    if 0 < limit_steps:
+        return min(int(limit_steps), len(loader))
+    return len(loader)
+
+
+def _make_epoch_pbar(desc: str, total: int, colour: str):
+    if not is_main_process():
+        return None
+    return tqdm(
+        total=total,
+        unit="batch",
+        colour=colour,
+        desc=desc,
+        dynamic_ncols=True,
+        leave=True,
+        position=0,
+    )
 
 
 def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device | int):
@@ -216,6 +236,64 @@ def _collect_checkpoint_states(
     return model_state, optimizer_state
 
 
+def _fsdp_root_module(model: torch.nn.Module):
+    if TorchFSDP is None:
+        return None
+    for candidate in _iter_wrapped_modules(model):
+        if isinstance(candidate, TorchFSDP):
+            return candidate
+    return None
+
+
+def _restore_checkpoint_states(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+    model_state: dict,
+    optimizer_state: dict | None,
+) -> None:
+    """
+    Load model/optimizer states saved by :func:`_collect_checkpoint_states`.
+
+    Checkpoints for FSDP models are stored as FULL_STATE_DICT (unsharded).
+    The optimizer state in particular must be re-sharded to match the local
+    flat parameters via ``FSDP.optim_state_dict_to_load`` before it can be
+    loaded; a plain ``optimizer.load_state_dict`` would install full-size
+    momentum buffers that mismatch the sharded gradients at ``optimizer.step``.
+    """
+    fsdp_root = None
+    if (
+        TorchFSDP is not None
+        and StateDictType is not None
+        and FullStateDictConfig is not None
+        and _checkpoint_requires_all_ranks(model)
+    ):
+        fsdp_root = _fsdp_root_module(model)
+
+    if fsdp_root is not None:
+        full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        if FullOptimStateDictConfig is not None:
+            full_optim_cfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=False)
+            state_dict_ctx = TorchFSDP.state_dict_type(
+                fsdp_root, StateDictType.FULL_STATE_DICT, full_cfg, full_optim_cfg,
+            )
+        else:
+            state_dict_ctx = TorchFSDP.state_dict_type(
+                fsdp_root, StateDictType.FULL_STATE_DICT, full_cfg,
+            )
+        with state_dict_ctx:
+            model.load_state_dict(model_state, strict=True)
+            if optimizer is not None and optimizer_state is not None:
+                sharded_optimizer_state = TorchFSDP.optim_state_dict_to_load(
+                    model, optimizer, optimizer_state,
+                )
+                optimizer.load_state_dict(sharded_optimizer_state)
+        return
+
+    model.load_state_dict(model_state, strict=True)
+    if optimizer is not None and optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+
+
 def _inject_precip_hurdle_aux(batch: Dict[str, torch.Tensor], model: torch.nn.Module) -> None:
     """
     Ensure hurdle aux tensors are present on the caller batch, even when wrappers
@@ -282,13 +360,12 @@ def validate_one_epoch(
     elif dist.is_available() and dist.is_initialized():
         print('WARNING: Not calling set_epoch.')
 
-    if is_main_process():
-        inner_pbar = tqdm(
-            range(min(limit_steps, len(validation_loader))),
-            unit='batch',
-            colour="green",
-            desc="Validation Epoch",
-        )
+    max_steps = _loader_step_count(validation_loader, limit_steps)
+    inner_pbar = _make_epoch_pbar(
+        desc=f"Validation {epoch + 1}",
+        total=max_steps,
+        colour="green",
+    )
 
     # Inference mode further reduces autograd metadata/memory compared to no_grad.
     with torch.inference_mode():
@@ -310,7 +387,7 @@ def validate_one_epoch(
             ddp_loss[0] += loss.item()  # sum up batch loss
             ddp_loss[1] += 1
 
-            if is_main_process():
+            if inner_pbar is not None:
                 inner_pbar.update(1)
                 inner_pbar.set_postfix(loss=loss.item())
 
@@ -326,7 +403,7 @@ def validate_one_epoch(
         dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
     val_loss = ddp_loss[0] / max(ddp_loss[1], 1)
 
-    if is_main_process():
+    if inner_pbar is not None:
         inner_pbar.close()
 
     metrics = {
@@ -382,11 +459,10 @@ def train_one_epoch(
         else:
             num_epochs = 0
 
-        inner_pbar = tqdm(
-            range(min(limit_steps, len(train_loader))),
-            unit="batch",
+        inner_pbar = _make_epoch_pbar(
+            desc=f"Epoch {epoch + 1}/{num_epochs}",
+            total=_loader_step_count(train_loader, limit_steps),
             colour="blue",
-            desc=f"Training Epoch {epoch+1}/{num_epochs}",
         )
 
     benchmark_timer, benchmark_timer_total = time(), time()
@@ -395,7 +471,7 @@ def train_one_epoch(
     accumulation_steps = max(1, int(kwargs.get("gradient_accumulation_steps", 1)))
     max_grad_norm = float(kwargs.get("max_grad_norm", 0.0) or 0.0)
     optimizer_steps = 0
-    max_steps = min(limit_steps, len(train_loader)) if 0 < limit_steps else len(train_loader)
+    max_steps = _loader_step_count(train_loader, limit_steps)
     optimizer.zero_grad(set_to_none=True)
 
     for i, batch in enumerate(train_loader):
@@ -460,7 +536,7 @@ def train_one_epoch(
         ddp_loss[0] += loss.item()
         ddp_loss[1] += 1
 
-        if is_main_process():
+        if inner_pbar is not None:
             postfix = {"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"]}
             if hasattr(loss_func, "get_last_terms"):
                 last_terms = loss_func.get_last_terms()
@@ -482,7 +558,7 @@ def train_one_epoch(
         dist.all_reduce(node_count, op=dist.ReduceOp.SUM)
     train_loss = ddp_loss[0] / max(ddp_loss[1], 1)
 
-    if is_main_process():
+    if inner_pbar is not None:
         inner_pbar.close()
 
     metrics = {
@@ -635,20 +711,30 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
             raise ValueError(
                 "Checkpoint does not contain a valid model state dictionary under key 'model'."
             )
-        model.load_state_dict(model_state, strict=True)
 
         optimizer_state = checkpoint.get("optimizer")
-        if optimizer_state is not None:
-            try:
-                optimizer.load_state_dict(optimizer_state)
-                if use_gpu and torch.cuda.is_available():
-                    _move_optimizer_state_to_device(optimizer, local_rank)
-            except Exception as exc:
-                if is_main_process():
-                    print(
-                        "[resume] warning: failed to restore optimizer state; "
-                        f"continuing with initialized optimizer ({exc})"
-                    )
+        try:
+            _restore_checkpoint_states(model, optimizer, model_state, optimizer_state)
+            if optimizer_state is not None and use_gpu and torch.cuda.is_available():
+                _move_optimizer_state_to_device(optimizer, local_rank)
+        except Exception as exc:
+            if is_main_process():
+                print(
+                    "[resume] warning: FSDP-aware restore failed; falling back to "
+                    f"plain state-dict load ({exc})"
+                )
+            model.load_state_dict(model_state, strict=True)
+            if optimizer_state is not None:
+                try:
+                    optimizer.load_state_dict(optimizer_state)
+                    if use_gpu and torch.cuda.is_available():
+                        _move_optimizer_state_to_device(optimizer, local_rank)
+                except Exception as opt_exc:
+                    if is_main_process():
+                        print(
+                            "[resume] warning: failed to restore optimizer state; "
+                            f"continuing with initialized optimizer ({opt_exc})"
+                        )
 
         scheduler_state = checkpoint.get("scheduler")
         if scheduler is not None and scheduler_state is not None:

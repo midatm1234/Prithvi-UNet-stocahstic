@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""CLI entry-point for MERRA2-to-PRISM fine-tuning.
+"""CLI entry-point for NARR-to-PRISM fine-tuning.
 
 Usage:
-    python merra_prism_finetune.py --config MERRA_PRISM.yaml [--num-gpus 1] [--save-every 5]
+    python narr_prism_finetune.py --config NARR_PRISM.yaml [--num-gpus 1] [--save-every 5]
 """
 
 from __future__ import annotations
@@ -18,15 +18,15 @@ if str(REPO_ROOT) not in sys.path:
 from granitewxc.utils.config import get_config
 from granitewxc.utils.normalization import apply_scalar_paths, log_scalar_summary
 
-from merra_prism_training import run_training
+from narr_prism_training import run_training
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run MERRA-PRISM fine-tuning (single-GPU or multi-GPU).",
+        description="Run NARR-PRISM fine-tuning (single-GPU or multi-GPU).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", required=True, help="Path to MERRA_PRISM YAML config.")
+    parser.add_argument("--config", required=True, help="Path to NARR_PRISM YAML config.")
     parser.add_argument(
         "--num-gpus", type=int, default=None,
         help="Number of GPUs (default: from YAML or 1).",

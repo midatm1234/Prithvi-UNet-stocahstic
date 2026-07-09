@@ -1,0 +1,48 @@
+{
+  "created_at": "2026-07-09T00:00:36.308834Z",
+  "case_name": "merra_prism_smoke_gp",
+  "predictor_mode": "global",
+  "target_mode": "spatial",
+  "train_date_range": [
+    "2015-01-01",
+    "2015-01-06"
+  ],
+  "scalers": {
+    "inputs_mean": {
+      "shape": [
+        26
+      ],
+      "sha256": "05fdcf3175a6e9cd154038652c89525e799caedfa76ce3706332e7f2a2773e50",
+      "n_channels": 26,
+      "kind": "channel"
+    },
+    "inputs_std": {
+      "shape": [
+        26
+      ],
+      "sha256": "a4fe2fe6c4bed6e0df11dfa5c3b3a3f258634a02de2a09a6f04f0eb66fb20a8c",
+      "n_channels": 26,
+      "kind": "channel"
+    },
+    "targets_mean": {
+      "shape": [
+        3,
+        517,
+        517
+      ],
+      "sha256": "a87f29bf5ec365f97d1a740236fcf45ffa38d46f0fd882d381d2395f95f38812",
+      "n_channels": 3,
+      "kind": "spatial"
+    },
+    "targets_std": {
+      "shape": [
+        3,
+        517,
+        517
+      ],
+      "sha256": "eed38f3ca5a6f0cd5ca154a9c69620aabdcf8ca7cddf62cdced3f14c30a7d4e9",
+      "n_channels": 3,
+      "kind": "spatial"
+    }
+  }
+}

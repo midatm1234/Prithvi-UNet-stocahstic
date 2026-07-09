@@ -1,10 +1,10 @@
-"""Training utilities for the MERRA2-to-PRISM downscaling model.
+"""Training utilities for the NARR-to-PRISM downscaling model.
 
 Closely mirrors the CORDEX_ML training logic but loads data through
-the MERRA_PRISM dataset and uses the MERRA_PRISM YAML configuration.
+the NARR_PRISM dataset and uses the NARR_PRISM YAML configuration.
 
-Usage (via merra_prism_finetune.py):
-    python merra_prism_finetune.py --config MERRA_PRISM.yaml
+Usage (via narr_prism_finetune.py):
+    python narr_prism_finetune.py --config NARR_PRISM.yaml
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from merra_prism_dataset import MerraPrismDataset
+from narr_prism_dataset import NarrPrismDataset
 
 try:
     from granitewxc.models.loss import build_loss_fn, rmse_loss
@@ -54,7 +54,7 @@ from granitewxc.utils.config import ExperimentConfig, get_config
 from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.distributed import init_ddp
 from granitewxc.utils.trainer import train_model
-from merra_prism_utils import case_output_dir, get_case_name
+from narr_prism_utils import case_output_dir, get_case_name
 
 try:
     from torch.distributed.fsdp import (
@@ -145,7 +145,7 @@ def _wrap_fsdp(model: torch.nn.Module, local_rank: int, config: ExperimentConfig
 # ---------------------------------------------------------------------------
 
 class _WrappedDataset(torch.utils.data.Dataset):
-    """Adapt MerraPrismDataset output dict to the model's expected format.
+    """Adapt NarrPrismDataset output dict to the model's expected format.
 
     Pads the input ``x`` spatial dimensions to the nearest multiple of
     ``mask_unit_size × patch_size`` (default 32) so the Prithvi backbone
@@ -160,7 +160,7 @@ class _WrappedDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        base: MerraPrismDataset,
+        base: NarrPrismDataset,
         num_static_channels: int = 0,
         pad_multiple: int = 32,
     ) -> None:
@@ -198,9 +198,14 @@ class _WrappedDataset(torch.utils.data.Dataset):
                 "y": sample["y"],
                 "static_x": self._pad_to_multiple(static_x),
                 "static_y": self._static_y,
+                "__scaler_offset": sample["__scaler_offset"],
             }
 
-        return {"x": self._pad_to_multiple(x_full), "y": sample["y"]}
+        return {
+            "x": self._pad_to_multiple(x_full),
+            "y": sample["y"],
+            "__scaler_offset": sample["__scaler_offset"],
+        }
 
 
 def _build_dataloader(
@@ -213,7 +218,7 @@ def _build_dataloader(
     rank: int,
     world_size: int,
 ) -> DataLoader:
-    base = MerraPrismDataset(config_path, mode=mode)
+    base = NarrPrismDataset(config_path, mode=mode)
     num_static = int(getattr(getattr(config, "model", object()), "num_static_channels", 0))
     # Compute required padding multiple: mask_unit_size × patch_size
     mask_unit = getattr(config, "mask_unit_size", [16, 16])
@@ -292,7 +297,7 @@ def load_pretrained_weights(model: torch.nn.Module, weights_path: str) -> Tuple[
 
 def create_finetune_model(config: ExperimentConfig, verbose: bool = True) -> torch.nn.Module:
     # Safety guards for fields that must exist before calling get_finetune_model_UNET.
-    # These are normally provided by MERRA_PRISM.yaml but we guard here for robustness.
+    # These are normally provided by NARR_PRISM.yaml but we guard here for robustness.
     for attr in ("input_static_surface_vars", "input_surface_vars", "other",
                  "vertical_level1_vars", "input_level1",
                  "vertical_level2_vars", "input_level2"):

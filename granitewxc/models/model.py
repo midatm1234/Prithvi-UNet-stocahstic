@@ -65,7 +65,7 @@ def get_scalers(config: ExperimentConfig):
         target_sigma = torch.load(config.model.target_sigma, map_location=device, weights_only=False)
         target_static_mu = torch.load(config.model.target_static_mu, map_location=device, weights_only=False)
         target_static_sigma = torch.load(config.model.target_static_sigma, map_location=device, weights_only=False)
-    elif config.data.type in ('cordex', 'merra_prism'):
+    elif config.data.type in ('cordex', 'merra_prism', 'narr_prism'):
         specs = build_predictand_specs(config, output_vars=list(config.data.output_vars))
 
         def load_array(path: str) -> torch.Tensor:
@@ -235,7 +235,7 @@ def get_finetune_model_UNET(config: ExperimentConfig) -> torch.nn.Module:
     #########################################################
     # 1. Patch Embedding/Shallow Feature Extraction
     #########################################################
-    if config.data.type in ('eccc', 'cordex', 'merra_prism'):  # eccc + cordex + merra_prism share embedding setup
+    if config.data.type in ('eccc', 'cordex', 'merra_prism', 'narr_prism'):  # eccc + cordex + prism workflows share embedding setup
         embedding, embedding_static = get_eccc_embedding_module(config)
     else:
         raise ValueError(f'{config.data.type} is not a valid config.data.type')
@@ -328,7 +328,7 @@ def get_finetune_model(config: ExperimentConfig) -> torch.nn.Module:
     #########################################################
     # 1. Patch Embedding/Shallow Feature Extraction
     #########################################################
-    if config.data.type in ('eccc', 'cordex', 'merra_prism'):  # eccc + cordex + merra_prism share embedding setup
+    if config.data.type in ('eccc', 'cordex', 'merra_prism', 'narr_prism'):  # eccc + cordex + prism workflows share embedding setup
         embedding, embedding_static = get_eccc_embedding_module(config)
     else:
         raise ValueError(f'{config.data.type} is not a valid config.data.type')

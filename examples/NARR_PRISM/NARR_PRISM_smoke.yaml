@@ -1,102 +1,102 @@
 data:
-  type: merra_prism
-  predictor_dir: /data/merra2/daily_subset_with_H
+  type: narr_prism
+  predictor_dir: /data2/NARR/data/subset
   target_dir: /data/PRISM/prism_daily_800m_an
   target_variables:
   - ppt
   - tmax
   - tmin
   predictor_variables:
-    QV:
+    shum:
     - 500
     - 700
     - 850
-    U:
+    uwnd:
     - 500
     - 700
     - 850
-    V:
+    vwnd:
     - 500
     - 700
     - 850
-    T:
+    air:
     - 500
     - 700
     - 850
-    H:
+    hgt:
     - 500
     - 700
     - 850
-  static_elevation_file: ./examples/MERRA_PRISM/prism_elevation.nc
+  static_elevation_file: ./examples/NARR_PRISM/prism_elevation.nc
   static_elevation_var: null
   input_vars:
-  - QV_500
-  - QV_700
-  - QV_850
-  - U_500
-  - U_700
-  - U_850
-  - V_500
-  - V_700
-  - V_850
-  - T_500
-  - T_700
-  - T_850
-  - H_500
-  - H_700
-  - H_850
+  - shum_500
+  - shum_700
+  - shum_850
+  - uwnd_500
+  - uwnd_700
+  - uwnd_850
+  - vwnd_500
+  - vwnd_700
+  - vwnd_850
+  - air_500
+  - air_700
+  - air_850
+  - hgt_500
+  - hgt_700
+  - hgt_850
   - elev
-  - mask_QV_500
-  - mask_QV_700
-  - mask_QV_850
-  - mask_U_500
-  - mask_U_700
-  - mask_U_850
-  - mask_V_500
-  - mask_V_700
-  - mask_V_850
-  - mask_T_500
-  - mask_T_700
-  - mask_T_850
-  - mask_H_500
-  - mask_H_700
-  - mask_H_850
+  - mask_shum_500
+  - mask_shum_700
+  - mask_shum_850
+  - mask_uwnd_500
+  - mask_uwnd_700
+  - mask_uwnd_850
+  - mask_vwnd_500
+  - mask_vwnd_700
+  - mask_vwnd_850
+  - mask_air_500
+  - mask_air_700
+  - mask_air_850
+  - mask_hgt_500
+  - mask_hgt_700
+  - mask_hgt_850
   - mask_elev
   input_levels:
   - 1
   input_surface_vars: []
   vertical_pres_vars:
-  - QV_500
-  - QV_700
-  - QV_850
-  - U_500
-  - U_700
-  - U_850
-  - V_500
-  - V_700
-  - V_850
-  - T_500
-  - T_700
-  - T_850
-  - H_500
-  - H_700
-  - H_850
+  - shum_500
+  - shum_700
+  - shum_850
+  - uwnd_500
+  - uwnd_700
+  - uwnd_850
+  - vwnd_500
+  - vwnd_700
+  - vwnd_850
+  - air_500
+  - air_700
+  - air_850
+  - hgt_500
+  - hgt_700
+  - hgt_850
   - elev
-  - mask_QV_500
-  - mask_QV_700
-  - mask_QV_850
-  - mask_U_500
-  - mask_U_700
-  - mask_U_850
-  - mask_V_500
-  - mask_V_700
-  - mask_V_850
-  - mask_T_500
-  - mask_T_700
-  - mask_T_850
-  - mask_H_500
-  - mask_H_700
-  - mask_H_850
+  - mask_shum_500
+  - mask_shum_700
+  - mask_shum_850
+  - mask_uwnd_500
+  - mask_uwnd_700
+  - mask_uwnd_850
+  - mask_vwnd_500
+  - mask_vwnd_700
+  - mask_vwnd_850
+  - mask_air_500
+  - mask_air_700
+  - mask_air_850
+  - mask_hgt_500
+  - mask_hgt_700
+  - mask_hgt_850
   - mask_elev
   input_level_pres:
   - 1
@@ -110,47 +110,47 @@ data:
   - tmax
   - tmin
   use_static: false
-  preprocessed_dir: ./examples/MERRA_PRISM/preprocessed
-  scalar_dir: ./examples/MERRA_PRISM/scalars_with_H
+  preprocessed_dir: ./examples/NARR_PRISM/preprocessed
+  scalar_dir: ./examples/NARR_PRISM/scalars_smoke
   scalers:
-    inputs_mean: ./examples/MERRA_PRISM/scalars_with_H/inputs_mean.npy
-    inputs_std: ./examples/MERRA_PRISM/scalars_with_H/inputs_std.npy
-    targets_mean: ./examples/MERRA_PRISM/scalars_with_H/targets_mean.npy
-    targets_std: ./examples/MERRA_PRISM/scalars_with_H/targets_std.npy
-  # Full-domain coverage via deterministic fixed-size spatial tiles.
-  # Edge tiles are shifted inward so every sample remains 256x256.
-  train_crop_size_lat: 256
-  train_crop_size_lon: 256
-  training_spatial_sampling: tiled
-  training_tile_stride_lat: 256
-  training_tile_stride_lon: 256
-  min_valid_target_fraction: 1.0e-04
+    inputs_mean: ./examples/NARR_PRISM/scalars_with_H/inputs_mean.npy
+    inputs_std: ./examples/NARR_PRISM/scalars_with_H/inputs_std.npy
+    targets_mean: ./examples/NARR_PRISM/scalars_with_H/targets_mean.npy
+    targets_std: ./examples/NARR_PRISM/scalars_with_H/targets_std.npy
+  input_size_lat: 16
+  input_size_lon: 16
+  target_size_lat: 128
+  target_size_lon: 128
+  train_crop_size_lat: 128
+  train_crop_size_lon: 128
+  min_valid_target_fraction: 0.0001
   max_crop_retries: 32
   skip_empty_target_tiles: true
+  downsample_factor: 8
   n_input_timestamps: 1
   regrid_method: bilinear
-  # Required for per-gridpoint target normalization (tmax/tmin mode=gridpoint):
-  # compute full-resolution target climatology instead of strided/coarse scalers.
-  scalar_stride: 1
+  scalar_stride: 16
   spatial_subset:
     enabled: true
-    # Edit these inclusive bounds to choose the training/inference subdomain.
-    # PRISM grid range in this dataset is roughly:
-    #   latitude  24.07 .. 49.93
-    #   longitude -125.02 .. -66.48
-    lat_min: 32.55
-    lat_max: 41.075
-    lon_min: -124.45
-    lon_max: -115.925
+    lat_min: 35.0
+    lat_max: 39.3
+    lon_min: -124.0
+    lon_max: -119.7
+  scalars:
+    inputs_mean: ./examples/NARR_PRISM/scalars_smoke/narr_prism_smoke/inputs_mean.npy
+    inputs_std: ./examples/NARR_PRISM/scalars_smoke/narr_prism_smoke/inputs_std.npy
+    targets_mean: ./examples/NARR_PRISM/scalars_smoke/narr_prism_smoke/targets_mean.npy
+    targets_std: ./examples/NARR_PRISM/scalars_smoke/narr_prism_smoke/targets_std.npy
 dates:
   training:
-    start: '1996-01-01'
-    end: '2015-12-31'
+    start: '2015-01-01'
+    end: '2015-01-06'
   inference:
-    start: '2016-01-01'
-    end: '2025-12-31'
+    start: '2016-01-03'
+    end: '2016-01-03'
 normalization:
   predictor_method: standardize
+  predictor_mode: global
   target_method: per_variable
 predictands:
   ppt:
@@ -180,7 +180,7 @@ predictands:
       fixed_scale: null
     normalization:
       method: standardize
-      mode: gridpoint
+      mode: global
       eps_std: 1.0e-06
   tmin:
     name: tmin
@@ -194,13 +194,13 @@ predictands:
       fixed_scale: null
     normalization:
       method: standardize
-      mode: gridpoint
+      mode: global
       eps_std: 1.0e-06
 model:
-  input_mu: ./examples/MERRA_PRISM/scalars_with_H/inputs_mean.npy
-  input_sigma: ./examples/MERRA_PRISM/scalars_with_H/inputs_std.npy
-  target_mu: ./examples/MERRA_PRISM/scalars_with_H/targets_mean.npy
-  target_sigma: ./examples/MERRA_PRISM/scalars_with_H/targets_std.npy
+  input_mu: ./examples/NARR_PRISM/scalars_smoke/narr_prism_smoke/inputs_mean.npy
+  input_sigma: ./examples/NARR_PRISM/scalars_smoke/narr_prism_smoke/inputs_std.npy
+  target_mu: ./examples/NARR_PRISM/scalars_smoke/narr_prism_smoke/targets_mean.npy
+  target_sigma: ./examples/NARR_PRISM/scalars_smoke/narr_prism_smoke/targets_std.npy
   embed_dim: 1024
   n_blocks_encoder: 8
   mlp_multiplier: 4
@@ -236,29 +236,29 @@ model:
   - 3
   - 3
   - 3
-job_id: MERRA_PRISM
-case_name: merra_prism_California
+job_id: NARR_PRISM
+case_name: narr_prism_smoke
 type_training: full_dataset
 batch_size: 1
-num_epochs: 20
+num_epochs: 1
 dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 1.0e-05
 max_grad_norm: 1.0
-limit_steps_train: 100000
-limit_steps_valid: 100
+limit_steps_train: 6
+limit_steps_valid: 2
 min_lr: 1.0e-06
 max_lr: 0.0001
 warm_up_steps: 0
 mask_unit_size:
-- 16
-- 16
+- 8
+- 8
 mask_ratio_inputs: 0.0
 mask_ratio_targets: 0.0
 max_batch_size: 4
-path_experiment: ./examples/MERRA_PRISM/experiments
-checkpoint_dir: ./examples/MERRA_PRISM/experiments/checkpoints
-run_dir: ./examples/MERRA_PRISM/experiments/runs
+path_experiment: ./examples/NARR_PRISM/experiments
+checkpoint_dir: ./examples/NARR_PRISM/experiments/checkpoints
+run_dir: ./examples/NARR_PRISM/experiments/runs
 path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET.pt
 backbone_use: true
 backbone_freeze: false
@@ -266,18 +266,18 @@ backbone_prefix: encoder.
 finetune_w_static: false
 strict_matching: false
 device_target: cuda
-distributed_strategy: fsdp
+distributed_strategy: none
 fsdp_precision: bf16
 fsdp_min_num_params: 5000000
 backbone_gradient_checkpointing: true
 skip_activation_offload: true
 training:
-  distributed: fsdp
-  num_gpus: 2
+  distributed: none
+  num_gpus: 1
   per_device_batch_size: 1
-  gradient_accumulation_steps: 32
+  gradient_accumulation_steps: 16
   auto_resume_if_checkpoint_exists: false
-gradient_accumulation_steps: 32
+gradient_accumulation_steps: 16
 loss:
   base: rmse
   predictands:
@@ -349,7 +349,7 @@ loss:
     match_target: true
 inference:
   checkpoint_path: null
-  output_dir: ./examples/MERRA_PRISM/experiments/inference_output
+  output_dir: ./examples/NARR_PRISM/experiments/inference_output
   mixed_precision: true
   mixed_precision_dtype: bfloat16
   boundary_mitigation:
@@ -372,8 +372,8 @@ inference:
     use_seam_deblocking: false
     seam_deblocking_strength: 0.1
   inference_tile_size:
-  - 256
-  - 256
+  - 128
+  - 128
   inference_overlap:
   - 64
   - 64
@@ -390,4 +390,4 @@ precip_lambda_amount: 1.0
 precip_amount_loss_type: smoothl1
 resume_training: false
 resume_checkpoint_path: null
-auto_resume_if_checkpoint_exists: true
+auto_resume_if_checkpoint_exists: false

@@ -1,10 +1,10 @@
-"""Inference for the MERRA2-to-PRISM downscaling model.
+"""Inference for the NARR-to-PRISM downscaling model.
 
 Loads a trained checkpoint, runs prediction over the YAML-defined inference
 date range, denormalizes outputs, and writes NetCDF files.
 
 Usage:
-    python merra_prism_inference.py --config MERRA_PRISM.yaml [--checkpoint path/to/best.ckpt]
+    python narr_prism_inference.py --config NARR_PRISM.yaml [--checkpoint path/to/best.ckpt]
 """
 
 from __future__ import annotations
@@ -50,8 +50,8 @@ from granitewxc.utils.normalization import (
     targets_are_spatial,
 )
 
-from merra_prism_dataset import MerraPrismDataset
-from merra_prism_utils import (
+from narr_prism_dataset import NarrPrismDataset
+from narr_prism_utils import (
     case_output_dir,
     expand_predictor_variables,
     get_case_name,
@@ -495,7 +495,7 @@ def _open_streaming_output(
         # tmax/tmin are degC, ppt is mm/day; default to "" for unknown vars.
         out_var.units = VAR_UNITS.get(var, "")
 
-    nc.description = "MERRA2-to-PRISM downscaling inference output"
+    nc.description = "NARR-to-PRISM downscaling inference output"
     nc.case_name = case_name
     nc.checkpoint = checkpoint_path
     nc.inference_start = str(inference_dates[0])
@@ -568,8 +568,8 @@ def run_inference(
     )
 
     # Co-registered, raw-physical dataset (same class used for training). It
-    # regrids MERRA2 onto the PRISM grid on the fly and exposes the fine grid.
-    dataset = MerraPrismDataset(config_path, mode="inference")
+    # regrids NARR onto the PRISM grid on the fly and exposes the fine grid.
+    dataset = NarrPrismDataset(config_path, mode="inference")
     all_inference_dates = dataset.dates
     if date_shard_count < 1:
         raise ValueError("date_shard_count must be >= 1")
@@ -682,7 +682,7 @@ def run_inference(
         date_iter = tqdm(
             list(enumerate(inference_dates)),
             total=len(inference_dates),
-            desc="MERRA-PRISM inference (days)",
+            desc="NARR-PRISM inference (days)",
             unit="day",
         )
 
@@ -732,10 +732,12 @@ def run_inference(
                             x = day_predictors[:, lat_slice, lon_slice]
                         xs.append(_pad_to_multiple(x.unsqueeze(0), pad_multiple))
                     xb_cpu = torch.cat(xs, dim=0)
+                    scaler_offsets_cpu = torch.tensor(chunk, dtype=torch.long)
                     _add_time(day_times, "preprocessing", time.perf_counter() - t0)
 
                     t0 = time.perf_counter()
                     xb = xb_cpu.to(device, non_blocking=True)
+                    scaler_offsets = scaler_offsets_cpu.to(device, non_blocking=True)
 
                     # Real tensor (not a shape-only stub) so DataParallel scatters it
                     # along the batch dim consistently with x.
@@ -754,14 +756,11 @@ def run_inference(
                         else nullcontext()
                     )
                     with amp_context:
-                        # Per-tile crop origins (domain frame) for spatial target
-                        # scalers; harmless (ignored) for channel-only scalers.
-                        scaler_offset = torch.tensor(
-                            [[int(lat0), int(lon0)] for lat0, lon0 in chunk],
-                            dtype=torch.long,
-                            device=device,
-                        )
-                        pred = model({"x": xb, "y": yb, "__scaler_offset": scaler_offset})
+                        pred = model({
+                            "x": xb,
+                            "y": yb,
+                            "__scaler_offset": scaler_offsets,
+                        })
                     if isinstance(pred, dict):
                         pred = pred.get(
                             "y_hat", pred.get("output", next(iter(pred.values())))
@@ -899,7 +898,7 @@ def run_parallel_inference(
     case_name = get_case_name(cfg)
     output_path = case_output_dir(output_dir, case_name)
     output_path.mkdir(parents=True, exist_ok=True)
-    dataset = MerraPrismDataset(config_path, mode="inference")
+    dataset = NarrPrismDataset(config_path, mode="inference")
     total_dates = len(dataset.dates)
     del dataset
 
@@ -1030,10 +1029,10 @@ def run_parallel_inference(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run MERRA-PRISM inference",
+        description="Run NARR-PRISM inference",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", required=True, help="Path to MERRA_PRISM.yaml")
+    parser.add_argument("--config", required=True, help="Path to NARR_PRISM.yaml")
     parser.add_argument("--checkpoint", default=None, help="Override checkpoint path")
     parser.add_argument("--output-dir", default=None, help="Override output directory")
     parser.add_argument("--batch-size", type=int, default=1, help="Inference batch size")
@@ -1067,7 +1066,7 @@ def main() -> None:
 
     checkpoint = _find_checkpoint(cfg, args.checkpoint)
     output_root = args.output_dir or cfg.get("inference", {}).get(
-        "output_dir", "./examples/MERRA_PRISM/experiments/inference_output"
+        "output_dir", "./examples/NARR_PRISM/experiments/inference_output"
     )
     output_dir = str(case_output_dir(output_root, case_name))
 

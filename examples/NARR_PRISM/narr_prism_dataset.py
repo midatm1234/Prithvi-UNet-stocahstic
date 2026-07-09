@@ -1,6 +1,6 @@
-"""PyTorch Dataset for MERRA2-to-PRISM downscaling.
+"""PyTorch Dataset for NARR-to-PRISM downscaling.
 
-Reads daily MERRA2 predictors and daily PRISM targets, aligns by date,
+Reads daily NARR predictors and daily PRISM targets, aligns by date,
 and returns (predictor, target) tensor pairs normalised by pre-computed
 scalars.
 """
@@ -21,11 +21,12 @@ try:
 except ImportError:
     xr = None
 
-from merra_prism_utils import (
+from narr_prism_utils import (
     align_dates,
     discover_all_prism_targets,
-    discover_merra2_files,
+    discover_narr_files,
     expand_predictor_variables,
+    interpolate_narr_to_grid,
     load_elevation,
     load_yaml,
     parse_date_range_from_config,
@@ -106,13 +107,13 @@ def _coord_subset_slice(
     return slice(int(idx[0]), int(idx[-1]) + 1)
 
 
-class MerraPrismDataset(Dataset):
-    """Pair daily MERRA2 predictors with daily PRISM targets.
+class NarrPrismDataset(Dataset):
+    """Pair daily NARR predictors with daily PRISM targets.
 
     Parameters
     ----------
     config_path : str or Path
-        Path to the MERRA_PRISM.yaml configuration file.
+        Path to the NARR_PRISM.yaml configuration file.
     mode : str
         ``"training"`` or ``"inference"`` — selects the date range from the
         YAML ``dates`` block.
@@ -137,7 +138,7 @@ class MerraPrismDataset(Dataset):
         dtype: torch.dtype = torch.float32,
     ) -> None:
         if xr is None:
-            raise ImportError("xarray is required for MerraPrismDataset")
+            raise ImportError("xarray is required for NarrPrismDataset")
 
         self.cfg = load_yaml(config_path)
         self.mode = mode
@@ -165,13 +166,18 @@ class MerraPrismDataset(Dataset):
         self.start_date, self.end_date = parse_date_range_from_config(self.cfg, mode)
 
         # Discover files
-        merra_files = discover_merra2_files(self.predictor_dir, self.start_date, self.end_date)
+        narr_files = discover_narr_files(
+            self.predictor_dir,
+            self.start_date,
+            self.end_date,
+            self.predictor_vars,
+        )
         prism_files = discover_all_prism_targets(
             self.target_dir, self.target_vars, self.start_date, self.end_date
         )
 
         # Build date -> path maps
-        self._predictor_map: Dict[Any, Path] = {d: p for d, p in merra_files}
+        self._predictor_map: Dict[Any, Dict[str, Path]] = {d: p for d, p in narr_files}
         self._target_maps: Dict[str, Dict[Any, Path]] = {}
         for var, file_list in prism_files.items():
             self._target_maps[var] = {d: p for d, p in file_list}
@@ -551,9 +557,9 @@ class MerraPrismDataset(Dataset):
         lat_slice: slice = slice(None),
         lon_slice: slice = slice(None),
     ) -> torch.Tensor:
-        """Load MERRA2 predictors for a date, regridded onto the PRISM crop.
+        """Load NARR predictors for a date, regridded onto the PRISM crop.
 
-        Each predictor is bilinearly interpolated from the coarse MERRA2 grid
+        Each predictor is bilinearly interpolated from the coarse NARR grid
         onto the exact PRISM crop coordinates (``lat_slice``/``lon_slice`` of the
         fine grid). This co-registers the coarse predictors with the fine
         target, exactly like the CORDEX_ML dataset's regridder step. The static
@@ -562,31 +568,18 @@ class MerraPrismDataset(Dataset):
         Returned values are RAW physical units.
         """
         crop_lat, crop_lon = self._fine_coords(lat_slice, lon_slice)
-        path = self._predictor_map[sample_date]
+        file_map = self._predictor_map[sample_date]
         arrays: List[np.ndarray] = []
-        with xr.open_dataset(str(path)) as ds:
-            lat_name = _infer_coord_name(ds, LAT_CANDIDATES)
-            lon_name = _infer_coord_name(ds, LON_CANDIDATES)
-            for var, level in self.predictor_vars:
-                if var not in ds.data_vars:
-                    raise ValueError(
-                        f"MERRA2 file {path} does not contain variable '{var}'"
-                    )
-                da = ds[var]
-                if "time" in da.dims:
-                    da = da.isel(time=0, drop=True)
-                if "lev" in da.dims:
-                    da = da.sel(lev=level, drop=True)
-                # Bilinear regrid (interp) of the coarse field onto the PRISM
-                # crop coordinates -> co-registered with the target. NaN cells
-                # (pressure levels below the surface over high terrain) are
-                # PRESERVED here; they are masked + filled below.
-                da = da.interp(
-                    {lat_name: crop_lat, lon_name: crop_lon}, method="linear"
-                )
-                arr = np.asarray(da.values, dtype=np.float32)
-                arr[np.isinf(arr)] = np.nan
-                arrays.append(arr)
+        for var, level in self.predictor_vars:
+            arr = interpolate_narr_to_grid(
+                file_map,
+                var,
+                level,
+                sample_date,
+                crop_lat,
+                crop_lon,
+            )
+            arrays.append(arr)
         stacked = np.stack(arrays, axis=0)
 
         self._check_predictor_alignment(stacked, crop_lat, crop_lon)
@@ -613,7 +606,16 @@ class MerraPrismDataset(Dataset):
         mask = valid.astype(np.float32)
 
         if self._fill_means is not None and len(self._fill_means) >= n_ch:
-            fill = np.asarray(self._fill_means[:n_ch], dtype=np.float32)[:, None, None]
+            fill_source = np.asarray(self._fill_means[:n_ch], dtype=np.float32)
+            if fill_source.ndim == 3:
+                fill = fill_source[:, lat_slice, lon_slice]
+                if fill.shape[-2:] != stacked.shape[-2:]:
+                    raise ValueError(
+                        "Gridpoint input fill means do not match the requested crop. "
+                        f"fill={fill.shape}, crop={stacked.shape}"
+                    )
+            else:
+                fill = fill_source[:, None, None]
         else:
             # Fallback before scalars exist (e.g. first scalar pass): per-tile
             # channel nanmean, then 0 for all-NaN channels.
@@ -682,7 +684,7 @@ class MerraPrismDataset(Dataset):
 
     @property
     def num_predictor_channels(self) -> int:
-        """Total input channels = 2 × (dynamic MERRA2 vars + elevation):
+        """Total input channels = 2 × (dynamic NARR vars + elevation):
         N physical data channels followed by N binary validity-mask channels."""
         n_data = len(self.predictor_vars) + (1 if self._elevation is not None else 0)
         return 2 * n_data

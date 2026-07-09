@@ -1,10 +1,10 @@
-"""Compute normalisation scalars for the MERRA2-to-PRISM downscaling workflow.
+"""Compute normalisation scalars for the NARR-to-PRISM downscaling workflow.
 
 Statistics are computed **only** over the YAML-defined training period so that
 the same scalars can be reused consistently during training and inference.
 
 Usage:
-    python compute_scalars_merra_prism.py --config MERRA_PRISM.yaml
+    python compute_scalars_narr_prism.py --config NARR_PRISM.yaml
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
 
 try:
     import xarray as xr
@@ -29,11 +28,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from merra_prism_utils import (
+from narr_prism_utils import (
     align_dates,
     discover_all_prism_targets,
-    discover_merra2_files,
+    discover_narr_files,
     expand_predictor_variables,
+    interpolate_narr_to_grid,
     load_elevation,
     load_yaml,
     parse_date_range_from_config,
@@ -56,10 +56,10 @@ EPS = 1e-6
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compute per-channel scalars for MERRA-PRISM training",
+        description="Compute per-channel scalars for NARR-PRISM training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", required=True, help="Path to MERRA_PRISM.yaml")
+    parser.add_argument("--config", required=True, help="Path to NARR_PRISM.yaml")
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -77,32 +77,21 @@ def parse_args() -> argparse.Namespace:
 def _load_predictor_arrays(
     path: Path,
     variables: Sequence[Tuple[str, float]],
+    sample_date: Any,
     target_lat: np.ndarray,
     target_lon: np.ndarray,
 ) -> np.ndarray:
-    """Load predictors from a MERRA2 file, regridded onto (target_lat, target_lon).
+    """Load predictors from a NARR file, regridded onto (target_lat, target_lon).
 
     Predictors are bilinearly interpolated onto the (strided) PRISM grid so the
     input scalars are computed from the SAME co-registered fields the dataset
     feeds the model at train/inference time.
     """
     arrays: List[np.ndarray] = []
-    with xr.open_dataset(str(path)) as ds:
-        lat_name = next((n for n in ("lat", "latitude", "y") if n in ds.coords or n in ds.dims), "lat")
-        lon_name = next((n for n in ("lon", "longitude", "x") if n in ds.coords or n in ds.dims), "lon")
-        for var, level in variables:
-            if var not in ds.data_vars:
-                raise ValueError(f"Variable '{var}' not found in {path}")
-            da = ds[var]
-            if "time" in da.dims:
-                da = da.isel(time=0, drop=True)
-            if "lev" in da.dims:
-                da = da.sel(lev=level, drop=True)
-            da = da.interp({lat_name: target_lat, lon_name: target_lon}, method="linear")
-            arr = np.asarray(da.values, dtype=np.float32)
-            # Preserve NaN (below-surface / missing). Only scrub +/-inf.
-            arr[np.isinf(arr)] = np.nan
-            arrays.append(arr)
+    for var, level in variables:
+        arrays.append(
+            interpolate_narr_to_grid(path, var, level, sample_date, target_lat, target_lon)
+        )
     return np.stack(arrays, axis=0)
 
 
@@ -211,6 +200,13 @@ def compute_scalars(
         raise ImportError("xarray is required")
 
     data_cfg = cfg.get("data", {})
+    normalization_cfg = cfg.get("normalization", {}) or {}
+    predictor_mode = str(normalization_cfg.get("predictor_mode", "global")).lower()
+    if predictor_mode not in {"global", "gridpoint"}:
+        raise ValueError(
+            "normalization.predictor_mode must be either 'global' or 'gridpoint'"
+        )
+    use_input_gridpoint = predictor_mode == "gridpoint"
     predictor_dir = resolve_path(data_cfg["predictor_dir"])
     target_dir = resolve_path(data_cfg["target_dir"])
     predictor_variables = expand_predictor_variables(data_cfg.get("predictor_variables", {}))
@@ -223,14 +219,14 @@ def compute_scalars(
     print(f"[scalars] computing over training period: {start} → {end}")
 
     # Discover files
-    merra_files = discover_merra2_files(predictor_dir, start, end)
+    narr_files = discover_narr_files(predictor_dir, start, end, predictor_variables)
     prism_files = discover_all_prism_targets(target_dir, target_variables, start, end)
 
-    if not merra_files:
-        raise RuntimeError(f"No MERRA2 files found in {predictor_dir} for {start}–{end}")
+    if not narr_files:
+        raise RuntimeError(f"No NARR files found in {predictor_dir} for {start}–{end}")
 
     # Align dates
-    predictor_dates = [d for d, _ in merra_files]
+    predictor_dates = [d for d, _ in narr_files]
     target_date_maps_dates = {
         var: [d for d, _ in fl] for var, fl in prism_files.items()
     }
@@ -240,7 +236,7 @@ def compute_scalars(
     if not aligned_dates:
         raise RuntimeError("No aligned dates — cannot compute scalars")
 
-    pred_map = {d: p for d, p in merra_files}
+    pred_map = {d: p for d, p in narr_files}
     target_maps = {var: {d: p for d, p in fl} for var, fl in prism_files.items()}
 
     # PRISM (fine) grid, strided for fast-but-representative scalar estimation.
@@ -253,10 +249,15 @@ def compute_scalars(
         == "gridpoint"
         for var in target_variables
     )
+    if use_input_gridpoint and stride != 1:
+        print(
+            "[scalars] normalization.predictor_mode=gridpoint requires full-resolution "
+            f"input scalers; overriding scalar_stride={stride} to 1"
+        )
+        stride = 1
     if use_target_gridpoint and stride != 1:
         # Per-gridpoint TARGET scalers are a native-resolution climatology; a
-        # strided (coarse) estimate would reintroduce block artifacts. Force
-        # full resolution.
+        # strided (coarse) estimate would reintroduce block artifacts.
         print(
             "[scalars] a predictand uses normalization.mode: gridpoint -> forcing "
             f"scalar_stride={stride} to 1 for a full-resolution target climatology"
@@ -299,6 +300,14 @@ def compute_scalars(
     x_sumsq = np.zeros(n_pred, dtype=np.float64)
     x_count = np.zeros(n_pred, dtype=np.float64)  # per-channel valid (non-NaN) count
 
+    # Optional per-gridpoint input accumulators. For time-varying predictors this
+    # gives one normalization scalar per channel and PRISM grid cell, computed
+    # over training time only. Static elevation is handled later with broadcast
+    # global scalers because its temporal std is zero at every grid point.
+    x_grid_sum: Optional[np.ndarray] = None
+    x_grid_sumsq: Optional[np.ndarray] = None
+    x_grid_count: Optional[np.ndarray] = None
+
     y_sum = np.zeros(n_tgt, dtype=np.float64)
     y_sumsq = np.zeros(n_tgt, dtype=np.float64)
     y_count = np.zeros(n_tgt, dtype=np.float64)  # per-channel valid (non-NaN) count
@@ -310,7 +319,13 @@ def compute_scalars(
 
     for idx, sample_date in enumerate(aligned_dates):
         # Predictors regridded onto the strided PRISM grid (co-registered).
-        x = _load_predictor_arrays(pred_map[sample_date], predictor_variables, sub_lat, sub_lon)
+        x = _load_predictor_arrays(
+            pred_map[sample_date],
+            predictor_variables,
+            sample_date,
+            sub_lat,
+            sub_lon,
+        )
 
         # Append elevation as the last channel (already on the strided grid).
         if elevation_arr is not None:
@@ -324,6 +339,17 @@ def compute_scalars(
         x_sum += np.nansum(np.where(x_valid, x_flat, 0.0), axis=1)
         x_sumsq += np.nansum(np.where(x_valid, x_flat ** 2, 0.0), axis=1)
         x_count += x_valid.sum(axis=1)
+
+        if use_input_gridpoint:
+            x0 = np.where(np.isfinite(x), x.astype(np.float64), 0.0)
+            x_valid_grid = np.isfinite(x)
+            if x_grid_sum is None:
+                x_grid_sum = np.zeros_like(x0, dtype=np.float64)
+                x_grid_sumsq = np.zeros_like(x0, dtype=np.float64)
+                x_grid_count = np.zeros_like(x0, dtype=np.float64)
+            x_grid_sum += x0
+            x_grid_sumsq += x0 ** 2
+            x_grid_count += x_valid_grid.astype(np.float64)
 
         # Targets subsampled on the same strided grid (PRISM is NaN over ocean).
         y = _load_target_arrays(
@@ -369,6 +395,38 @@ def compute_scalars(
     x_var = np.maximum(x_sumsq / x_count - (x_sum / x_count) ** 2, 0.0)
     inputs_std = np.sqrt(x_var).astype(np.float32)
 
+    if use_input_gridpoint:
+        assert x_grid_sum is not None
+        assert x_grid_sumsq is not None
+        assert x_grid_count is not None
+        if np.any(x_grid_count == 0):
+            print(
+                "[scalars] WARN: some input grid cells have no finite predictor values; "
+                "their gridpoint scalers will be set to neutral values."
+            )
+        safe_x_grid_count = np.maximum(x_grid_count, 1.0)
+        inputs_grid_mean = (x_grid_sum / safe_x_grid_count).astype(np.float32)
+        inputs_grid_var = np.maximum(
+            x_grid_sumsq / safe_x_grid_count
+            - (x_grid_sum / safe_x_grid_count) ** 2,
+            0.0,
+        )
+        inputs_grid_std = np.sqrt(inputs_grid_var).astype(np.float32)
+        missing_x_grid = x_grid_count == 0
+        inputs_grid_mean[missing_x_grid] = 0.0
+        inputs_grid_std[missing_x_grid] = 1.0
+
+        # Static elevation is included as the final data channel when present.
+        # Its temporal std at a fixed grid point is exactly zero, so keep the
+        # previous global channel normalization and broadcast it over the grid.
+        if elevation_arr is not None:
+            elev_idx = n_pred - 1
+            inputs_grid_mean[elev_idx] = inputs_mean[elev_idx]
+            inputs_grid_std[elev_idx] = max(float(inputs_std[elev_idx]), EPS)
+
+        inputs_mean = inputs_grid_mean
+        inputs_std = np.maximum(inputs_grid_std, EPS)
+
     targets_mean = (y_sum / y_count).astype(np.float32)
     y_var = np.maximum(y_sumsq / y_count - (y_sum / y_count) ** 2, 0.0)
     targets_std = np.sqrt(y_var).astype(np.float32)
@@ -398,8 +456,6 @@ def compute_scalars(
     # this whole block was gated behind `use_gridpoint`, so in the all-global
     # configuration ppt kept its raw mean (~1.2) instead of 0, breaking the
     # model's divide_only output scaler.
-    # (predictands_cfg was resolved above, next to the stride guard.)
-
     # Phase A resolves a per-CHANNEL SCALAR for every target (used directly for
     # global channels and as the broadcast fill for gridpoint channels). Spatial
     # (per-gridpoint) maps are only assembled in Phase B, so we never store a 2-D
@@ -473,8 +529,13 @@ def compute_scalars(
     # channel per predictor channel (1 valid / 0 missing). Masks must pass
     # through the model's internal z-score UNCHANGED, so their scalers are
     # mu=0, sigma=1. Order matches the dataset: [data_0..N-1, mask_0..N-1].
-    mask_mean = np.zeros(n_pred, dtype=np.float32)
-    mask_std = np.ones(n_pred, dtype=np.float32)
+    if inputs_mean.ndim == 3:
+        mask_shape = inputs_mean.shape
+        mask_mean = np.zeros(mask_shape, dtype=np.float32)
+        mask_std = np.ones(mask_shape, dtype=np.float32)
+    else:
+        mask_mean = np.zeros(n_pred, dtype=np.float32)
+        mask_std = np.ones(n_pred, dtype=np.float32)
     inputs_mean = np.concatenate([inputs_mean, mask_mean], axis=0)
     inputs_std = np.concatenate([inputs_std, mask_std], axis=0)
     print(

@@ -13,8 +13,8 @@ import xarray as xr
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ELEVATION_PATH = REPO_ROOT / "examples/MERRA_PRISM/prism_elevation.nc"
-OUTPUT_PATH = REPO_ROOT / "examples/MERRA_PRISM/california_1024_tile_terrain.png"
+ELEVATION_PATH = REPO_ROOT / "examples/NARR_PRISM/prism_elevation.nc"
+OUTPUT_PATH = REPO_ROOT / "examples/NARR_PRISM/california_1024_tile_terrain.png"
 TILE_SIZE = 1024
 
 # PRISM-aligned 1024x1024 bounds covering most of California within the US.

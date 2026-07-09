@@ -24,7 +24,27 @@ python "$SCRIPT_DIR/preproc_merra_prism.py" --config "$CONFIG" --mode training
 echo "    Training preprocessing done."
 echo ""
 
-printf '%s\n' '-- Step 3/3: Preprocessing inference data ...'
+HAS_VALIDATION="$(
+python - "$CONFIG" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    cfg = yaml.safe_load(fh) or {}
+validation = (cfg.get("dates") or {}).get("validation") or {}
+print("1" if validation.get("start") and validation.get("end") else "0")
+PY
+)"
+
+if [[ "$HAS_VALIDATION" == "1" ]]; then
+  printf '%s\n' '-- Step 3/4: Preprocessing validation data ...'
+  python "$SCRIPT_DIR/preproc_merra_prism.py" --config "$CONFIG" --mode validation
+  echo "    Validation preprocessing done."
+  echo ""
+  printf '%s\n' '-- Step 4/4: Preprocessing inference data ...'
+else
+  printf '%s\n' '-- Step 3/3: Preprocessing inference data ...'
+fi
 python "$SCRIPT_DIR/preproc_merra_prism.py" --config "$CONFIG" --mode inference
 echo "    Inference preprocessing done."
 echo ""

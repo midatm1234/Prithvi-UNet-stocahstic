@@ -101,12 +101,12 @@ data:
     inputs_std: ./examples/MERRA_PRISM/scalars_smoke/inputs_std.npy
     targets_mean: ./examples/MERRA_PRISM/scalars_smoke/targets_mean.npy
     targets_std: ./examples/MERRA_PRISM/scalars_smoke/targets_std.npy
-  input_size_lat: 32
-  input_size_lon: 32
-  target_size_lat: 256
-  target_size_lon: 256
-  train_crop_size_lat: 256
-  train_crop_size_lon: 256
+  input_size_lat: 16
+  input_size_lon: 16
+  target_size_lat: 128
+  target_size_lon: 128
+  train_crop_size_lat: 128
+  train_crop_size_lon: 128
   min_valid_target_fraction: 1.0e-04
   max_crop_retries: 32
   skip_empty_target_tiles: true
@@ -115,18 +115,23 @@ data:
   regrid_method: bilinear
   scalar_stride: 16
   spatial_subset:
-    enabled: false
-    lat_min: null
-    lat_max: null
-    lon_min: null
-    lon_max: null
+    enabled: true
+    lat_min: 35.0
+    lat_max: 39.3
+    lon_min: -124.0
+    lon_max: -119.7
 dates:
   training:
     start: '2015-01-01'
-    end: '2015-01-15'
+    end: '2015-01-06'
   inference:
     start: '2016-01-03'
     end: '2016-01-03'
+preprocess:
+  save_train_targets: true
+  save_val_targets: true
+  save_inference_targets: false
+  inference_include_observed_targets_for_eval: false
 normalization:
   predictor_method: standardize
   target_method: per_variable
@@ -222,14 +227,14 @@ num_epochs: 1
 dl_num_workers: 0
 dl_prefetch_size: 1
 learning_rate: 5.0e-05
-limit_steps_train: 30
-limit_steps_valid: 4
+limit_steps_train: 6
+limit_steps_valid: 2
 min_lr: 1.0e-06
 max_lr: 0.0001
 warm_up_steps: 0
 mask_unit_size:
-- 16
-- 16
+- 8
+- 8
 mask_ratio_inputs: 0.0
 mask_ratio_targets: 0.0
 max_batch_size: 4
@@ -347,8 +352,8 @@ inference:
     use_seam_deblocking: false
     seam_deblocking_strength: 0.1
   inference_tile_size:
-  - 256
-  - 256
+  - 128
+  - 128
   inference_overlap:
   - 64
   - 64
@@ -365,4 +370,4 @@ precip_lambda_amount: 1.0
 precip_amount_loss_type: smoothl1
 resume_training: false
 resume_checkpoint_path: null
-auto_resume_if_checkpoint_exists: true
+auto_resume_if_checkpoint_exists: false
