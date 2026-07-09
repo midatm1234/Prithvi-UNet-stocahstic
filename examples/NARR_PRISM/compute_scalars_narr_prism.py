@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Override scalar output directory (default: from YAML data.scalar_dir)",
+        help="Override scalar output directory (default: <preprocessed_dir>/<case_name>/scalars)",
     )
     parser.add_argument(
         "--progress-interval",
@@ -579,9 +579,15 @@ def main() -> None:
         output_dir = str(resolve_path(args.output_dir))
     else:
         # Save per-channel scalers under the owning case_name so training and
-        # inference load exactly these files (single source of truth).
+        # inference load exactly these files (single source of truth):
+        # <preprocessed_dir>/<case_name>/scalars.
         output_dir = str(norm.resolve_scalar_dir(cfg, for_writing=True))
     os.makedirs(output_dir, exist_ok=True)
+
+    case_name = norm.get_case_name(cfg)
+    print(f"[scalars] Using case_name: {case_name}")
+    print(f"[scalars] Using preprocessing directory: {norm.case_preprocess_dir(cfg)}")
+    print(f"[scalars] Writing scalars to: {output_dir}")
 
     stats = compute_scalars(cfg, progress_interval=args.progress_interval)
 

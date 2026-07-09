@@ -122,7 +122,9 @@ class MerraPrismDataset(Dataset):
     target_variables : list[str] | None
         Override target variable names (default reads from YAML).
     scalars_dir : str | Path | None
-        Override scalar directory (default reads from YAML ``data.scalar_dir``).
+        Override scalar directory (default: case-scoped
+        ``<preprocessed_dir>/<case_name>/scalars``, resolved via
+        ``normalization.resolve_scalar_dir``).
     dtype : torch.dtype
         Tensor dtype for returned samples.
     """
@@ -303,10 +305,13 @@ class MerraPrismDataset(Dataset):
         if scalars_dir is not None:
             scalar_dir = str(scalars_dir)
         else:
-            try:
-                scalar_dir = str(norm.resolve_scalar_dir(self.cfg, for_writing=False))
-            except Exception:
-                scalar_dir = data_cfg.get("scalar_dir", "")
+            # Case-scoped resolution only. Never fall back to a shared/flat
+            # scalar_dir: that historically mixed another case's stale
+            # per-gridpoint scalers into this run. A missing case_name raises a
+            # clear error here (a config bug); merely-absent scalers resolve to
+            # the canonical (empty) dir and are tolerated for the first scalar
+            # pass below.
+            scalar_dir = str(norm.resolve_scalar_dir(self.cfg, for_writing=False))
         self._fill_means: Optional[np.ndarray] = None
         if scalar_dir:
             self._scalars = self._load_scalars(scalar_dir)

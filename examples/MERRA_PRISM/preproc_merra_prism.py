@@ -32,7 +32,6 @@ except Exception:
 
 from merra_prism_utils import (
     align_dates,
-    case_output_dir,
     discover_all_prism_targets,
     discover_merra2_files,
     expand_predictor_variables,
@@ -44,6 +43,12 @@ from merra_prism_utils import (
     validate_dates_exist,
     validate_target_variables,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from granitewxc.utils import normalization as norm
 
 
 LAT_CANDIDATES = ("lat", "latitude", "y")
@@ -290,13 +295,14 @@ def preprocess(
     include_targets = _mode_saves_targets(cfg, mode)
 
     case_name = get_case_name(cfg)
-    output_dir = case_output_dir(
-        resolve_path(data_cfg.get("preprocessed_dir", "./preprocessed")) / mode,
-        case_name,
-    )
+    # Case-scoped layout: <preprocessed_dir>/<case_name>/<mode>. Isolating by
+    # case ensures reruns for a different YAML/case never overwrite another
+    # case's normalized predictors/targets.
+    output_dir = norm.case_preprocess_dir(cfg) / mode
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[preproc] case_name={case_name}")
-    print(f"[preproc] output_dir={output_dir}")
+    print(f"[preproc] Using case_name: {case_name}")
+    print(f"[preproc] Using preprocessing directory: {norm.case_preprocess_dir(cfg)}")
+    print(f"[preproc] Writing {mode} outputs to: {output_dir}")
     print(f"[preproc] target_variables={target_variables}")
     print(
         f"[preproc] include_targets={include_targets} "

@@ -51,6 +51,12 @@ except ModuleNotFoundError:
 
 from granitewxc.models.model import get_finetune_model_UNET
 from granitewxc.utils.config import ExperimentConfig, get_config
+from granitewxc.utils.normalization import (
+    apply_scalar_paths,
+    assert_scalars_available,
+    log_case_context,
+    log_scalar_summary,
+)
 from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.distributed import init_ddp
 from granitewxc.utils.trainer import train_model
@@ -457,6 +463,15 @@ def run_training(
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     print(f"[training] case_name={case_name}")
     print(f"[training] checkpoint_dir={config.checkpoint_dir}")
+
+    # Wire the model + dataset to the per-case, per-channel scalers and fail
+    # fast if they are missing. Centralized here so BOTH the CLI entry point and
+    # the notebook (which calls run_training directly) consume the SAME
+    # case-scoped scalers instead of the YAML's default (flat) scaler paths.
+    log_case_context(config, "finetune")
+    assert_scalars_available(config, role="finetune")
+    apply_scalar_paths(config)
+    log_scalar_summary(config, "training")
 
     use_gpu = _should_use_gpu(config)
 

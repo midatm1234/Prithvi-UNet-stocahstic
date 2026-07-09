@@ -52,8 +52,8 @@ hyper-parameters are controlled by a single YAML file.
 | `data.target_dir` | Path to PRISM root directory |
 | `data.target_variables` | PRISM target sub-folders (`ppt`, `tmax`, `tmin`) |
 | `data.predictor_variables` | NARR variable names to use as predictors |
-| `data.preprocessed_dir` | Where preprocessed files are written |
-| `data.scalar_dir` | Where normalization statistics are saved |
+| `data.preprocessed_dir` | Case-scoped root; every output lands under `<preprocessed_dir>/<case_name>/` |
+| `data.scalar_dir` | Legacy scalar location (read-only, same-case fallback only); new scalars are written under `<preprocessed_dir>/<case_name>/scalars/` |
 | `data.scalers.*` | Paths to the four `.npy` scalar files |
 | `dates.training.start / end` | Training date range |
 | `dates.inference.start / end` | Inference date range |
@@ -88,7 +88,9 @@ Optional flags:
 - `--progress-interval 100` — log every N dates.
 
 **Outputs:** `inputs_mean.npy`, `inputs_std.npy`, `targets_mean.npy`,
-`targets_std.npy`, and `metadata.json` in the configured `data.scalar_dir`.
+`targets_std.npy`, and `metadata.json` in `<preprocessed_dir>/<case_name>/scalars/`.
+The directory is **case-scoped**, so recomputing scalars for another
+`case_name` (or another YAML) never overwrites these files.
 
 ---
 
@@ -106,8 +108,8 @@ python preproc_narr_prism.py \
 `--mode` accepts `training`, `inference`, or `both` (default).
 
 **Outputs:** One NetCDF per aligned date in
-`<preprocessed_dir>/training/<case_name>/` and
-`<preprocessed_dir>/inference/<case_name>/`.
+`<preprocessed_dir>/<case_name>/training/` and
+`<preprocessed_dir>/<case_name>/inference/`.
 
 ---
 
@@ -135,12 +137,13 @@ Run inference over the YAML-defined inference date range.
 ```bash
 python narr_prism_inference.py \
     --config NARR_PRISM.yaml \
-    [--checkpoint path/to/best.ckpt]
+    [--checkpoint path/to/last.ckpt]
 ```
 
 Optional flags:
 - `--checkpoint` — explicit path to a trained checkpoint (auto-detected
-  from `inference.checkpoint_path` or `path_experiment` if omitted).
+  from `inference.checkpoint_path` if set, otherwise auto-discovered from
+  experiment/checkpoint directories with **`last.ckpt` preferred over `best.ckpt`**).
 - `--output-dir` — override the output directory.
 - `--batch-size` — inference batch size (default 1).
 - `--device cpu` — force CPU inference.
@@ -161,8 +164,8 @@ Optional flags:
 
 | Step | Output location |
 |------|-----------------|
-| Scalars | `data.scalar_dir` (`.npy` + `metadata.json`) |
-| Preprocessing | `data.preprocessed_dir/{training,inference}/<case_name>/` |
+| Scalars | `<preprocessed_dir>/<case_name>/scalars/` (`.npy` + `metadata.json`) |
+| Preprocessing | `<preprocessed_dir>/<case_name>/{training,inference}/` |
 | Training | `checkpoint_dir/<case_name>/` |
 | Inference | `inference.output_dir/<case_name>/` |
 
@@ -191,3 +194,11 @@ Optional flags:
   hard-coded; change them in `NARR_PRISM.yaml`.
 - **Scalar reuse.** The same scalars computed over the training period
   are used for both training normalisation and inference denormalization.
+- **Case isolation.** Every preprocessing artifact (scalars, normalized
+  predictors/targets, cached/tiled outputs) is written under
+  `<preprocessed_dir>/<case_name>/`, so preprocessing one case (or YAML)
+  never overwrites another. Scalars are **never** read from a shared/flat
+  directory: fine-tuning and inference resolve `<preprocessed_dir>/<case_name>/scalars/`
+  (with a same-case fallback to a legacy `data.scalar_dir/<case_name>/`) and
+  raise a clear error if the per-case scalars are missing. Each entry point
+  logs the active `case_name` and the exact preprocessing/scalar directories.

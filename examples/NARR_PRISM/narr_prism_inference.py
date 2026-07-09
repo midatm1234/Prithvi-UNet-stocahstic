@@ -4,7 +4,7 @@ Loads a trained checkpoint, runs prediction over the YAML-defined inference
 date range, denormalizes outputs, and writes NetCDF files.
 
 Usage:
-    python narr_prism_inference.py --config NARR_PRISM.yaml [--checkpoint path/to/best.ckpt]
+    python narr_prism_inference.py --config NARR_PRISM_subdomain_old.yaml [--checkpoint path/to/last.ckpt]
 """
 
 from __future__ import annotations
@@ -43,7 +43,9 @@ from granitewxc.utils.config import get_config
 from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.normalization import (
     apply_scalar_paths,
+    assert_scalars_available,
     assert_target_grid_matches,
+    log_case_context,
     log_scalar_summary,
     resolve_scalar_dir,
     seam_gradient_ratio,
@@ -67,40 +69,81 @@ from narr_prism_utils import (
 
 def _find_checkpoint(cfg: Dict[str, Any], explicit: Optional[str]) -> str:
     """Locate the model checkpoint to use for inference."""
+    candidates = ("last.ckpt", "best.ckpt")
     if explicit:
-        return str(resolve_path(explicit))
+        p = resolve_path(explicit)
+        if p.exists():
+            return str(p)
+        raise FileNotFoundError(f"Explicit checkpoint not found: {p}")
     case_name = get_case_name(cfg)
     inf_cfg = cfg.get("inference", {})
     ckpt = inf_cfg.get("checkpoint_path")
     if ckpt:
-        return str(resolve_path(ckpt))
+        p = resolve_path(ckpt)
+        if p.exists():
+            return str(p)
+        raise FileNotFoundError(f"inference.checkpoint_path not found: {p}")
+    resume_ckpt = cfg.get("resume_checkpoint_path")
+    if resume_ckpt:
+        p = resolve_path(resume_ckpt)
+        if p.exists():
+            return str(p)
+        print(f"[inference] resume_checkpoint_path not found (skipping): {p}", flush=True)
 
     checkpoint_dir = cfg.get("checkpoint_dir")
     if checkpoint_dir:
-        case_checkpoint_dir = case_output_dir(checkpoint_dir, case_name)
-        for candidate in ("best.ckpt", "last.ckpt"):
+        case_checkpoint_dir = case_output_dir(resolve_path(checkpoint_dir), case_name)
+        for candidate in candidates:
             p = case_checkpoint_dir / candidate
             if p.exists():
                 return str(p)
 
     run_dir = cfg.get("run_dir")
     if run_dir:
-        case_run_dir = case_output_dir(run_dir, case_name)
-        for candidate in ("best.ckpt", "last.ckpt"):
+        case_run_dir = case_output_dir(resolve_path(run_dir), case_name)
+        for candidate in candidates:
             p = case_run_dir / candidate
             if p.exists():
                 return str(p)
-        for candidate in ("best.ckpt", "last.ckpt"):
+        for candidate in candidates:
             p = case_run_dir / "checkpoints" / candidate
             if p.exists():
                 return str(p)
 
-    exp = cfg.get("path_experiment", ".")
-    for candidate in ("best.ckpt", "last.ckpt"):
+    exp = resolve_path(cfg.get("path_experiment", "."))
+    for candidate in candidates:
         p = case_output_dir(resolve_path(exp) / "checkpoints", case_name) / candidate
         if p.exists():
             return str(p)
-    raise FileNotFoundError("Cannot locate a trained checkpoint. Pass --checkpoint explicitly.")
+
+    # Fallback: if case_name does not match the trained run, use the most recent
+    # checkpoint under known checkpoint roots.
+    search_roots: List[Path] = []
+    if checkpoint_dir:
+        search_roots.append(resolve_path(checkpoint_dir))
+    if run_dir:
+        search_roots.append(resolve_path(run_dir))
+    search_roots.append(exp / "checkpoints")
+
+    found: List[Tuple[float, Path]] = []
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for candidate in candidates:
+            for p in root.rglob(candidate):
+                if p.is_file():
+                    found.append((p.stat().st_mtime, p))
+    if found:
+        # Prefer latest modified checkpoint; "last.ckpt" is preferred via candidate order.
+        found.sort(key=lambda item: item[0], reverse=True)
+        return str(found[0][1])
+
+    roots_msg = ", ".join(str(r) for r in search_roots)
+    raise FileNotFoundError(
+        "Cannot locate a trained checkpoint. "
+        f"Searched case '{case_name}' and roots: {roots_msg}. "
+        "Pass --checkpoint explicitly."
+    )
 
 
 def _load_model(
@@ -542,6 +585,18 @@ def run_inference(
     case_name = get_case_name(cfg)
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
 
+    # Log the active case + case-scoped directories, then require the per-case
+    # scalers to exist. Inference must denormalize with the SAME per-case
+    # scalers used at training; never silently borrow another case's files.
+    log_case_context(cfg, "inference")
+    assert_scalars_available(cfg, role="inference")
+
+    # Point the model at the per-case scalers. The notebook calls run_inference
+    # directly with a fresh config, so we must not rely on the CLI having wired
+    # them; log shapes + sha256 to prove train/infer used identical files.
+    apply_scalar_paths(config)
+    log_scalar_summary(config, "inference")
+
     # Load model
     print(f"[inference] loading checkpoint: {checkpoint_path}")
     model = _load_model(config, checkpoint_path, device, data_parallel=data_parallel)
@@ -896,6 +951,11 @@ def run_parallel_inference(
     """
     cfg = load_yaml(config_path)
     case_name = get_case_name(cfg)
+    # Fail fast with a clear, case-specific message before spawning workers if
+    # the per-case scalers are missing (this is where the stale shared-scalar
+    # crash used to surface).
+    log_case_context(cfg, "inference")
+    assert_scalars_available(cfg, role="inference")
     output_path = case_output_dir(output_dir, case_name)
     output_path.mkdir(parents=True, exist_ok=True)
     dataset = NarrPrismDataset(config_path, mode="inference")
@@ -1032,7 +1092,11 @@ def parse_args() -> argparse.Namespace:
         description="Run NARR-PRISM inference",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", required=True, help="Path to NARR_PRISM.yaml")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to the same YAML used for training (e.g., NARR_PRISM_subdomain_old.yaml)",
+    )
     parser.add_argument("--checkpoint", default=None, help="Override checkpoint path")
     parser.add_argument("--output-dir", default=None, help="Override output directory")
     parser.add_argument("--batch-size", type=int, default=1, help="Inference batch size")
@@ -1058,12 +1122,9 @@ def main() -> None:
     config = get_config(str(Path(args.config).resolve()))
     case_name = get_case_name(cfg)
 
-    # Resolve the per-case scaler files and point the model at them, then log
-    # shapes + sha256 so we can confirm inference used the SAME per-channel
-    # normalization file as training.
-    apply_scalar_paths(config)
-    log_scalar_summary(config, "inference")
-
+    # Scaler resolution + wiring + logging happen inside run_inference /
+    # run_parallel_inference so the notebook (which calls those directly)
+    # behaves identically to this CLI entry point.
     checkpoint = _find_checkpoint(cfg, args.checkpoint)
     output_root = args.output_dir or cfg.get("inference", {}).get(
         "output_dir", "./examples/NARR_PRISM/experiments/inference_output"

@@ -16,7 +16,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from granitewxc.utils.config import get_config
-from granitewxc.utils.normalization import apply_scalar_paths, log_scalar_summary
 
 from merra_prism_training import run_training
 
@@ -41,11 +40,8 @@ def main() -> None:
     config = get_config(config_path)
     print(f"[finetune] config={config_path}")
 
-    # Point the model at the per-case, per-channel scalers and log their shapes
-    # + sha256 so training and inference are provably using the SAME file.
-    apply_scalar_paths(config)
-    log_scalar_summary(config, "training")
-
+    # Scaler wiring + case-context logging + missing-scaler guard live in
+    # run_training so the CLI and notebook paths behave identically.
     train_losses, val_losses = run_training(
         config=config,
         config_path=config_path,

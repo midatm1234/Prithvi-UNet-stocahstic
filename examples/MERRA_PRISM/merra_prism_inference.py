@@ -43,7 +43,9 @@ from granitewxc.utils.config import get_config
 from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.normalization import (
     apply_scalar_paths,
+    assert_scalars_available,
     assert_target_grid_matches,
+    log_case_context,
     log_scalar_summary,
     resolve_scalar_dir,
     seam_gradient_ratio,
@@ -542,6 +544,18 @@ def run_inference(
     case_name = get_case_name(cfg)
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
 
+    # Log the active case + case-scoped directories, then require the per-case
+    # scalers to exist. Inference must denormalize with the SAME per-case
+    # scalers used at training; never silently borrow another case's files.
+    log_case_context(cfg, "inference")
+    assert_scalars_available(cfg, role="inference")
+
+    # Point the model at the per-case scalers. The notebook calls run_inference
+    # directly with a fresh config, so we must not rely on the CLI having wired
+    # them; log shapes + sha256 to prove train/infer used identical files.
+    apply_scalar_paths(config)
+    log_scalar_summary(config, "inference")
+
     # Load model
     print(f"[inference] loading checkpoint: {checkpoint_path}")
     model = _load_model(config, checkpoint_path, device, data_parallel=data_parallel)
@@ -897,6 +911,11 @@ def run_parallel_inference(
     """
     cfg = load_yaml(config_path)
     case_name = get_case_name(cfg)
+    # Fail fast with a clear, case-specific message before spawning workers if
+    # the per-case scalers are missing (this is where the stale shared-scalar
+    # crash used to surface).
+    log_case_context(cfg, "inference")
+    assert_scalars_available(cfg, role="inference")
     output_path = case_output_dir(output_dir, case_name)
     output_path.mkdir(parents=True, exist_ok=True)
     dataset = MerraPrismDataset(config_path, mode="inference")
@@ -1059,12 +1078,9 @@ def main() -> None:
     config = get_config(str(Path(args.config).resolve()))
     case_name = get_case_name(cfg)
 
-    # Resolve the per-case scaler files and point the model at them, then log
-    # shapes + sha256 so we can confirm inference used the SAME per-channel
-    # normalization file as training.
-    apply_scalar_paths(config)
-    log_scalar_summary(config, "inference")
-
+    # Scaler resolution + wiring + logging happen inside run_inference /
+    # run_parallel_inference so the notebook (which calls those directly)
+    # behaves identically to this CLI entry point.
     checkpoint = _find_checkpoint(cfg, args.checkpoint)
     output_root = args.output_dir or cfg.get("inference", {}).get(
         "output_dir", "./examples/MERRA_PRISM/experiments/inference_output"

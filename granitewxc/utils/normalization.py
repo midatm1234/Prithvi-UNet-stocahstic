@@ -19,8 +19,10 @@ training, validation, testing, and inference code paths:
   lives in the ``compute_scalars_*`` scripts; this module enforces the shapes and
   records provenance).
 * The *same* saved files are reused everywhere.  They are resolved under a
-  per-``case_name`` directory (``<scalar_dir>/<case_name>``) and a manifest
-  (sha256 + shapes) lets training and inference assert byte-for-byte identity.
+  per-``case_name`` directory (``<preprocessed_dir>/<case_name>/scalars``) and a
+  manifest (sha256 + shapes) lets training and inference assert byte-for-byte
+  identity.  Scalers are **never** read from a shared/flat directory that is not
+  scoped to the active ``case_name``.
 
 The helpers accept either a raw YAML ``dict`` (used by the ``compute_scalars_*``
 scripts) or a parsed ``ExperimentConfig``-like object (used by training and
@@ -71,12 +73,34 @@ def get_case_name(cfg: Any) -> str:
     return str(case_name)
 
 
-def _scalar_dir_base(cfg: Any) -> str:
+def _scalar_dir_base(cfg: Any) -> Optional[str]:
     data = _get(cfg, "data", {}) or {}
     base = _get(data, "scalar_dir")
-    if not base:
-        raise ValueError("data.scalar_dir must be set in the YAML config")
-    return str(base)
+    return str(base) if base else None
+
+
+def _preprocessed_base(cfg: Any) -> Path:
+    """Root under which every case-scoped preprocessing artifact lives.
+
+    Read from ``data.preprocessed_dir`` (default ``./preprocessed``) and resolved
+    repo-relative so preprocessing, training, and inference agree regardless of
+    the working directory.
+    """
+    data = _get(cfg, "data", {}) or {}
+    base = _get(data, "preprocessed_dir", "./preprocessed") or "./preprocessed"
+    return _resolve_repo_relative(str(base))
+
+
+def case_preprocess_dir(cfg: Any) -> Path:
+    """Canonical case-scoped preprocessing root ``<preprocessed_dir>/<case_name>``.
+
+    All preprocessing outputs for a given YAML/case (normalized predictors,
+    normalized targets, scalars, cached/tiled artifacts) are isolated here so
+    reruns for a different case never overwrite another case's outputs.
+    """
+    base = _preprocessed_base(cfg)
+    case_name = get_case_name(cfg)
+    return base if base.name == case_name else base / case_name
 
 
 def _has_all_scalars(directory: Path) -> bool:
@@ -88,26 +112,96 @@ def _has_all_scalars(directory: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def resolve_scalar_dir(cfg: Any, *, for_writing: bool = False) -> Path:
-    """Resolve the case-scoped scalar directory ``<scalar_dir>/<case_name>``.
+    """Resolve the case-scoped scalar directory for the active ``case_name``.
 
-    * When ``for_writing`` is ``True`` (``compute_scalars_*``) the case-scoped
-      directory is always returned so freshly computed, per-channel scalers land
-      under the owning ``case_name``.
-    * When reading (training / inference) the case-scoped directory is preferred,
-      but if it does not yet contain scalers we fall back to the flat
-      ``scalar_dir`` for backward compatibility with previously computed runs.
+    The canonical location is ``<preprocessed_dir>/<case_name>/scalars`` so every
+    normalization artifact is isolated per case and reruns never clobber another
+    case's scalers.
+
+    * When ``for_writing`` is ``True`` (``compute_scalars_*``) the canonical
+      directory is always returned.
+    * When reading (training / inference) the canonical directory is preferred.
+      If it does not yet contain scalers, we fall back **only** to the
+      *same-case* legacy location ``<scalar_dir>/<case_name>`` (previously
+      computed runs). We NEVER fall back to a shared/flat directory that is not
+      scoped to this ``case_name`` -- doing so would silently mix scalers across
+      cases (the historical source of per-gridpoint shape errors).
     """
-    base = _resolve_repo_relative(_scalar_dir_base(cfg))
-    case_name = get_case_name(cfg)
-    case_dir = base if base.name == case_name else base / case_name
-
+    canonical = case_preprocess_dir(cfg) / "scalars"
     if for_writing:
-        return case_dir
-    if _has_all_scalars(case_dir):
-        return case_dir
-    if _has_all_scalars(base):
-        return base
-    return case_dir
+        return canonical
+    if _has_all_scalars(canonical):
+        return canonical
+
+    # Same-case-only legacy fallback: <scalar_dir>/<case_name>. This is safe
+    # because it is still scoped to THIS case; it can never return another
+    # case's (or a shared flat) directory.
+    legacy_raw = _scalar_dir_base(cfg)
+    if legacy_raw:
+        case_name = get_case_name(cfg)
+        legacy_base = _resolve_repo_relative(legacy_raw)
+        legacy_case = (
+            legacy_base if legacy_base.name == case_name else legacy_base / case_name
+        )
+        if legacy_case != canonical and _has_all_scalars(legacy_case):
+            print(
+                f"[normalization] using legacy case-scoped scalars at {legacy_case}; "
+                f"recompute to migrate them under {canonical}"
+            )
+            return legacy_case
+
+    # No scalers found anywhere case-scoped. Return the canonical (missing)
+    # directory so downstream code raises a clear, case-specific error instead
+    # of silently reading another case's scalers.
+    return canonical
+
+
+def assert_scalars_available(cfg: Any, *, role: str = "") -> Path:
+    """Return the resolved scalar dir, or raise a clear error if incomplete.
+
+    Use at stages that strictly require precomputed scalers (fine-tuning,
+    inference). The dataset itself stays tolerant of missing scalers so the very
+    first ``compute_scalars_*`` pass can still construct it.
+    """
+    directory = resolve_scalar_dir(cfg, for_writing=False)
+    if not _has_all_scalars(directory):
+        case_name = get_case_name(cfg)
+        missing = [
+            f"{name}.npy"
+            for name in SCALAR_NAMES
+            if not (directory / f"{name}.npy").exists()
+        ]
+        raise FileNotFoundError(
+            f"Normalization scalers are missing for case '{case_name}' "
+            f"(role={role or 'train/inference'}): expected all of "
+            f"{list(SCALAR_NAMES)} under {directory}, missing {missing}. "
+            f"Run compute_scalars for THIS YAML/case first, e.g. "
+            f"`python compute_scalars_*_prism.py --config <the-same-YAML>`. "
+            f"Per-case scalers are never shared across cases."
+        )
+    return directory
+
+
+def log_case_context(cfg: Any, role: str, *, logger=print) -> Dict[str, str]:
+    """Print (and return) the active case_name and case-scoped directories.
+
+    Emits the standardized lines requested for every entry point, e.g.::
+
+        [inference] Using case_name: narr_prism_LA_county
+        [inference] Using preprocessing directory: <repo>/.../preprocessed/narr_prism_LA_county
+        [inference] Using scalar directory: <repo>/.../preprocessed/narr_prism_LA_county/scalars
+    """
+    case_name = get_case_name(cfg)
+    preprocess_dir = case_preprocess_dir(cfg)
+    scalar_dir = resolve_scalar_dir(cfg, for_writing=False)
+    logger(f"[{role}] Using case_name: {case_name}")
+    logger(f"[{role}] Using preprocessing directory: {preprocess_dir}")
+    logger(f"[{role}] Using scalar directory: {scalar_dir}")
+    return {
+        "case_name": case_name,
+        "preprocess_dir": str(preprocess_dir),
+        "scalar_dir": str(scalar_dir),
+    }
 
 
 def scalar_paths(directory: Path | str) -> Dict[str, Path]:
