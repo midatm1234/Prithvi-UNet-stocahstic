@@ -146,6 +146,11 @@ dates:
   inference:
     start: '2016-01-01'
     end: '2025-12-31'
+preprocess:
+  save_train_targets: true
+  save_val_targets: true
+  save_inference_targets: false
+  inference_include_observed_targets_for_eval: false
 normalization:
   predictor_method: standardize
   target_method: per_variable
@@ -177,7 +182,7 @@ predictands:
       fixed_scale: null
     normalization:
       method: standardize
-      mode: global
+      mode: gridpoint
       eps_std: 1.0e-06
   tmin:
     name: tmin
@@ -191,7 +196,7 @@ predictands:
       fixed_scale: null
     normalization:
       method: standardize
-      mode: global
+      mode: gridpoint
       eps_std: 1.0e-06
 model:
   input_mu: ./examples/MERRA_PRISM/scalars_with_H/inputs_mean.npy
@@ -234,7 +239,7 @@ model:
   - 3
   - 3
 job_id: MERRA_PRISM
-case_name: merra_prism_LA_county
+case_name: merra_prism_CA
 type_training: full_dataset
 batch_size: 1
 num_epochs: 20
