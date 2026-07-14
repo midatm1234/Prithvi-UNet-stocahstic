@@ -131,21 +131,24 @@ model:
     likelihood_weighting: false
     reduce_mean: true
     # --- reverse process / sampling ---
-    sampling_method: pc        # 'pc' (predictor-corrector) or 'ode'
-    predictor: euler_maruyama  # euler_maruyama | reverse_diffusion | none
-    corrector: none            # langevin | none
-    snr: 0.16                  # signal-to-noise ratio for Langevin corrector
+    sampling_method: ddim       # 'pc' (predictor-corrector), 'ode', or 'ddim'
+    eta: 0.2                    # DDIM stochasticity (0=deterministic, 1=DDPM)
+    predictor: euler_maruyama   # only used when sampling_method=pc
+    corrector: none             # only used when sampling_method=pc
+    snr: 0.16
     n_corrector_steps: 1
-    num_sampling_steps: 128    # reverse steps used at inference time
+    num_sampling_steps: 256     # more steps improve sample quality (was 128)
     probability_flow: false
     denoise: true
     # --- score network ---
     base_channels: 64
     channel_multipliers: [1, 2, 2]
-    num_res_blocks: 1
+    num_res_blocks: 2           # increased from 1 for more network capacity
     time_embed_dim: 128
-    dropout: 0.0
+    dropout: 0.1                # regularisation (was 0.0)
     fourier_scale: 16.0
+    projected_cond_channels: 128
+    residual_diffusion: false
     # --- documentation only (channels are inferred from the model) ---
     conditioning_channels: null
     output_channels: 2
@@ -191,7 +194,7 @@ resume_checkpoint_path: null
 # The diffusion head models pr/tasmax jointly; the hurdle precipitation model is
 # not compatible with it, so use the single-head precipitation model here.
 precip_model: single_head
-precip_wet_threshold: 0.5
+precip_wet_threshold: 0.1  # mm/day (converted to normalised units at runtime using p95 scaler)
 precip_lambda_occurrence: 1.0
 precip_lambda_amount: 1.0
 precip_amount_loss_type: smoothl1

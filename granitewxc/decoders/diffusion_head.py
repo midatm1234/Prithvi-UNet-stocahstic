@@ -12,6 +12,13 @@ and decoding generated samples back to physical units (inference). Keeping the
 head scaler-agnostic makes it reusable across the CORDEX models and keeps the
 precipitation non-negativity logic in one place (the model decoder).
 
+**Residual diffusion mode** (``residual_diffusion=True``):
+When enabled the head generates a *residual* correction relative to a provided
+deterministic baseline rather than the full target from noise.  The baseline
+(in standardized space) is concatenated to the conditioning features. This
+makes the learning problem considerably easier and ensures the ensemble mean
+stays close to the deterministic prediction.
+
 Public surface:
     * ``DiffusionHeadConfig`` - resolves diffusion parameters from a config.
     * ``build_diffusion_head`` - factory used by the CORDEX models.
@@ -89,6 +96,12 @@ class ConditionalScoreUNet(nn.Module):
     channel dimension and processed by a small time-conditioned U-Net. Skip
     connections are resized so that arbitrary (non power-of-two) spatial sizes
     are supported; the output is returned at the input spatial resolution.
+
+    When ``cond_channels`` is large (e.g. 640 from the CORDEX UNet decoder) a
+    lightweight ``cond_proj`` layer first projects conditioning to
+    ``projected_cond_channels`` (default = 2 × ``base_channels``) before
+    concatenation, preventing the first conv from being overwhelmed by an
+    excessively wide input.
     """
 
     def __init__(
@@ -101,10 +114,23 @@ class ConditionalScoreUNet(nn.Module):
         time_embed_dim: int = 128,
         dropout: float = 0.0,
         fourier_scale: float = 16.0,
+        projected_cond_channels: int = 0,
     ):
         super().__init__()
         self.target_channels = int(target_channels)
         self.cond_channels = int(cond_channels)
+
+        # Conditioning projection: if cond_channels is large, project down first
+        # so the score network isn't dominated by conditioning at the first layer.
+        if projected_cond_channels > 0 and cond_channels > projected_cond_channels:
+            self.cond_proj: nn.Module = nn.Sequential(
+                nn.Conv2d(cond_channels, projected_cond_channels, 1),
+                nn.SiLU(),
+            )
+            effective_cond = projected_cond_channels
+        else:
+            self.cond_proj = nn.Identity()
+            effective_cond = cond_channels
 
         self.time_embed = nn.Sequential(
             GaussianFourierProjection(time_embed_dim, scale=fourier_scale),
@@ -113,7 +139,7 @@ class ConditionalScoreUNet(nn.Module):
             nn.Linear(time_embed_dim, time_embed_dim),
         )
 
-        in_channels = self.target_channels + self.cond_channels
+        in_channels = self.target_channels + effective_cond
         self.in_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
 
         # Encoder
@@ -161,6 +187,8 @@ class ConditionalScoreUNet(nn.Module):
         out_size = x.shape[-2:]
         if cond.shape[-2:] != out_size:
             cond = F.interpolate(cond, size=out_size, mode="bilinear", align_corners=False)
+
+        cond = self.cond_proj(cond)
 
         temb = self.time_embed(t)
         h = self.in_conv(torch.cat([x, cond], dim=1))
@@ -220,16 +248,22 @@ class DiffusionHeadConfig:
     corrector: str = "none"
     snr: float = 0.16
     n_corrector_steps: int = 1
-    num_sampling_steps: int = 128
+    num_sampling_steps: int = 256
     probability_flow: bool = False
     denoise: bool = True
     sampling_eps: float = 1e-3
+    # DDIM stochasticity: 0 = fully deterministic, 1 = DDPM-equivalent
+    eta: float = 0.0
+    # conditioning projection (0 = no projection)
+    projected_cond_channels: int = 128
+    # residual diffusion: generate residual around deterministic baseline
+    residual_diffusion: bool = False
     # network
     base_channels: int = 64
     channel_multipliers: tuple[int, ...] = (1, 2, 2)
-    num_res_blocks: int = 1
+    num_res_blocks: int = 2
     time_embed_dim: int = 128
-    dropout: float = 0.0
+    dropout: float = 0.1
     fourier_scale: float = 16.0
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -288,6 +322,9 @@ class DiffusionHeadConfig:
             "probability_flow",
             "denoise",
             "sampling_eps",
+            "eta",
+            "projected_cond_channels",
+            "residual_diffusion",
             "base_channels",
             "channel_multipliers",
             "channel_mults",
@@ -323,6 +360,11 @@ class DiffusionHeadConfig:
             probability_flow=bool(pick("probability_flow", defaults.probability_flow)),
             denoise=bool(pick("denoise", defaults.denoise)),
             sampling_eps=float(pick("sampling_eps", defaults.sampling_eps)),
+            eta=float(pick("eta", defaults.eta)),
+            projected_cond_channels=int(
+                pick("projected_cond_channels", defaults.projected_cond_channels)
+            ),
+            residual_diffusion=bool(pick("residual_diffusion", defaults.residual_diffusion)),
             base_channels=int(pick("base_channels", defaults.base_channels)),
             channel_multipliers=multipliers,
             num_res_blocks=int(pick("num_res_blocks", defaults.num_res_blocks)),
@@ -340,6 +382,15 @@ class DiffusionHead(nn.Module):
         cond_channels: number of channels in the conditioning feature map.
         output_channels: number of target variables (e.g. 2 for ``pr``/``tasmax``).
         head_config: resolved :class:`DiffusionHeadConfig`.
+
+    Residual diffusion (``head_config.residual_diffusion=True``):
+        In this mode the head generates a *residual* around a deterministic
+        baseline supplied in the conditioning tensor.  The score network input
+        is the noised residual (not the noised full target) and the conditioning
+        features include both the UNet decoder activations and the deterministic
+        baseline (projected to a small number of channels).  During training,
+        call ``training_loss(cond, target_std, baseline_std=...)``.  During
+        sampling, call ``sample(cond, H, W, baseline_std=...)``.
     """
 
     def __init__(
@@ -353,17 +404,44 @@ class DiffusionHead(nn.Module):
         self.cond_channels = int(cond_channels)
         self.output_channels = int(output_channels)
 
+        # In residual mode the baseline (output_channels) is concatenated to
+        # the conditioning before passing to the score network.
+        effective_cond = self.cond_channels
+        if head_config.residual_diffusion:
+            effective_cond = self.cond_channels + self.output_channels
+
         self.score_model = ConditionalScoreUNet(
             target_channels=self.output_channels,
-            cond_channels=self.cond_channels,
+            cond_channels=effective_cond,
             base_channels=head_config.base_channels,
             channel_multipliers=head_config.channel_multipliers,
             num_res_blocks=head_config.num_res_blocks,
             time_embed_dim=head_config.time_embed_dim,
             dropout=head_config.dropout,
             fourier_scale=head_config.fourier_scale,
+            projected_cond_channels=head_config.projected_cond_channels,
         )
         self.sde: SDE = build_sde(head_config.sde_params(), num_scales=head_config.num_scales)
+
+    # -- conditioning helper ------------------------------------------------
+    def _build_cond(
+        self,
+        cond: torch.Tensor,
+        baseline_std: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Concatenate baseline to conditioning in residual mode."""
+        if not self.cfg.residual_diffusion:
+            return cond
+        if baseline_std is None:
+            raise ValueError(
+                "residual_diffusion=True requires baseline_std to be provided "
+                "to training_loss() and sample()."
+            )
+        if baseline_std.shape[-2:] != cond.shape[-2:]:
+            baseline_std = F.interpolate(
+                baseline_std, size=cond.shape[-2:], mode="bilinear", align_corners=False
+            )
+        return torch.cat([cond, baseline_std], dim=1)
 
     # -- score function -----------------------------------------------------
     def score_fn(self, x: torch.Tensor, cond: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -376,25 +454,52 @@ class DiffusionHead(nn.Module):
 
         labels = t * self.cfg.noise_conditioning_scale
         model_out = self.score_model(x, cond, labels)
-        std = self.sde.marginal_prob(torch.zeros_like(x), t)[1]
+        std = self.sde.marginal_prob(torch.zeros_like(x[:, :1, :1, :1]), t)[1]
+        # Clamp std away from zero to prevent numerical explosion at small t.
+        std = std.clamp(min=1e-5)
         return -model_out / std[:, None, None, None]
 
     # -- training -----------------------------------------------------------
-    def training_loss(self, cond: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Score-matching loss for a standardized ``target`` given ``cond``."""
+    def training_loss(
+        self,
+        cond: torch.Tensor,
+        target: torch.Tensor,
+        baseline_std: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Score-matching loss.
+
+        Args:
+            cond: conditioning feature map ``[B, C_cond, h, w]``.
+            target: standardized target (or residual when ``residual_diffusion=True``),
+                shape ``[B, C_out, H, W]``.
+            baseline_std: deterministic baseline in standardized space, required
+                when ``residual_diffusion=True``.
+        """
+        if self.cfg.residual_diffusion and baseline_std is not None:
+            # Train on the residual: target_residual = target - baseline
+            target_input = target - baseline_std.detach()
+        else:
+            target_input = target
+
+        full_cond = self._build_cond(cond, baseline_std)
         return score_matching_loss(
             self.sde,
             self.score_fn,
-            target,
-            cond,
+            target_input,
+            full_cond,
             reduce_mean=self.cfg.reduce_mean,
             likelihood_weighting=self.cfg.likelihood_weighting,
             eps=self.cfg.eps,
         )
 
-    def forward(self, cond: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        cond: torch.Tensor,
+        target: torch.Tensor,
+        baseline_std: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Alias for :meth:`training_loss` (keeps ``nn.Module`` semantics)."""
-        return self.training_loss(cond, target)
+        return self.training_loss(cond, target, baseline_std=baseline_std)
 
     # -- sampling -----------------------------------------------------------
     @torch.no_grad()
@@ -404,18 +509,31 @@ class DiffusionHead(nn.Module):
         height: int,
         width: int,
         generator: torch.Generator | None = None,
+        baseline_std: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reverse-diffusion sample in standardized target space.
 
         Returns a tensor of shape ``[B, output_channels, height, width]``.
+
+        In residual diffusion mode the returned tensor is the FULL prediction
+        (baseline + generated residual), not just the residual.
         """
+        full_cond = self._build_cond(cond, baseline_std)
         sampler = build_sampler(
             self.cfg,
             self.sde,
             (self.output_channels, int(height), int(width)),
             device=cond.device,
         )
-        return sampler(self.score_fn, cond, generator=generator)
+        residual_or_full = sampler(self.score_fn, full_cond, generator=generator)
+
+        if self.cfg.residual_diffusion and baseline_std is not None:
+            if baseline_std.shape[-2:] != (height, width):
+                baseline_std = F.interpolate(
+                    baseline_std, size=(height, width), mode="bilinear", align_corners=False
+                )
+            return baseline_std + residual_or_full
+        return residual_or_full
 
 
 def _coerce_mapping(value: Any) -> dict[str, Any]:

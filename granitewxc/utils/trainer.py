@@ -270,6 +270,22 @@ def _inject_precip_hurdle_aux(batch: Dict[str, torch.Tensor], model: torch.nn.Mo
         batch.pop("__precip_hurdle_aux", None)
 
 
+def _inject_bernoulli_gamma_aux(batch: Dict[str, torch.Tensor], model: torch.nn.Module) -> None:
+    """Ensure Bernoulli-Gamma aux tensors (logit_wet, log_mu, log_phi) are present on the
+    caller batch after model.forward(), even under DDP/FSDP wrappers."""
+    aux = None
+    for candidate in _iter_wrapped_modules(model):
+        last = getattr(candidate, "_last_bg_aux", None)
+        if last is not None:
+            aux = last
+            break
+
+    if aux is not None:
+        batch["__bernoulli_gamma_aux"] = aux
+    else:
+        batch.pop("__bernoulli_gamma_aux", None)
+
+
 def batch_step(
     batch: Dict[str, torch.Tensor],
     model: torch.nn.Module,
@@ -283,10 +299,12 @@ def batch_step(
         with autocast(device_type="cuda", dtype=dtype):
             prediction = model(batch)
             _inject_precip_hurdle_aux(batch, model)
+            _inject_bernoulli_gamma_aux(batch, model)
             loss = loss_func(prediction, batch)
     else:
         prediction = model(batch)
         _inject_precip_hurdle_aux(batch, model)
+        _inject_bernoulli_gamma_aux(batch, model)
         loss = loss_func(prediction, batch)
 
     return loss

@@ -19,6 +19,8 @@ PRECIP_VAR_NAMES = {"pr", "precip", "precipitation"}
 
 DIFFUSION_HEAD_ALIASES = {"diffusion", "diffusion_head", "sde", "score", "score_sde"}
 
+BERNOULLI_GAMMA_ALIASES = {"bernoulli_gamma", "bernoulli-gamma", "bg", "zero_inflated_gamma"}
+
 
 def resolve_head_type(config) -> str:
     """Return ``'diffusion'`` when the config selects the diffusion head.
@@ -52,6 +54,11 @@ def _canonicalize_precip_model(value: str | None) -> str:
         "bernoulli_plus_positive": "hurdle",
         "bernoulli_positive_amount": "hurdle",
         "bernoulli-plus-positive-amount": "hurdle",
+        # Bernoulli-Gamma zero-inflated model
+        "bernoulli_gamma": "bernoulli_gamma",
+        "bernoulli-gamma": "bernoulli_gamma",
+        "bg": "bernoulli_gamma",
+        "zero_inflated_gamma": "bernoulli_gamma",
     }
     if text not in aliases:
         raise ValueError(
@@ -195,6 +202,38 @@ class ClimateECCCFinetuneWrapper(FinetuneWrapper):
         """
         return bool(return_pre_inverse or return_raw_output)
 
+    def _get_deterministic_baseline_std(
+        self,
+        cond: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+    ) -> torch.Tensor | None:
+        """Return deterministic baseline in standardized space for residual diffusion.
+
+        If the model has a ``baseline_head`` (a deterministic conv head trained
+        jointly), its standardized output is used. Otherwise returns None and
+        the caller should pass None to the diffusion head.
+
+        The baseline_head is a lightweight conv decoder that can optionally be
+        added to the model when ``residual_diffusion=True`` in the diffusion
+        config. When absent the residual diffusion head uses pure cond features
+        and the diffusion generates the full target from scratch (same as
+        non-residual mode).
+        """
+        if not getattr(self, "baseline_head", None):
+            return None
+        with torch.no_grad():
+            raw = self.baseline_head(cond)
+        scaler_offset = batch.get("__scaler_offset")
+        constrained = self._apply_output_constraints(raw)
+        mu, sigma = self._resolve_output_scalers(constrained, scaler_offset=scaler_offset)
+        method_codes = self.predictand_scaling_method_codes.to(device=constrained.device)
+        code = method_codes.view(1, -1, 1, 1)
+        denom = sigma + 1e-12
+        zscore = (constrained - mu) / denom
+        divide = constrained / denom
+        log1p = (torch.log1p(torch.clamp(constrained, min=0.0)) - mu) / denom
+        return torch.where(code == 1, divide, torch.where(code == 2, log1p, zscore))
+
     def _diffusion_forward(
         self,
         cond: torch.Tensor,
@@ -208,16 +247,36 @@ class ClimateECCCFinetuneWrapper(FinetuneWrapper):
         score-matching loss. Inference (return flags set) runs the reverse
         diffusion sampler and decodes the standardized sample to physical
         ``pr``/``tasmax`` (preserving precipitation non-negativity).
+
+        Residual diffusion mode: when ``diffusion_head.cfg.residual_diffusion``
+        is True and a ``baseline_head`` module is present, the diffusion head
+        generates a residual correction around the deterministic baseline
+        prediction. The baseline is computed in standardized space and passed
+        to the diffusion head as ``baseline_std``.
         """
         self._last_precip_hurdle_aux = None
         scaler_offset = batch.get("__scaler_offset")
 
+        # Optionally compute deterministic baseline in std space for residual diffusion.
+        residual_mode = (
+            getattr(self.diffusion_head, "cfg", None) is not None
+            and getattr(self.diffusion_head.cfg, "residual_diffusion", False)
+        )
+        baseline_std: torch.Tensor | None = None
+        if residual_mode:
+            baseline_std = self._get_deterministic_baseline_std(cond, batch)
+
         if not self._diffusion_wants_sample(return_pre_inverse, return_raw_output):
             target_std = self._encode_targets_std(batch["y"], scaler_offset=scaler_offset)
-            return self.diffusion_head.training_loss(cond, target_std)
+            return self.diffusion_head.training_loss(cond, target_std, baseline_std=baseline_std)
 
         expected_hw = batch["y"].shape[-2:] if "y" in batch else cond.shape[-2:]
-        std_sample = self.diffusion_head.sample(cond, int(expected_hw[0]), int(expected_hw[1]))
+        std_sample = self.diffusion_head.sample(
+            cond,
+            int(expected_hw[0]),
+            int(expected_hw[1]),
+            baseline_std=baseline_std,
+        )
         x_out = self._decode_targets_std(std_sample, scaler_offset=scaler_offset)
         x_pre_inverse = std_sample
         raw_out = std_sample
@@ -495,8 +554,36 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 cond_channels=self._decoder_output_channels,
                 output_channels=int(self.output_scalers_sigma.shape[1]),
             )
+            # Optional lightweight deterministic head for residual diffusion mode.
+            # When residual_diffusion=True the diffusion score network generates a
+            # correction around this baseline rather than the full target from noise.
+            _diff_cfg = getattr(self.diffusion_head, "cfg", None)
+            if _diff_cfg is not None and getattr(_diff_cfg, "residual_diffusion", False):
+                n_out = int(self.output_scalers_sigma.shape[1])
+                self.baseline_head: nn.Module | None = nn.Sequential(
+                    nn.Conv2d(
+                        self._decoder_output_channels,
+                        self._decoder_output_channels,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                    ),
+                    nn.LeakyReLU(),
+                    nn.Conv2d(
+                        self._decoder_output_channels,
+                        n_out,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                    ),
+                )
+                self._init_weights(self.baseline_head[0])
+                self._init_weights(self.baseline_head[2])
+            else:
+                self.baseline_head = None
         else:
             self.diffusion_head = None
+            self.baseline_head = None
         if self.precip_hurdle_enabled:
             self.precip_wet_head = nn.Conv2d(
                 in_channels=self._decoder_output_channels,
@@ -507,6 +594,23 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 padding_mode='replicate',
             )
             self._init_weights(self.precip_wet_head)
+
+        # Bernoulli-Gamma precipitation head (optional, replaces pr output channel)
+        if self.precip_bg_enabled:
+            from granitewxc.models.bernoulli_gamma_head import (
+                BernoulliGammaConfig,
+                BernoulliGammaHead,
+            )
+            _bg_cfg = BernoulliGammaConfig.from_config(config) if config is not None else BernoulliGammaConfig()
+            self.precip_bg_head: BernoulliGammaHead | None = BernoulliGammaHead(
+                in_channels=self._decoder_output_channels,
+                n_output_vars=1,
+                config=_bg_cfg,
+            )
+            self._bg_config = _bg_cfg
+        else:
+            self.precip_bg_head = None
+            self._bg_config = None
 
     def _configure_predictand_decoding(self, config: ExperimentConfig | None) -> None:
         n_outputs = int(self.output_scalers_sigma.shape[1])
@@ -607,8 +711,9 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         self.precip_model = precip_model
         self.precip_channel_index = precip_idx
         self.precip_hurdle_enabled = precip_hurdle_enabled
+        self.precip_bg_enabled = precip_model == "bernoulli_gamma" and precip_idx >= 0
         self.precip_wet_threshold = float(
-            getattr(config, "precip_wet_threshold", 0.0) if config is not None else 0.0
+            getattr(config, "precip_wet_threshold", 0.1) if config is not None else 0.1
         )
         self.precip_occurrence_prob_threshold = float(
             getattr(config, "precip_occurrence_prob_threshold", 0.5)
@@ -620,6 +725,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             1.0,
         )
         self._last_precip_hurdle_aux = None
+        self._last_bg_aux: dict | None = None
         self._precip_softplus_link = PositivePrecipLink()
 
     def _apply_output_constraints(self, raw_out: torch.Tensor) -> torch.Tensor:
@@ -974,6 +1080,28 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 raise ValueError("precip_model='hurdle' requested but precip_wet_head is not initialized.")
             wet_logits = self.precip_wet_head(out)
 
+        # Bernoulli-Gamma head: replaces the pr channel with expected precipitation
+        self._last_bg_aux = None
+        if self.precip_bg_enabled and self.precip_bg_head is not None:
+            from granitewxc.models.bernoulli_gamma_head import bernoulli_gamma_nll
+            bg_out = self.precip_bg_head.predict(out, stochastic=False)
+            pr_idx = int(self.precip_channel_index)
+            bg_pr = bg_out["pr_expected"]
+            # Replace pr channel in x_out with BG expected value and store aux
+            x_clone = x.clone()
+            x_clone[:, pr_idx : pr_idx + 1, ...] = bg_pr
+            x = x_clone
+            self._last_bg_aux = {
+                "logit_wet": bg_out["logit_wet"],
+                "log_mu": bg_out["log_mu"],
+                "log_phi": bg_out["log_phi"],
+                "p_wet": bg_out["p_wet"],
+                "mu_pos": bg_out["mu_pos"],
+                "phi": bg_out["phi"],
+                "pr_expected": bg_pr,
+            }
+            batch["__bernoulli_gamma_aux"] = self._last_bg_aux
+
         raw_out = x
         scaler_offset = batch.get("__scaler_offset")
         x_out, x_pre_inverse = self._decode_outputs(
@@ -981,6 +1109,14 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             scaler_offset=scaler_offset,
             wet_logits=wet_logits,
         )
+        # When BG is active, the pr channel in x_out is already in physical units
+        # (BG outputs in mm/day directly). Undo the inverse scaling applied by
+        # _decode_outputs for the pr channel to avoid double-denormalization.
+        if self.precip_bg_enabled and self._last_bg_aux is not None:
+            pr_idx = int(self.precip_channel_index)
+            decoded_channels = list(x_out.split(1, dim=1))
+            decoded_channels[pr_idx] = bg_pr
+            x_out = torch.cat(decoded_channels, dim=1)
         expected_hw = batch["y"].shape[-2:]
         if x_out.shape[-2:] != expected_hw:
             x_out = F.interpolate(
@@ -1237,8 +1373,31 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
                 cond_channels=self.embed_dim_backbone,
                 output_channels=int(self.output_scalers_sigma.shape[1]),
             )
+            _diff_cfg = getattr(self.diffusion_head, "cfg", None)
+            if _diff_cfg is not None and getattr(_diff_cfg, "residual_diffusion", False):
+                n_out = int(self.output_scalers_sigma.shape[1])
+                self.baseline_head: nn.Module | None = nn.Sequential(
+                    nn.Conv2d(
+                        self.embed_dim_backbone,
+                        self.embed_dim_backbone,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                    ),
+                    nn.LeakyReLU(),
+                    nn.Conv2d(
+                        self.embed_dim_backbone,
+                        n_out,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                    ),
+                )
+            else:
+                self.baseline_head = None
         else:
             self.diffusion_head = None
+            self.baseline_head = None
 
     def _configure_predictand_decoding(self, config: ExperimentConfig | None) -> None:
         n_outputs = int(self.output_scalers_sigma.shape[1])

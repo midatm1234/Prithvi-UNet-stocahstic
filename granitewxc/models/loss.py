@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -94,12 +96,33 @@ def _canonicalize_precip_model(value: Any) -> str:
         "bernoulli_plus_positive": "hurdle",
         "bernoulli_positive_amount": "hurdle",
         "bernoulli-plus-positive-amount": "hurdle",
+        # Bernoulli-Gamma zero-inflated model
+        "bernoulli_gamma": "bernoulli_gamma",
+        "bernoulli-gamma": "bernoulli_gamma",
+        "bg": "bernoulli_gamma",
+        "zero_inflated_gamma": "bernoulli_gamma",
     }
     if text not in aliases:
         raise ValueError(
             f"Unsupported precip_model '{value}'. Expected one of {sorted(aliases)}."
         )
     return aliases[text]
+
+
+def _resolve_bernoulli_gamma_index(output_vars: list[str], cfg: Mapping[str, Any]) -> int:
+    """Return the channel index for the BG precipitation variable, or -1 if not applicable."""
+    precip_model = _canonicalize_precip_model(
+        cfg.get("precip_model", cfg.get("precip_head_type", "single_head"))
+    )
+    if precip_model != "bernoulli_gamma":
+        return -1
+    idx = next(
+        (i for i, name in enumerate(output_vars) if str(name).lower() in PRECIP_VAR_NAMES),
+        -1,
+    )
+    if idx < 0:
+        raise ValueError("precip_model='bernoulli_gamma' requires a precipitation variable (e.g. 'pr').")
+    return idx
 
 
 def _resolve_precip_hurdle_spec(output_vars: list[str], cfg: Mapping[str, Any]) -> PrecipHurdleLossSpec | None:
@@ -155,6 +178,18 @@ class CompositePredictandLoss:
                 self._amount_loss_fn = nn.MSELoss(reduction="mean")
             else:
                 self._amount_loss_fn = nn.SmoothL1Loss(reduction="mean")
+
+        self._bg_precip_index: int = _resolve_bernoulli_gamma_index(self.output_vars, cfg)
+        self._bg_loss: Any | None = None
+        if self._bg_precip_index >= 0:
+            from granitewxc.models.bernoulli_gamma_head import BernoulliGammaConfig, BernoulliGammaLoss
+
+            _bg_cfg = BernoulliGammaConfig(
+                wet_threshold=float(cfg.get("precip_wet_threshold", 0.1)),
+                lambda_occurrence=float(cfg.get("precip_lambda_occurrence", 1.0)),
+                lambda_positive_amount=float(cfg.get("precip_lambda_amount", 1.0)),
+            )
+            self._bg_loss = BernoulliGammaLoss(config=_bg_cfg, output_vars=self.output_vars)
 
         predictand_cfg = _coerce_mapping(cfg.get("predictands"))
         self._dist_specs: dict[int, DistributionLossSpec] = {}
@@ -505,11 +540,14 @@ class CompositePredictandLoss:
         return total / total_weight
 
     def _base_rmse(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if self._precip_hurdle is None:
+        excluded: set[int] = set()
+        if self._precip_hurdle is not None:
+            excluded.add(self._precip_hurdle.precip_index)
+        if self._bg_precip_index >= 0:
+            excluded.add(self._bg_precip_index)
+        if not excluded:
             return torch.sqrt(torch.mean((pred - target) ** 2))
-
-        precip_idx = self._precip_hurdle.precip_index
-        keep_indices = [idx for idx in range(pred.shape[1]) if idx != precip_idx]
+        keep_indices = [idx for idx in range(pred.shape[1]) if idx not in excluded]
         if not keep_indices:
             return torch.zeros((), device=pred.device, dtype=pred.dtype)
         pred_non_precip = pred[:, keep_indices, ...]
@@ -584,6 +622,32 @@ class CompositePredictandLoss:
         }
         return total, terms
 
+    def _compute_bernoulli_gamma_loss(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        assert self._bg_precip_index >= 0
+        assert self._bg_loss is not None
+
+        aux = batch.get("__bernoulli_gamma_aux")
+        if not isinstance(aux, Mapping):
+            raise ValueError(
+                "precip_model='bernoulli_gamma' requires model auxiliary outputs in "
+                "batch['__bernoulli_gamma_aux']."
+            )
+
+        logit_wet = aux.get("logit_wet")
+        log_mu = aux.get("log_mu")
+        log_phi = aux.get("log_phi")
+        if not torch.is_tensor(logit_wet) or not torch.is_tensor(log_mu) or not torch.is_tensor(log_phi):
+            raise ValueError(
+                "batch['__bernoulli_gamma_aux'] must contain tensors: logit_wet, log_mu, log_phi."
+            )
+
+        target_pr = batch["y"][:, self._bg_precip_index, ...]
+        loss = self._bg_loss(logit_wet, log_mu, log_phi, target_pr)
+        terms = self._bg_loss.get_last_terms()
+        return loss, terms
+
     def __call__(self, y_hat: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         target = batch["y"]
         total = self._base_rmse(y_hat, target)
@@ -594,10 +658,17 @@ class CompositePredictandLoss:
             total = total + precip_loss
             terms.update(precip_terms)
 
+        if self._bg_precip_index >= 0:
+            bg_loss, bg_terms = self._compute_bernoulli_gamma_loss(batch)
+            total = total + bg_loss
+            terms.update(bg_terms)
+
         for ch_idx, spec in self._dist_specs.items():
             if not spec.enabled or spec.weight <= 0.0:
                 continue
             if self._precip_hurdle is not None and ch_idx == self._precip_hurdle.precip_index:
+                continue
+            if self._bg_precip_index >= 0 and ch_idx == self._bg_precip_index:
                 continue
             dist_term = self._compute_distribution_loss(y_hat[:, ch_idx, ...], target[:, ch_idx, ...], spec)
             weighted = dist_term * spec.weight
@@ -725,6 +796,78 @@ def _head_type_is_diffusion(config: Any) -> bool:
     }
 
 
+def _precip_model_is_bernoulli_gamma(config: Any) -> bool:
+    raw = _canonicalize_precip_model(
+        getattr(config, "precip_model", getattr(config, "precip_head_type", "single_head"))
+    )
+    return raw == "bernoulli_gamma"
+
+
+def _resolve_precip_wet_threshold(config: Any, merged_cfg: dict[str, Any], output_vars: list[str]) -> dict[str, Any]:
+    """Convert precip_wet_threshold from mm/day (physical) to normalised units.
+
+    Only applies when ``precip_model='bernoulli_gamma'``.  For legacy hurdle
+    configs the threshold is already stored in normalised space and must not
+    be divided again.
+
+    ``precip_wet_threshold`` is expressed in mm/day in the YAML.  The model
+    operates on precipitation that has been divided by its p95 scalar, so the
+    threshold must be divided by the same value before being compared against
+    ``batch["y"]``.  The p95 is taken from ``targets_std.npy`` at the
+    precipitation variable index.
+
+    If the scaler file cannot be found the threshold is passed through
+    unchanged with a warning.
+    """
+    precip_model = _canonicalize_precip_model(
+        merged_cfg.get("precip_model", merged_cfg.get("precip_head_type", "single_head"))
+    )
+    if precip_model != "bernoulli_gamma":
+        return merged_cfg
+
+    raw_threshold = float(merged_cfg.get("precip_wet_threshold", 0.1))
+
+    pr_idx = next(
+        (i for i, name in enumerate(output_vars) if str(name).lower() in PRECIP_VAR_NAMES),
+        -1,
+    )
+    if pr_idx < 0:
+        return merged_cfg
+
+    # Locate targets_std.npy via model config or data.scalers
+    p95 = None
+    model_cfg = getattr(config, "model", None)
+    target_sigma_path = getattr(model_cfg, "target_sigma", None) if model_cfg is not None else None
+    if target_sigma_path is None:
+        data_cfg = getattr(config, "data", None)
+        scalers = getattr(data_cfg, "scalers", None) if data_cfg is not None else None
+        if isinstance(scalers, Mapping):
+            target_sigma_path = scalers.get("targets_std")
+        elif hasattr(scalers, "targets_std"):
+            target_sigma_path = getattr(scalers, "targets_std")
+
+    if target_sigma_path is not None:
+        try:
+            arr = np.load(str(target_sigma_path))
+            p95 = float(np.ravel(arr)[pr_idx])
+        except Exception:
+            pass
+
+    if p95 is None or p95 <= 0.0:
+        import warnings
+        warnings.warn(
+            f"precip_wet_threshold: could not load p95 scaler to convert {raw_threshold} mm/day "
+            "to normalised units — using the raw value as-is.",
+            stacklevel=4,
+        )
+        return merged_cfg
+
+    normalised = raw_threshold / p95
+    updated = dict(merged_cfg)
+    updated["precip_wet_threshold"] = normalised
+    return updated
+
+
 def build_loss_fn(config: Any, output_vars: list[str]):
     if _head_type_is_diffusion(config):
         from granitewxc.models.diffusion_loss import DiffusionLossPassthrough
@@ -755,6 +898,7 @@ def build_loss_fn(config: Any, output_vars: list[str]):
     precip_model = _canonicalize_precip_model(
         merged_cfg.get("precip_model", merged_cfg.get("precip_head_type", "single_head"))
     )
-    if not loss_cfg and precip_model != "hurdle":
+    if not loss_cfg and precip_model not in {"hurdle", "bernoulli_gamma"}:
         return rmse_loss
+    merged_cfg = _resolve_precip_wet_threshold(config, merged_cfg, output_vars)
     return CompositePredictandLoss(output_vars=output_vars, loss_cfg=merged_cfg)
