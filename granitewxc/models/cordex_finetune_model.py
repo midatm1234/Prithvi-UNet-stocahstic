@@ -12,9 +12,32 @@ from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.target_transforms import PositivePrecipLink
 from granitewxc.models.finetune_model import FinetuneWrapper
 from granitewxc.decoders.downscaling import ConvTransposeBlock, InterpBlock, PixelShuffleBlock
+from granitewxc.decoders.diffusion_head import build_diffusion_head
 
 
 PRECIP_VAR_NAMES = {"pr", "precip", "precipitation"}
+
+DIFFUSION_HEAD_ALIASES = {"diffusion", "diffusion_head", "sde", "score", "score_sde"}
+
+
+def resolve_head_type(config) -> str:
+    """Return ``'diffusion'`` when the config selects the diffusion head.
+
+    The head is selected via ``config.model.head_type`` (preferred) or the
+    equivalent ``config.model.decoder_type``. Any other value (including the
+    default/absent) keeps the deterministic convolutional / UNet head.
+    """
+    if config is None:
+        return "deterministic"
+    model_cfg = getattr(config, "model", None)
+    raw = None
+    if model_cfg is not None:
+        raw = getattr(model_cfg, "head_type", None)
+        if raw is None:
+            raw = getattr(model_cfg, "decoder_type", None)
+    if raw is None:
+        return "deterministic"
+    return "diffusion" if str(raw).strip().lower() in DIFFUSION_HEAD_ALIASES else "deterministic"
 
 
 def _canonicalize_precip_model(value: str | None) -> str:
@@ -106,6 +129,113 @@ class ClimateECCCFinetuneWrapper(FinetuneWrapper):
         else:
             return
 
+    # ------------------------------------------------------------------
+    # Standardized target space helpers (shared by the diffusion head).
+    #
+    # The diffusion head models the *standardized* target distribution.
+    # These helpers convert between physical targets and standardized space
+    # and are the inverse of one another. ``_decode_targets_std`` mirrors the
+    # deterministic ``_decode_outputs`` inverse scaling (z-score / divide-only /
+    # log1p) and additionally clamps configured non-negative channels
+    # (e.g. precipitation) so generated samples remain physically valid.
+    # ------------------------------------------------------------------
+    def _encode_targets_std(
+        self,
+        y: torch.Tensor,
+        scaler_offset: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """Physical target ``y`` -> standardized diffusion space."""
+        mu, sigma = self._resolve_output_scalers(y, scaler_offset=scaler_offset)
+        mu = mu.to(dtype=y.dtype)
+        sigma = sigma.to(dtype=y.dtype)
+        denom = sigma + 1e-12
+        method_codes = self.predictand_scaling_method_codes.to(device=y.device)
+        code = method_codes.view(1, -1, 1, 1)
+
+        zscore = (y - mu) / denom
+        divide = y / denom
+        log1p = (torch.log1p(torch.clamp(y, min=0.0)) - mu) / denom
+        return torch.where(code == 1, divide, torch.where(code == 2, log1p, zscore))
+
+    def _decode_targets_std(
+        self,
+        std: torch.Tensor,
+        scaler_offset: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """Standardized diffusion sample -> physical target space."""
+        mu, sigma = self._resolve_output_scalers(std, scaler_offset=scaler_offset)
+        mu = mu.to(dtype=std.dtype)
+        sigma = sigma.to(dtype=std.dtype)
+        method_codes = self.predictand_scaling_method_codes.to(device=std.device)
+        code = method_codes.view(1, -1, 1, 1)
+
+        zscore = std * sigma + mu
+        divide = std * sigma
+        log1p = torch.expm1(std * sigma + mu)
+        decoded = torch.where(code == 1, divide, torch.where(code == 2, log1p, zscore))
+
+        tiny_negative_tol = 1e-7
+        decoded = torch.where(
+            (code == 2) & (decoded < 0.0) & (decoded > -tiny_negative_tol),
+            torch.zeros_like(decoded),
+            decoded,
+        )
+
+        nonneg = self.predictand_nonneg_enabled_mask.to(device=std.device).view(1, -1, 1, 1)
+        decoded = torch.where(nonneg, torch.clamp(decoded, min=0.0), decoded)
+        return decoded
+
+    @staticmethod
+    def _diffusion_wants_sample(return_pre_inverse: bool, return_raw_output: bool) -> bool:
+        """Inference (sampling) is requested via the return-tensor flags.
+
+        Training and validation call ``model(batch)`` without flags and receive
+        the scalar score-matching loss; the inference helpers pass
+        ``return_pre_inverse``/``return_raw_output`` and receive decoded samples.
+        """
+        return bool(return_pre_inverse or return_raw_output)
+
+    def _diffusion_forward(
+        self,
+        cond: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+        return_pre_inverse: bool = False,
+        return_raw_output: bool = False,
+    ):
+        """Shared diffusion-head forward for both CORDEX model variants.
+
+        Training / validation (no return flags) returns the scalar
+        score-matching loss. Inference (return flags set) runs the reverse
+        diffusion sampler and decodes the standardized sample to physical
+        ``pr``/``tasmax`` (preserving precipitation non-negativity).
+        """
+        self._last_precip_hurdle_aux = None
+        scaler_offset = batch.get("__scaler_offset")
+
+        if not self._diffusion_wants_sample(return_pre_inverse, return_raw_output):
+            target_std = self._encode_targets_std(batch["y"], scaler_offset=scaler_offset)
+            return self.diffusion_head.training_loss(cond, target_std)
+
+        expected_hw = batch["y"].shape[-2:] if "y" in batch else cond.shape[-2:]
+        std_sample = self.diffusion_head.sample(cond, int(expected_hw[0]), int(expected_hw[1]))
+        x_out = self._decode_targets_std(std_sample, scaler_offset=scaler_offset)
+        x_pre_inverse = std_sample
+        raw_out = std_sample
+
+        if tuple(x_out.shape[-2:]) != tuple(expected_hw):
+            x_out = F.interpolate(x_out, size=expected_hw, mode="bilinear", align_corners=False)
+            x_pre_inverse = F.interpolate(
+                x_pre_inverse, size=expected_hw, mode="bilinear", align_corners=False
+            )
+            raw_out = F.interpolate(raw_out, size=expected_hw, mode="bilinear", align_corners=False)
+
+        if return_pre_inverse and return_raw_output:
+            return x_out, x_pre_inverse, raw_out
+        if return_pre_inverse:
+            return x_out, x_pre_inverse
+        if return_raw_output:
+            return x_out, raw_out
+        return x_out
 
 
 #-----------------------------------------------------
@@ -326,10 +456,17 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
         current_ch = config.model.encoder_decoder_conv_channels + self.downscaling_embed_dim
         self._decoder_output_channels = current_ch
-        self.output_conv_block = nn.Sequential(nn.Conv2d(current_ch, current_ch, kernel_size=3, stride=1, padding='same', padding_mode='replicate'),
-                                               nn.LeakyReLU(),
-                                               nn.Conv2d(current_ch, out_channels, kernel_size=3, stride=1, padding='same', padding_mode='replicate'),
-                                              )
+        self.head_type = resolve_head_type(config)
+        self.diffusion_enabled = self.head_type == "diffusion"
+        if self.diffusion_enabled:
+            # The deterministic conv head is replaced by the diffusion head,
+            # which is built after predictand decoding is configured.
+            self.output_conv_block = None
+        else:
+            self.output_conv_block = nn.Sequential(nn.Conv2d(current_ch, current_ch, kernel_size=3, stride=1, padding='same', padding_mode='replicate'),
+                                                   nn.LeakyReLU(),
+                                                   nn.Conv2d(current_ch, out_channels, kernel_size=3, stride=1, padding='same', padding_mode='replicate'),
+                                                  )
         self.precip_wet_head: nn.Module | None = None
 
         self.apply(self._init_weights)
@@ -346,6 +483,20 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 kernel_size=1,
             )
         self._configure_predictand_decoding(config)
+        if self.diffusion_enabled:
+            if self.precip_hurdle_enabled:
+                raise ValueError(
+                    "head_type='diffusion' is incompatible with precip_model='hurdle'. "
+                    "Use the single-head precipitation model (precip_model: single_head) "
+                    "with the diffusion head."
+                )
+            self.diffusion_head = build_diffusion_head(
+                config,
+                cond_channels=self._decoder_output_channels,
+                output_channels=int(self.output_scalers_sigma.shape[1]),
+            )
+        else:
+            self.diffusion_head = None
         if self.precip_hurdle_enabled:
             self.precip_wet_head = nn.Conv2d(
                 in_channels=self._decoder_output_channels,
@@ -808,6 +959,14 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 )
             out = torch.cat((upsampled, skip), dim=1)
 
+        if self.diffusion_enabled:
+            return self._diffusion_forward(
+                out,
+                batch,
+                return_pre_inverse=return_pre_inverse,
+                return_raw_output=return_raw_output,
+            )
+
         x = self.output_conv_block(out)
         wet_logits = None
         if self.precip_hurdle_enabled:
@@ -1064,6 +1223,22 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
                 kernel_size=1,
             )
         self._configure_predictand_decoding(config)
+
+        self.head_type = resolve_head_type(config)
+        self.diffusion_enabled = self.head_type == "diffusion"
+        if self.diffusion_enabled:
+            if getattr(self, "precip_hurdle_enabled", False):
+                raise ValueError(
+                    "head_type='diffusion' is incompatible with precip_model='hurdle'. "
+                    "Use precip_model: single_head with the diffusion head."
+                )
+            self.diffusion_head = build_diffusion_head(
+                config,
+                cond_channels=self.embed_dim_backbone,
+                output_channels=int(self.output_scalers_sigma.shape[1]),
+            )
+        else:
+            self.diffusion_head = None
 
     def _configure_predictand_decoding(self, config: ExperimentConfig | None) -> None:
         n_outputs = int(self.output_scalers_sigma.shape[1])
@@ -1352,6 +1527,14 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
             x = x_deep_feats + x_upscale
         else:
             x = x_deep_feats
+
+        if self.diffusion_enabled:
+            return self._diffusion_forward(
+                x,
+                batch,
+                return_pre_inverse=return_pre_inverse,
+                return_raw_output=return_raw_output,
+            )
 
         x = self.head(x)  # [batch, out_channels, lat*scale[0]*scale[1], lon*scale[0]*scale[1]]
         raw_out = x

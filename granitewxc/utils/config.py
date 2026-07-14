@@ -4,6 +4,35 @@ from typing import List, Optional
 
 import yaml
 
+
+# Canonical file names produced by ``compute_scalars_cordex.py``. These are the
+# normalization statistics that training/inference load back from the
+# case-specific ``scalars`` folder.
+SCALAR_FILENAMES = {
+    "inputs_mean": "inputs_mean.npy",
+    "inputs_std": "inputs_std.npy",
+    "targets_mean": "targets_mean.npy",
+    "targets_std": "targets_std.npy",
+}
+
+# Sub-folders created underneath a case directory. Every generated artifact for
+# a config lives under ``<path_experiment>/<case_name>/<subdir>``.
+CASE_SUBDIRS = ("scalars", "preproc", "checkpoints", "inference", "logs")
+
+
+class MissingCaseNameError(ValueError):
+    """Raised when a config is loaded without the mandatory ``case_name`` field."""
+
+
+def _clean_case_name(value: object) -> str:
+    """Return a filesystem-friendly, non-empty case name or ``""`` when unset."""
+
+    if value is None:
+        return ""
+    name = str(value).strip()
+    return name
+
+
 class DataConfig:
     def __init__(
         self,
@@ -102,6 +131,7 @@ class ExperimentConfig:
         job_id: str = "",
         data_config: DataConfig = None,
         model_config: ModelConfig = None,
+        case_name: Optional[str] = None,
         num_epochs: int = 1,
         limit_steps_train: int = 1,
         limit_steps_valid: int = 1,
@@ -121,6 +151,7 @@ class ExperimentConfig:
         self.__dict__.update(kwargs)
 
         self.job_id = job_id
+        self.case_name = _clean_case_name(case_name)
         self.data = data_config
         self.model = model_config
         self.num_epochs = num_epochs
@@ -153,6 +184,78 @@ class ExperimentConfig:
     @property
     def path_wandb(self) -> str:
         return os.path.join(self.path_experiment, self.make_suffix_path())
+
+    # ------------------------------------------------------------------
+    # Case-specific output layout
+    #
+    # Every generated artifact for a config is organized underneath a single
+    # case directory named after ``case_name``. The layout is::
+    #
+    #     <path_experiment>/<case_name>/
+    #         scalars/       # normalization statistics (inputs/targets *.npy)
+    #         preproc/       # regridded / preprocessed predictor files
+    #         checkpoints/   # training checkpoints (best/last/epoch_*.ckpt)
+    #         inference/     # NetCDF predictions and diagnostics
+    #         logs/          # training / evaluation logs
+    # ------------------------------------------------------------------
+    def require_case_name(self) -> str:
+        """Return the case name, raising a clear error when it is missing."""
+
+        name = _clean_case_name(getattr(self, "case_name", None))
+        if not name:
+            raise MissingCaseNameError(
+                "`case_name` is not defined for this config. Add `case_name: "
+                "<name>` as the first line of the YAML file so all generated "
+                "outputs (scalars, preprocessed files, checkpoints, inference "
+                "outputs and logs) can be organized under a case-specific folder."
+            )
+        return name
+
+    @property
+    def case_dir(self) -> str:
+        """Root output directory for this case: ``<path_experiment>/<case_name>``.
+
+        If ``path_experiment`` has already been pointed at the case directory
+        (e.g. the fine-tune notebooks set ``path_experiment`` to
+        ``<runs_root>/<case_name>``) the case name is not appended twice.
+        """
+
+        case_name = self.require_case_name()
+        base = os.path.normpath(self.path_experiment or ".")
+        if os.path.basename(base) == case_name:
+            return base
+        return os.path.join(base, case_name)
+
+    @property
+    def path_scalars(self) -> str:
+        return os.path.join(self.case_dir, "scalars")
+
+    @property
+    def path_preproc(self) -> str:
+        return os.path.join(self.case_dir, "preproc")
+
+    @property
+    def path_checkpoints(self) -> str:
+        return os.path.join(self.case_dir, "checkpoints")
+
+    @property
+    def path_inference(self) -> str:
+        return os.path.join(self.case_dir, "inference")
+
+    @property
+    def path_logs(self) -> str:
+        return os.path.join(self.case_dir, "logs")
+
+    def scalar_path(self, key: str) -> str:
+        """Absolute path of a normalization-statistic file inside the case."""
+
+        try:
+            filename = SCALAR_FILENAMES[key]
+        except KeyError as exc:
+            raise KeyError(
+                f"Unknown scalar '{key}'. Expected one of {sorted(SCALAR_FILENAMES)}."
+            ) from exc
+        return os.path.join(self.path_scalars, filename)
 
     def to_dict(self):
         d = self.__dict__.copy()
@@ -207,6 +310,72 @@ class ExperimentConfig:
         )
 
 
+def apply_case_output_paths(config: "ExperimentConfig") -> "ExperimentConfig":
+    """Point every generated-output location at the case-specific folder.
+
+    This makes ``case_name`` the single source of truth for where artifacts are
+    read from / written to:
+
+    * ``config.model.{input_mu,input_sigma,target_mu,target_sigma}`` and
+      ``config.data.scalers`` are repointed at ``<case_dir>/scalars`` so that
+      training/inference load the statistics produced by
+      ``compute_scalars_cordex.py``.
+    * ``config.scalar_dir``/``config.preproc_dir``/``config.checkpoint_dir``/
+      ``config.inference_dir`` default to the matching case sub-folders unless a
+      caller (e.g. a notebook wiring up ``run_utils``) has already set them.
+
+    Set ``derive_output_paths: false`` in the YAML to opt out of repointing the
+    scalar files (the case sub-folder defaults are still exposed via the
+    ``config.path_*`` properties).
+    """
+
+    config.require_case_name()
+
+    derive = getattr(config, "derive_output_paths", True)
+    if derive:
+        model = getattr(config, "model", None)
+        if model is not None:
+            model.input_mu = config.scalar_path("inputs_mean")
+            model.input_sigma = config.scalar_path("inputs_std")
+            model.target_mu = config.scalar_path("targets_mean")
+            model.target_sigma = config.scalar_path("targets_std")
+
+        data = getattr(config, "data", None)
+        if data is not None:
+            data.scalers = {
+                "inputs_mean": config.scalar_path("inputs_mean"),
+                "inputs_std": config.scalar_path("inputs_std"),
+                "targets_mean": config.scalar_path("targets_mean"),
+                "targets_std": config.scalar_path("targets_std"),
+            }
+
+    # Provide case-specific defaults for the run directories consumed by the
+    # trainer / preprocessing scripts. Existing explicit values win so the
+    # notebook-driven ``run_utils`` layout keeps working unchanged.
+    for attr, path in (
+        ("scalar_dir", config.path_scalars),
+        ("preproc_dir", config.path_preproc),
+        ("checkpoint_dir", config.path_checkpoints),
+        ("inference_dir", config.path_inference),
+        ("log_dir", config.path_logs),
+    ):
+        if not getattr(config, attr, None):
+            setattr(config, attr, path)
+
+    return config
+
+
 def get_config(config_path: str) -> ExperimentConfig:
     cfg = yaml.safe_load(open(config_path, 'r'))
-    return ExperimentConfig.from_dict(cfg)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config file {config_path!r} did not parse into a mapping.")
+    if not _clean_case_name(cfg.get("case_name")):
+        raise MissingCaseNameError(
+            f"`case_name` must be defined (as the first line) in {config_path!r}. "
+            "Add `case_name: <name>` so all generated outputs (scalars, "
+            "preprocessed files, checkpoints, inference outputs and logs) are "
+            "organized under a case-specific folder named after `case_name`."
+        )
+    config = ExperimentConfig.from_dict(cfg)
+    return apply_case_output_paths(config)
+

@@ -12,6 +12,7 @@ import os
 import sys
 import subprocess
 import warnings
+from concurrent.futures import ThreadPoolExecutor, Future
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -35,6 +36,14 @@ from cordex_inference import CordexWrappedDataset, build_inference_dataset, buil
 from utils.nearest_fill import repair_invalid_by_nearest_xr, summarize_invalid_counts_xr  # noqa: E402
 from utils.predictand_runtime import assert_nonnegative_outputs, resolve_predictand_specs  # noqa: E402
 from utils.inference_blending import infer_batch_with_boundary_mitigation, resolve_boundary_mitigation_settings  # noqa: E402
+from utils.diffusion_inference import (  # noqa: E402
+    add_predictions_to_dataset,
+    infer_batch_ensemble,
+    infer_head_type,
+    resolve_base_seed,
+    resolve_ensemble_size,
+    variable_array_map,
+)
 from utils.quantization_diagnostics import (  # noqa: E402
     RunningStats,
     format_compact_table,
@@ -66,12 +75,12 @@ TEST_SPLITS = ["test/historical/predictors/perfect","test/historical/predictors/
         "test/end_century/predictors/imperfect", "test/end_century/predictors/imperfect"
 ]
 
-PREDICTOR_FILES = ["ACCESS-CM2_1981-2000_regridded.nc","NorESM2-MM_1981-2000_regridded.nc",
-        "ACCESS-CM2_1981-2000_regridded.nc","NorESM2-MM_1981-2000_regridded.nc",
-        "ACCESS-CM2_2041-2060_regridded.nc","NorESM2-MM_2041-2060_regridded.nc",
-        "ACCESS-CM2_2041-2060_regridded.nc","NorESM2-MM_2041-2060_regridded.nc",
-        "ACCESS-CM2_2080-2099_regridded.nc","NorESM2-MM_2080-2099_regridded.nc",
-        "ACCESS-CM2_2080-2099_regridded.nc","NorESM2-MM_2080-2099_regridded.nc"
+PREDICTOR_FILES = ["ACCESS-CM2_1981-2000.nc","NorESM2-MM_1981-2000.nc",
+        "ACCESS-CM2_1981-2000.nc","NorESM2-MM_1981-2000.nc",
+        "ACCESS-CM2_2041-2060.nc","NorESM2-MM_2041-2060.nc",
+        "ACCESS-CM2_2041-2060.nc","NorESM2-MM_2041-2060.nc",
+        "ACCESS-CM2_2080-2099.nc","NorESM2-MM_2080-2099.nc",
+        "ACCESS-CM2_2080-2099.nc","NorESM2-MM_2080-2099.nc"
 ]
 
 PREDICTION_OUTPUT_NAMES = ["Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc", "Predictions_pr_tasmax_NorESM2-MM_1981-2000.nc",
@@ -82,46 +91,51 @@ PREDICTION_OUTPUT_NAMES = ["Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc", "Pre
         "Predictions_pr_tasmax_ACCESS-CM2_2080-2099.nc", "Predictions_pr_tasmax_NorESM2-MM_2080-2099.nc"
 ]
 
-INFERENCE_OUTPUT_ROOTS = ["/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/end-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/end-century/imperfect/"
+# Relative to the case-specific run directory (runs_root/<case_name>);
+# _case_inference_root() joins each entry under that run dir at runtime.
+INFERENCE_OUTPUT_ROOTS = ["predictions/historical/perfect/",
+        "predictions/historical/perfect/",
+        "predictions/historical/imperfect/",
+        "predictions/historical/imperfect/",
+        "predictions/mid-century/perfect/",
+        "predictions/mid-century/perfect/",
+        "predictions/mid-century/imperfect/",
+        "predictions/mid-century/imperfect/",
+        "predictions/end-century/perfect/",
+        "predictions/end-century/perfect/",
+        "predictions/end-century/imperfect/",
+        "predictions/end-century/imperfect/"
 ]
 
 # Fixed config for the fine-tuned model
 REPO_ROOT = REPO_ROOT.resolve()
 PROJECT_DIR = PROJECT_DIR.resolve()
 DATASET_ROOT = REPO_ROOT / "granite-geospatial-wxc-downscaling/CORDEX/SA_domain"
-CONFIG_PATH = PROJECT_DIR / "SA_T2_ACCESS-CM2_static_v6.yaml"
-RUNS_ROOT = PROJECT_DIR / f"runs_v6/{CONFIG_PATH.stem.replace('_v6', '')}_train"
+if not DATASET_ROOT.exists():
+    DATASET_ROOT = Path("D:/CORDEX/SA_domain")
+CONFIG_PATH = PROJECT_DIR / "SA_T2_ACCESS-CM2_static_diffusion.yaml"
+RUNS_ROOT = PROJECT_DIR / "runs/SA_T2_ACCESS-CM2_static_train"
 
 TRAIN_SPLIT = "train/Emulator_hist_future"
 TARGET_TEMPLATE_FILE = "pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc"
 TRAIN_TARGETS = [DATASET_ROOT / TRAIN_SPLIT / "target" / TARGET_TEMPLATE_FILE]
 
-FINETUNE_RUN_NAME = getattr(get_config(str(CONFIG_PATH)), "job_id", None)  # set None to auto-pick latest
+FINETUNE_RUN_NAME = getattr(get_config(str(CONFIG_PATH)), "case_name", None)  # set None to auto-pick latest
 USE_STATIC = True
-STATIC_PATH = None  # e.g., DATASET_ROOT / TRAIN_SPLIT / "predictors" / "Static_fields.nc"
+STATIC_PATH = DATASET_ROOT / TRAIN_SPLIT / "predictors" / "Static_fields.nc"
 
 REPAIR_INVALID_INPUTS = True
 
 DEVICE_TARGET = "cuda"
-NUM_WORKERS = 2
-INFERENCE_BATCH_SIZE = 8  # inference-only; does not affect model weights
-PREFERRED_CHECKPOINT = "best"
+NUM_WORKERS = 4
+INFERENCE_BATCH_SIZE = 16  # inference-only; does not affect model weights
+PREFERRED_CHECKPOINT = "last"
 MIN_FREE_GB = 8  # minimum free GPU memory to consider "idle"
 MAX_GPUS = 1  # set to an int to cap how many GPUs to expose
 RESPECT_CUDA_VISIBLE_DEVICES = True  # ignore preset CUDA_VISIBLE_DEVICES when auto-selecting idle GPUs
-ENABLE_MIXED_PRECISION = False  # keeps inference in full precision to avoid output quantization
+ENABLE_MIXED_PRECISION = True  # bfloat16/float16 autocast; FORCE_OUTPUT_FLOAT32 casts outputs back
 FORCE_OUTPUT_FLOAT32 = True
+USE_TORCH_COMPILE = False  # ~30-60s warm-up on first run; pays off across 12 runs
 NETCDF_OUTPUT_DTYPE = "float32"
 DIAGNOSTIC_MAX_SAMPLES = 250_000
 DIAGNOSTIC_ROUND_DECIMALS = 6
@@ -129,6 +143,10 @@ DIAGNOSTIC_TIME_WINDOW = 5
 DIAGNOSTIC_SPATIAL_WINDOW = 20
 SAVE_DIAGNOSTICS_JSON = True
 SAVE_DISTRIBUTION_PLOT = True
+
+# Set to run a subset: e.g. (0, 1) for only run 1, (1, 12) for runs 2-12, None for all.
+#RUN_RANGE: tuple[int, int] | None = (0, 1)
+RUN_RANGE: tuple[int, int] | None = (0, 1)
 
 DIST_ENABLED = False
 DIST_RANK = 0
@@ -185,14 +203,19 @@ def _select_runs_root(preferred_runs_root: Path, run_name_hint: str | None) -> P
     return preferred_runs_root
 
 
-def _remap_runs_base(path: Path, runs_base_name: str) -> Path:
-    """Rewrite '/runs_v6/' segments to the selected runs base."""
-    text = str(path)
-    for name in ("runs_v6", "runs"):
-        token = f"/{name}/"
-        if token in text:
-            return Path(text.replace(token, f"/{runs_base_name}/", 1))
-    return path
+def _case_inference_root(entry, run_dir: Path) -> Path:
+    """Root an inference output path under the case-specific run directory.
+
+    Preserves the meaningful '.../predictions/<scenario>/<kind>/' substructure
+    while discarding any hardcoded absolute prefix, so every inference output
+    lands under the case folder (runs_root/<case_name>).
+    """
+    text = str(entry).replace("\\", "/")
+    marker = "predictions/"
+    lowered = text.lower()
+    if marker in lowered:
+        return run_dir / text[lowered.index(marker):]
+    return run_dir / "predictions"
 
 
 def _resolve_inputs(values):
@@ -301,7 +324,7 @@ def _to_pre_inverse_output(pred_inverse: torch.Tensor, model: torch.nn.Module) -
     return (pred - mu) / (sigma + 1e-12)
 
 
-def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
+def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg, head_type="deterministic", ensemble_size=1, base_seed=42):
     predictions = []
     pre_inverse_predictions = []
     targets = []
@@ -370,16 +393,18 @@ def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
             normalized_x = _normalize_predictors_for_diagnostics(batch, model)
             stage_stats["normalized_predictors"].add(normalized_x.detach().cpu().numpy())
 
-            with autocast_context():
-                out, _, out_raw_model = infer_batch_with_boundary_mitigation(
-                    model=model,
-                    batch=batch,
-                    cfg=boundary_cfg,
-                )
-
-            if FORCE_OUTPUT_FLOAT32:
-                out = out.float()
-                out_raw_model = out_raw_model.float()
+            out, _, out_raw_model = infer_batch_ensemble(
+                model=model,
+                batch=batch,
+                infer_batch=infer_batch_with_boundary_mitigation,
+                boundary_cfg=boundary_cfg,
+                head_type=head_type,
+                ensemble_size=ensemble_size,
+                base_seed=base_seed,
+                device=device,
+                autocast_context=autocast_context,
+                force_float32=FORCE_OUTPUT_FLOAT32,
+            )
 
             out_cpu = out.detach().cpu()
             out_pre_inverse_cpu = out_raw_model.detach().cpu()
@@ -391,10 +416,14 @@ def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
             stage_stats["raw_model_outputs_pre_inverse"].add(out_pre_inverse_cpu.numpy())
             stage_stats["inverse_outputs"].add(out_cpu.numpy())
             for var_idx, var_name in enumerate(target_vars):
-                stage_stats_by_var["raw_model_outputs_pre_inverse"][var_name].add(
-                    out_pre_inverse_cpu[:, var_idx].numpy()
-                )
-                stage_stats_by_var["inverse_outputs"][var_name].add(out_cpu[:, var_idx].numpy())
+                if out_pre_inverse_cpu.ndim == 5:
+                    pre_inverse_var = out_pre_inverse_cpu[:, :, var_idx].numpy()
+                    output_var = out_cpu[:, :, var_idx].numpy()
+                else:
+                    pre_inverse_var = out_pre_inverse_cpu[:, var_idx].numpy()
+                    output_var = out_cpu[:, var_idx].numpy()
+                stage_stats_by_var["raw_model_outputs_pre_inverse"][var_name].add(pre_inverse_var)
+                stage_stats_by_var["inverse_outputs"][var_name].add(output_var)
 
     if not predictions:
         raise RuntimeError("Inference produced no predictions.")
@@ -433,6 +462,15 @@ def _concat_time_coordinate(paths, time_key):
     return combined.load()
 
 
+def _netcdf_engine() -> str:
+    """Return 'h5netcdf' if h5py is available, otherwise 'netcdf4'."""
+    try:
+        import h5py  # noqa: F401
+        return "h5netcdf"
+    except ImportError:
+        return "netcdf4"
+
+
 def _sanitize_data_attrs(attrs: dict[str, object]) -> dict[str, object]:
     clean_attrs = dict(attrs)
     for key in ("scale_factor", "add_offset", "_FillValue", "missing_value", "dtype"):
@@ -452,10 +490,7 @@ def _build_netcdf_encoding(var_names: list[str]) -> dict[str, dict[str, object]]
 
 
 def _build_var_array_map(var_names: list[str], values: np.ndarray) -> dict[str, np.ndarray]:
-    out: dict[str, np.ndarray] = {}
-    for var_idx, var_name in enumerate(var_names):
-        out[var_name] = np.asarray(values[:, var_idx], dtype=np.float32)
-    return out
+    return variable_array_map(var_names, values)
 
 
 def _compute_quantization_summary(var_values: dict[str, np.ndarray]) -> dict[str, dict[str, object]]:
@@ -532,7 +567,7 @@ def _repair_predictor_files_if_needed(
             after_counts = summarize_invalid_counts_xr(repaired_ds, var_names=predictor_var_names)
 
             repaired_path = repaired_dir / source_path.name
-            repaired_ds.to_netcdf(repaired_path, engine="h5netcdf")
+            repaired_ds.to_netcdf(repaired_path, engine=_netcdf_engine())
             final_paths.append(str(repaired_path.resolve()))
         else:
             after_counts = before_counts
@@ -552,16 +587,19 @@ def _build_dataloader(config, predictor_paths, target_paths, device):
     base_dataset = build_inference_dataset(config, predictor_paths, target_paths)
     dataset = CordexWrappedDataset(base_dataset)
     batch_size = getattr(config, "batch_size", 1)
+    num_workers = config.dl_num_workers
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=config.dl_num_workers,
+        num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
     )
 
 
-def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, Path]:
+def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, Path, str, int, int]:
     runs_root = _select_runs_root(RUNS_ROOT, FINETUNE_RUN_NAME)
     if runs_root != RUNS_ROOT:
         print(f"[runs] Using fallback runs root: {runs_root} (preferred {RUNS_ROOT})")
@@ -621,7 +659,9 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
     if STATIC_PATH:
         config.data.static_path = str(Path(STATIC_PATH).resolve())
 
-    checkpoint_path = resolve_checkpoint(base_params, run_dir)
+    checkpoint_path = run_dir / "checkpoints" / "last.ckpt"
+    if not checkpoint_path.exists():
+        checkpoint_path = resolve_checkpoint(base_params, run_dir)
     assert_no_eccc_reference(checkpoint_path)
 
     model = get_finetune_model_UNET(config)
@@ -660,7 +700,116 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
             f"missing={missing[:8]}, unexpected={incompatible.unexpected_keys[:8]}"
         )
 
-    return run_name, run_dir, checkpoint_path, config, model, runs_root
+    head_type = infer_head_type(checkpoint=checkpoint, config=config, model=model)
+    ensemble_size = resolve_ensemble_size(config, head_type=head_type)
+    base_seed = resolve_base_seed(config)
+    print(f"[inference] head_type={head_type}, ensemble_size={ensemble_size}, base_seed={base_seed}")
+
+    return run_name, run_dir, checkpoint_path, config, model, runs_root, head_type, ensemble_size, base_seed
+
+
+def _save_run_outputs(
+    *,
+    idx: int,
+    output_root: Path,
+    prediction_output_stub: Path,
+    outputs_np: np.ndarray,
+    outputs_pre_inverse_np: np.ndarray,
+    target_vars: list[str],
+    predictor_paths: list[str],
+    target_template_paths: list[str],
+    time_dim: str,
+    lat_dim: str,
+    lon_dim: str,
+    lat_name: str,
+    lon_name: str,
+    head_type: str,
+    ensemble_size: int,
+    base_seed: int,
+    diagnostics_payload: dict,
+    predicted_var_values: dict[str, np.ndarray],
+    predicted_pre_inverse_var_values: dict[str, np.ndarray],
+    target_var_values: dict[str, np.ndarray],
+) -> None:
+    import pickle
+
+    if SAVE_DIAGNOSTICS_JSON:
+        diagnostics_path = output_root / prediction_output_stub.with_suffix(".diagnostics.json")
+        save_json(diagnostics_payload, diagnostics_path)
+        print(f"[diag] Saved diagnostics JSON to {diagnostics_path}")
+
+    if SAVE_DISTRIBUTION_PLOT:
+        if "tasmax" in predicted_var_values and "pr" in predicted_var_values:
+            plot_path = output_root / prediction_output_stub.with_suffix(".distribution.png")
+            save_distribution_plot(
+                target_values=target_var_values,
+                predicted_values=predicted_var_values,
+                predicted_raw_values=predicted_pre_inverse_var_values,
+                output_path=plot_path,
+            )
+            print(f"[diag] Saved distribution comparison plot to {plot_path}")
+        else:
+            print("[diag] Skipped distribution plot; expected vars 'pr' and 'tasmax' were not both present.")
+
+    predictor_time_coord = _concat_time_coordinate(predictor_paths, time_dim)
+    if outputs_np.shape[0] != predictor_time_coord.sizes[time_dim]:
+        raise ValueError(
+            f"Prediction time dimension {outputs_np.shape[0]} does not match "
+            f"predictor timestamps {predictor_time_coord.sizes[time_dim]}"
+        )
+
+    if not target_template_paths:
+        raise FileNotFoundError("Target template paths missing; ensure config.data.test_target_paths is set")
+
+    with xr.open_dataset(target_template_paths[0], engine=_netcdf_engine()) as template_ds:
+        template_attrs = dict(template_ds.attrs)
+        target_attrs = {
+            name: _sanitize_data_attrs(dict(template_ds[name].attrs))
+            for name in target_vars
+            if name in template_ds.data_vars
+        }
+        lat_coord = template_ds[lat_name].load()
+        lon_coord = template_ds[lon_name].load()
+
+    coords = {time_dim: predictor_time_coord, lat_dim: lat_coord, lon_dim: lon_coord}
+    prediction_ds = xr.Dataset(coords=coords)
+    prediction_ds.attrs.update(template_attrs)
+    prediction_ds = add_predictions_to_dataset(
+        prediction_ds=prediction_ds,
+        target_vars=target_vars,
+        outputs_np=outputs_np,
+        coords=coords,
+        time_dim=time_dim,
+        lat_dim=lat_dim,
+        lon_dim=lon_dim,
+        target_attrs=target_attrs,
+        head_type=head_type,
+        ensemble_size=ensemble_size,
+        base_seed=base_seed,
+    )
+    prediction_output_path = output_root / prediction_output_stub
+    prediction_ds.to_netcdf(
+        prediction_output_path,
+        engine=_netcdf_engine(),
+        encoding=_build_netcdf_encoding(target_vars),
+    )
+    print(
+        f"[{idx + 1:02d}/{NUM_RUNS}] Saved predictions to {prediction_output_path} "
+        f"({predictor_time_coord.values[0]} -> {predictor_time_coord.values[-1]})"
+    )
+
+    pickle_path = output_root / prediction_output_stub.with_suffix(".pkl")
+    with open(pickle_path, "wb") as handle:
+        pickle.dump(outputs_np, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[{idx + 1:02d}/{NUM_RUNS}] Saved raw predictions array to {pickle_path}")
+
+    pre_inverse_pickle_path = output_root / prediction_output_stub.with_suffix(".pre_inverse.pkl")
+    with open(pre_inverse_pickle_path, "wb") as handle:
+        pickle.dump(outputs_pre_inverse_np, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    print(
+        f"[{idx + 1:02d}/{NUM_RUNS}] Saved pre-inverse predictions array to "
+        f"{pre_inverse_pickle_path}"
+    )
 
 
 def main() -> None:
@@ -691,14 +840,18 @@ def main() -> None:
     torch.jit.enable_onednn_fusion(True)
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.deterministic = False  # deterministic disables benchmark; inference doesn't need it
         torch.cuda.manual_seed(42)
     torch.manual_seed(42)
     np.random.seed(42)
 
     device = _select_device()
-    run_name, run_dir, checkpoint_path, config, model, runs_root_used = _load_model_and_config()
+    run_name, run_dir, checkpoint_path, config, model, runs_root_used, head_type, ensemble_size, base_seed = _load_model_and_config()
     model.to(device)
+    if USE_TORCH_COMPILE and hasattr(torch, "compile"):
+        print("[compile] Compiling model with torch.compile (mode='reduce-overhead')…")
+        model = torch.compile(model, mode="reduce-overhead")
+        print("[compile] Done.")
     scaler_dtype_summary = _collect_scaler_dtype_summary(model)
     print(f"[diag] scaler dtypes: {scaler_dtype_summary}")
     print(
@@ -706,223 +859,193 @@ def main() -> None:
         f"force_output_float32={FORCE_OUTPUT_FLOAT32}"
     )
 
-    run_indices = range(DIST_RANK, NUM_RUNS, DIST_WORLD_SIZE) if DIST_ENABLED else range(NUM_RUNS)
-    for idx in run_indices:
-        test_split = TEST_SPLITS[idx]
-        predictor_file = PREDICTOR_FILES[idx]
-        prediction_output_name = PREDICTION_OUTPUT_NAMES[idx]
-        inference_output_root = _remap_runs_base(
-            Path(INFERENCE_OUTPUT_ROOTS[idx]),
-            runs_root_used.parent.name,
-        )
+    _full = range(DIST_RANK, NUM_RUNS, DIST_WORLD_SIZE) if DIST_ENABLED else range(NUM_RUNS)
+    run_indices = [i for i in _full if RUN_RANGE is None or RUN_RANGE[0] <= i < RUN_RANGE[1]]
+    print(f"[runs] executing indices {list(run_indices)} of {NUM_RUNS} total")
+    save_future: Future | None = None
+    with ThreadPoolExecutor(max_workers=1) as save_executor:
+        for idx in run_indices:
+            test_split = TEST_SPLITS[idx]
+            predictor_file = PREDICTOR_FILES[idx]
+            prediction_output_name = PREDICTION_OUTPUT_NAMES[idx]
+            inference_output_root = _case_inference_root(INFERENCE_OUTPUT_ROOTS[idx], run_dir)
 
-        if predictor_file:
-            test_predictors = [DATASET_ROOT / test_split / predictor_file]
-        else:
-            test_predictors = sorted((DATASET_ROOT / test_split).glob("*.nc"))
-
-        params = UserParams(
-            repo_root=REPO_ROOT,
-            project_dir=PROJECT_DIR,
-            runs_root=runs_root_used,
-            config_path=CONFIG_PATH,
-            inference_run_name=run_name,
-            inference_output_root=inference_output_root,
-            inference_predictor_root=DATASET_ROOT / test_split,
-            test_predictor_paths=test_predictors,
-            test_target_paths=TRAIN_TARGETS,
-            use_static=USE_STATIC,
-            checkpoint_path=None,
-            preferred_checkpoint=PREFERRED_CHECKPOINT,
-            device_target=DEVICE_TARGET,
-            num_workers=NUM_WORKERS,
-            batch_size=INFERENCE_BATCH_SIZE,
-        )
-
-        validate_paths(params, require_inference=True)
-
-        test_predictor_paths = _resolve_inputs(params.test_predictor_paths) if params.test_predictor_paths else []
-        if not test_predictor_paths and params.inference_predictor_root:
-            test_predictor_paths = [
-                str(path.resolve()) for path in Path(params.inference_predictor_root).glob("*.nc")
-            ]
-        if not test_predictor_paths:
-            raise FileNotFoundError("No inference predictor files configured in USER PARAMETERS.")
-
-        output_root = Path(params.inference_output_root or (run_dir / "predictions"))
-        output_root.mkdir(parents=True, exist_ok=True)
-
-        predictor_var_names = build_predictor_names(config)
-        test_predictor_paths = _repair_predictor_files_if_needed(
-            test_predictor_paths,
-            output_root=output_root,
-            predictor_var_names=predictor_var_names,
-            run_index=idx + 1,
-        )
-
-        config.data.test_predictor_paths = test_predictor_paths
-        config.data.test_target_paths = _resolve_inputs(params.test_target_paths)
-
-        prediction_output_stub = Path(
-            prediction_output_name or f"{run_name}_predictions_{idx + 1:02d}.nc"
-        )
-
-        params_json = export_params(
-            params,
-            output_root / prediction_output_stub.with_suffix(".json"),
-            extra={"run_name": run_name, "checkpoint": str(checkpoint_path)},
-        )
-
-        print(f"[{idx + 1:02d}/{NUM_RUNS}] Using predictors from {Path(test_predictor_paths[0]).parent}")
-        print(f"[{idx + 1:02d}/{NUM_RUNS}] Output directory: {output_root}")
-        print(f"[{idx + 1:02d}/{NUM_RUNS}] Saved parameter snapshot to {params_json}")
-
-        test_dl = _build_dataloader(config, config.data.test_predictor_paths, config.data.test_target_paths, device)
-
-        base_dataset = test_dl.dataset.base
-        target_vars = list(base_dataset.target_vars)
-        predictand_specs = resolve_predictand_specs(config, target_vars)
-        predictor_paths = list(base_dataset.predictor_paths)
-        target_template_paths = list(base_dataset.target_paths)
-
-        boundary_cfg = resolve_boundary_mitigation_settings(config)
-        boundary_cfg.force_full_frame = True
-        if boundary_cfg.force_full_frame:
-            print("[boundary] force_full_frame=True (tiling/blending disabled)")
-        else:
-            print(
-                f"[boundary] enabled={boundary_cfg.enabled}, tile_size={boundary_cfg.tile_size}, "
-                f"overlap={boundary_cfg.overlap}, blend_mode={boundary_cfg.blend_mode}, "
-                f"deblock_enabled={boundary_cfg.deblock.enabled}"
-            )
-        inference_result = _run_full_inference(test_dl, model, device, target_vars, boundary_cfg)
-        full_outputs = inference_result["predictions"]
-        full_outputs_pre_inverse = inference_result["predictions_pre_inverse"]
-        full_targets = inference_result["targets"]
-
-        outputs_np = full_outputs.numpy().astype(np.float32, copy=False)
-        outputs_pre_inverse_np = full_outputs_pre_inverse.numpy().astype(np.float32, copy=False)
-        targets_np = full_targets.numpy().astype(np.float32, copy=False)
-        if outputs_np.shape[1] != len(target_vars):
-            raise ValueError(
-                f"Model produced {outputs_np.shape[1]} channels but target_vars expects {len(target_vars)}"
-            )
-
-        predicted_var_values = _build_var_array_map(target_vars, outputs_np)
-        predicted_pre_inverse_var_values = _build_var_array_map(target_vars, outputs_pre_inverse_np)
-        target_var_values = _build_var_array_map(target_vars, targets_np)
-
-        assert_nonnegative_outputs(predicted_var_values, predictand_specs, eps=1e-8)
-
-        quantization_summary = {
-            "raw_model_outputs_pre_inverse": _compute_quantization_summary(predicted_pre_inverse_var_values),
-            "inverse_outputs": _compute_quantization_summary(predicted_var_values),
-            "targets": _compute_quantization_summary(target_var_values),
-        }
-        diagnostic_rows = _build_diagnostic_rows(
-            inference_result["stage_stats"],
-            inference_result["stage_stats_by_var"],
-            quantization_summary,
-        )
-        print(f"[diag] Quantization summary for run {idx + 1:02d}")
-        print(format_compact_table(diagnostic_rows))
-
-        diagnostics_payload = {
-            "run_index": idx + 1,
-            "num_runs": NUM_RUNS,
-            "predictor_paths": test_predictor_paths,
-            "target_template_paths": target_template_paths,
-            "stage_stats": inference_result["stage_stats"],
-            "stage_stats_by_var": inference_result["stage_stats_by_var"],
-            "quantization_detector": quantization_summary,
-            "scaler_dtypes": scaler_dtype_summary,
-            "mixed_precision_enabled": bool(ENABLE_MIXED_PRECISION),
-            "force_output_float32": bool(FORCE_OUTPUT_FLOAT32),
-            "predictands": {name: spec.to_dict() for name, spec in predictand_specs.items()},
-        }
-        if SAVE_DIAGNOSTICS_JSON:
-            diagnostics_path = output_root / prediction_output_stub.with_suffix(".diagnostics.json")
-            save_json(diagnostics_payload, diagnostics_path)
-            print(f"[diag] Saved diagnostics JSON to {diagnostics_path}")
-        if SAVE_DISTRIBUTION_PLOT:
-            if "tasmax" in predicted_var_values and "pr" in predicted_var_values:
-                plot_path = output_root / prediction_output_stub.with_suffix(".distribution.png")
-                save_distribution_plot(
-                    target_values=target_var_values,
-                    predicted_values=predicted_var_values,
-                    predicted_raw_values=predicted_pre_inverse_var_values,
-                    output_path=plot_path,
-                )
-                print(f"[diag] Saved distribution comparison plot to {plot_path}")
+            if predictor_file:
+                test_predictors = [DATASET_ROOT / test_split / predictor_file]
             else:
-                print("[diag] Skipped distribution plot; expected vars 'pr' and 'tasmax' were not both present.")
+                test_predictors = sorted((DATASET_ROOT / test_split).glob("*.nc"))
 
-        time_dim = base_dataset.time_dim or "time"
-        lat_dim, lon_dim = base_dataset.output_spatial_dims
-        lat_name = base_dataset.fine_lat_name
-        lon_name = base_dataset.fine_lon_name
-
-        predictor_time_coord = _concat_time_coordinate(predictor_paths, time_dim)
-        if outputs_np.shape[0] != predictor_time_coord.sizes[time_dim]:
-            raise ValueError(
-                "Prediction time dimension "
-                f"{outputs_np.shape[0]} does not match predictor timestamps {predictor_time_coord.sizes[time_dim]}"
+            params = UserParams(
+                repo_root=REPO_ROOT,
+                project_dir=PROJECT_DIR,
+                runs_root=runs_root_used,
+                config_path=CONFIG_PATH,
+                inference_run_name=run_name,
+                inference_output_root=inference_output_root,
+                inference_predictor_root=DATASET_ROOT / test_split,
+                test_predictor_paths=test_predictors,
+                test_target_paths=TRAIN_TARGETS,
+                use_static=USE_STATIC,
+                checkpoint_path=None,
+                preferred_checkpoint=PREFERRED_CHECKPOINT,
+                device_target=DEVICE_TARGET,
+                num_workers=NUM_WORKERS,
+                batch_size=INFERENCE_BATCH_SIZE,
             )
 
-        if not target_template_paths:
-            raise FileNotFoundError("Target template paths missing; ensure config.data.test_target_paths is set")
+            validate_paths(params, require_inference=True)
 
-        with xr.open_dataset(target_template_paths[0], engine="h5netcdf") as template_ds:
-            template_attrs = dict(template_ds.attrs)
-            target_attrs = {
-                name: _sanitize_data_attrs(dict(template_ds[name].attrs))
-                for name in target_vars
-                if name in template_ds.data_vars
+            test_predictor_paths = _resolve_inputs(params.test_predictor_paths) if params.test_predictor_paths else []
+            if not test_predictor_paths and params.inference_predictor_root:
+                test_predictor_paths = [
+                    str(path.resolve()) for path in Path(params.inference_predictor_root).glob("*.nc")
+                ]
+            if not test_predictor_paths:
+                raise FileNotFoundError("No inference predictor files configured in USER PARAMETERS.")
+
+            output_root = Path(params.inference_output_root or (run_dir / "predictions"))
+            output_root.mkdir(parents=True, exist_ok=True)
+
+            predictor_var_names = build_predictor_names(config)
+            test_predictor_paths = _repair_predictor_files_if_needed(
+                test_predictor_paths,
+                output_root=output_root,
+                predictor_var_names=predictor_var_names,
+                run_index=idx + 1,
+            )
+
+            config.data.test_predictor_paths = test_predictor_paths
+            config.data.test_target_paths = _resolve_inputs(params.test_target_paths)
+
+            prediction_output_stub = Path(
+                prediction_output_name or f"{run_name}_predictions_{idx + 1:02d}.nc"
+            )
+
+            params_json = export_params(
+                params,
+                output_root / prediction_output_stub.with_suffix(".json"),
+                extra={"run_name": run_name, "checkpoint": str(checkpoint_path)},
+            )
+
+            print(f"[{idx + 1:02d}/{NUM_RUNS}] Using predictors from {Path(test_predictor_paths[0]).parent}")
+            print(f"[{idx + 1:02d}/{NUM_RUNS}] Output directory: {output_root}")
+            print(f"[{idx + 1:02d}/{NUM_RUNS}] Saved parameter snapshot to {params_json}")
+
+            test_dl = _build_dataloader(config, config.data.test_predictor_paths, config.data.test_target_paths, device)
+
+            base_dataset = test_dl.dataset.base
+            target_vars = list(base_dataset.target_vars)
+            predictand_specs = resolve_predictand_specs(config, target_vars)
+            predictor_paths = list(base_dataset.predictor_paths)
+            target_template_paths = list(base_dataset.target_paths)
+
+            boundary_cfg = resolve_boundary_mitigation_settings(config)
+            boundary_cfg.force_full_frame = True
+            if boundary_cfg.force_full_frame:
+                print("[boundary] force_full_frame=True (tiling/blending disabled)")
+            else:
+                print(
+                    f"[boundary] enabled={boundary_cfg.enabled}, tile_size={boundary_cfg.tile_size}, "
+                    f"overlap={boundary_cfg.overlap}, blend_mode={boundary_cfg.blend_mode}, "
+                    f"deblock_enabled={boundary_cfg.deblock.enabled}"
+                )
+
+            # Wait for previous run's save before starting GPU inference (frees memory).
+            if save_future is not None:
+                save_future.result()
+                save_future = None
+
+            inference_result = _run_full_inference(
+                test_dl,
+                model,
+                device,
+                target_vars,
+                boundary_cfg,
+                head_type=head_type,
+                ensemble_size=ensemble_size,
+                base_seed=base_seed,
+            )
+            full_outputs = inference_result["predictions"]
+            full_outputs_pre_inverse = inference_result["predictions_pre_inverse"]
+            full_targets = inference_result["targets"]
+
+            outputs_np = full_outputs.numpy().astype(np.float32, copy=False)
+            outputs_pre_inverse_np = full_outputs_pre_inverse.numpy().astype(np.float32, copy=False)
+            targets_np = full_targets.numpy().astype(np.float32, copy=False)
+            output_var_axis = 2 if outputs_np.ndim == 5 else 1
+            if outputs_np.shape[output_var_axis] != len(target_vars):
+                raise ValueError(
+                    f"Model produced {outputs_np.shape[output_var_axis]} channels but target_vars expects {len(target_vars)}"
+                )
+
+            predicted_var_values = _build_var_array_map(target_vars, outputs_np)
+            predicted_pre_inverse_var_values = _build_var_array_map(target_vars, outputs_pre_inverse_np)
+            target_var_values = _build_var_array_map(target_vars, targets_np)
+
+            assert_nonnegative_outputs(predicted_var_values, predictand_specs, eps=1e-8)
+
+            quantization_summary = {
+                "raw_model_outputs_pre_inverse": _compute_quantization_summary(predicted_pre_inverse_var_values),
+                "inverse_outputs": _compute_quantization_summary(predicted_var_values),
+                "targets": _compute_quantization_summary(target_var_values),
             }
-            lat_coord = template_ds[lat_name].load()
-            lon_coord = template_ds[lon_name].load()
-
-        coords = {time_dim: predictor_time_coord, lat_dim: lat_coord, lon_dim: lon_coord}
-        prediction_ds = xr.Dataset(coords=coords)
-        for var_idx, name in enumerate(target_vars):
-            prediction_ds[name] = xr.DataArray(
-                outputs_np[:, var_idx],
-                dims=(time_dim, lat_dim, lon_dim),
-                coords=coords,
-                attrs=target_attrs.get(name, {}),
+            diagnostic_rows = _build_diagnostic_rows(
+                inference_result["stage_stats"],
+                inference_result["stage_stats_by_var"],
+                quantization_summary,
             )
+            print(f"[diag] Quantization summary for run {idx + 1:02d}")
+            print(format_compact_table(diagnostic_rows))
 
-        for name in target_vars:
-            prediction_ds[name] = prediction_ds[name].astype(np.float32)
+            diagnostics_payload = {
+                "run_index": idx + 1,
+                "num_runs": NUM_RUNS,
+                "predictor_paths": test_predictor_paths,
+                "target_template_paths": target_template_paths,
+                "stage_stats": inference_result["stage_stats"],
+                "stage_stats_by_var": inference_result["stage_stats_by_var"],
+                "quantization_detector": quantization_summary,
+                "scaler_dtypes": scaler_dtype_summary,
+                "mixed_precision_enabled": bool(ENABLE_MIXED_PRECISION),
+                "force_output_float32": bool(FORCE_OUTPUT_FLOAT32),
+                "head_type": head_type,
+                "ensemble_size": int(ensemble_size),
+                "base_seed": int(base_seed),
+                "predictands": {name: spec.to_dict() for name, spec in predictand_specs.items()},
+            }
+            time_dim = base_dataset.time_dim or "time"
+            lat_dim, lon_dim = base_dataset.output_spatial_dims
+            lat_name = base_dataset.fine_lat_name
+            lon_name = base_dataset.fine_lon_name
 
-        prediction_ds.attrs.update(template_attrs)
-        prediction_output_path = output_root / prediction_output_stub
-        prediction_ds.to_netcdf(
-            prediction_output_path,
-            engine="h5netcdf",
-            encoding=_build_netcdf_encoding(target_vars),
-        )
-        print(
-            f"[{idx + 1:02d}/{NUM_RUNS}] Saved predictions to {prediction_output_path} "
-            f"({predictor_time_coord.values[0]} -> {predictor_time_coord.values[-1]})"
-        )
+            save_future = save_executor.submit(
+                _save_run_outputs,
+                idx=idx,
+                output_root=output_root,
+                prediction_output_stub=prediction_output_stub,
+                outputs_np=outputs_np,
+                outputs_pre_inverse_np=outputs_pre_inverse_np,
+                target_vars=target_vars,
+                predictor_paths=predictor_paths,
+                target_template_paths=target_template_paths,
+                time_dim=time_dim,
+                lat_dim=lat_dim,
+                lon_dim=lon_dim,
+                lat_name=lat_name,
+                lon_name=lon_name,
+                head_type=head_type,
+                ensemble_size=ensemble_size,
+                base_seed=base_seed,
+                diagnostics_payload=diagnostics_payload,
+                predicted_var_values=predicted_var_values,
+                predicted_pre_inverse_var_values=predicted_pre_inverse_var_values,
+                target_var_values=target_var_values,
+            )
+            print(f"[{idx + 1:02d}/{NUM_RUNS}] Save dispatched to background thread.")
 
-        pickle_path = output_root / prediction_output_stub.with_suffix(".pkl")
-        with open(pickle_path, "wb") as handle:
-            import pickle
-
-            pickle.dump(outputs_np, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"[{idx + 1:02d}/{NUM_RUNS}] Saved raw predictions array to {pickle_path}")
-
-        pre_inverse_pickle_path = output_root / prediction_output_stub.with_suffix(".pre_inverse.pkl")
-        with open(pre_inverse_pickle_path, "wb") as handle:
-            import pickle
-
-            pickle.dump(outputs_pre_inverse_np, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        print(
-            f"[{idx + 1:02d}/{NUM_RUNS}] Saved pre-inverse predictions array to "
-            f"{pre_inverse_pickle_path}"
-        )
+        # Wait for the last run's save to complete.
+        if save_future is not None:
+            save_future.result()
 
     if DIST_ENABLED and dist.is_initialized():
         dist.barrier()

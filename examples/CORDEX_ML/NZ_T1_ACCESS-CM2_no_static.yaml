@@ -1,3 +1,4 @@
+case_name: NZ_T1_ACCESS-CM2_no_static
 data:
   type: cordex
   training_predictor_paths:
@@ -49,10 +50,10 @@ data:
   crop_factor: 256
   downsample_factor: 8
   scalers:
-    inputs_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/inputs_mean.npy
-    inputs_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/inputs_std.npy
-    targets_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/targets_mean.npy
-    targets_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/targets_std.npy
+    inputs_mean: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static/scalars/inputs_mean.npy
+    inputs_std: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static/scalars/inputs_std.npy
+    targets_mean: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static/scalars/targets_mean.npy
+    targets_std: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static/scalars/targets_std.npy
 predictands:
   pr:
     name: pr
@@ -80,10 +81,10 @@ predictands:
       scale_stat: mean
       fixed_scale: null
 model:
-  input_mu: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/inputs_mean.npy
-  input_sigma: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/inputs_std.npy
-  target_mu: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/targets_mean.npy
-  target_sigma: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars/targets_std.npy
+  input_mu: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static/scalars/inputs_mean.npy
+  input_sigma: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static/scalars/inputs_std.npy
+  target_mu: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static/scalars/targets_mean.npy
+  target_sigma: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static/scalars/targets_std.npy
   embed_dim: 1024
   n_blocks_encoder: 8
   mlp_multiplier: 4

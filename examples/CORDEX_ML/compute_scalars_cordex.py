@@ -99,8 +99,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="./experiments/cordex_scalars",
-        help="Directory where .npy scalars and metadata.json are saved",
+        default=None,
+        help=(
+            "Directory where .npy scalars and metadata.json are saved. "
+            "When omitted and --config is provided, defaults to the case-specific "
+            "'<path_experiment>/<case_name>/scalars' folder derived from the config."
+        ),
     )
     parser.add_argument(
         "--progress-interval",
@@ -419,6 +423,29 @@ def _resolve_config_and_predictands(
     return config, target_vars, target_specs
 
 
+def _resolve_output_dir(args: argparse.Namespace, config: object) -> str:
+    """Determine where scalars are written.
+
+    Priority: explicit ``--output-dir`` > case-specific ``<path_experiment>/
+    <case_name>/scalars`` (when ``--config`` supplies a ``case_name``) > a plain
+    ``./experiments/cordex_scalars`` fallback for ad-hoc runs without a config.
+    """
+
+    if args.output_dir:
+        return args.output_dir
+
+    path_scalars = getattr(config, "path_scalars", None)
+    if path_scalars:
+        case_name = getattr(config, "case_name", None)
+        print(
+            f"[output] --output-dir not set; using case-specific scalars folder "
+            f"for case '{case_name}': {path_scalars}"
+        )
+        return path_scalars
+
+    return "./experiments/cordex_scalars"
+
+
 def _compact_array_summary(values: np.ndarray) -> dict | list:
     arr = np.asarray(values)
     if arr.ndim <= 1 and arr.size <= 64:
@@ -447,6 +474,8 @@ def main() -> None:
             "[predictands] no --config provided; using defaults "
             "(pr -> divide_only + p95, others -> zscore)."
         )
+
+    output_dir = _resolve_output_dir(args, config)
 
     dtype = getattr(torch, args.dtype)
     if args.no_static:
@@ -492,12 +521,12 @@ def main() -> None:
         target_scale_sample_size=max(1, int(args.target_scale_sample_size)),
     )
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
-    inputs_mean_path = os.path.join(args.output_dir, "inputs_mean.npy")
-    inputs_std_path = os.path.join(args.output_dir, "inputs_std.npy")
-    targets_mean_path = os.path.join(args.output_dir, "targets_mean.npy")
-    targets_std_path = os.path.join(args.output_dir, "targets_std.npy")
+    inputs_mean_path = os.path.join(output_dir, "inputs_mean.npy")
+    inputs_std_path = os.path.join(output_dir, "inputs_std.npy")
+    targets_mean_path = os.path.join(output_dir, "targets_mean.npy")
+    targets_std_path = os.path.join(output_dir, "targets_std.npy")
 
     np.save(inputs_mean_path, stats["inputs_mean"])
     np.save(inputs_std_path, stats["inputs_std"])
@@ -547,7 +576,7 @@ def main() -> None:
         },
     }
 
-    metadata_path = os.path.join(args.output_dir, "metadata.json")
+    metadata_path = os.path.join(output_dir, "metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as fp:
         json.dump(metadata, fp, indent=2)
 

@@ -46,6 +46,8 @@ The CORDEX workflow now includes a v4 path with:
 
 Use the CORDEX v4 YAMLs (`*_v4.yaml`) and `runs_v4` paths documented in [examples/CORDEX_ML/README.md](examples/CORDEX_ML/README.md).
 
+> **Config note:** every CORDEX-ML YAML now begins with a `case_name:` on line 1. All generated artifacts (scalars, preprocessed files, checkpoints, inference outputs, logs) are organized under `<path_experiment>/<case_name>/`. See [Case-specific output folders](examples/CORDEX_ML/README.md#case-specific-output-folders-case_name) for details.
+
 ## Fine-tuned model
 
 The fine-tuned model for MERRA-2 2m temperature data is available via [Hugging Face](https://huggingface.co/ibm-granite/granite-geospatial-wxc-downscaling).

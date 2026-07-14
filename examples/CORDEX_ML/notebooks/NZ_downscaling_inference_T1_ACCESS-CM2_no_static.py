@@ -35,6 +35,14 @@ from cordex_inference import CordexWrappedDataset, build_inference_dataset, buil
 from utils.nearest_fill import repair_invalid_by_nearest_xr, summarize_invalid_counts_xr  # noqa: E402
 from utils.predictand_runtime import assert_nonnegative_outputs, resolve_predictand_specs  # noqa: E402
 from utils.inference_blending import infer_batch_with_boundary_mitigation, resolve_boundary_mitigation_settings  # noqa: E402
+from utils.diffusion_inference import (  # noqa: E402
+    add_predictions_to_dataset,
+    infer_batch_ensemble,
+    infer_head_type,
+    resolve_base_seed,
+    resolve_ensemble_size,
+    variable_array_map,
+)
 from utils.quantization_diagnostics import (  # noqa: E402
     RunningStats,
     format_compact_table,
@@ -82,24 +90,28 @@ PREDICTION_OUTPUT_NAMES = ["Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc", "Pre
         "Predictions_pr_tasmax_ACCESS-CM2_2080-2099.nc", "Predictions_pr_tasmax_EC-Earth3_2080-2099.nc"
 ]
 
-INFERENCE_OUTPUT_ROOTS = ["/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/end-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T1_ACCESS-CM2_no_static_train/predictions/end-century/imperfect/"
+# Relative to the case-specific run directory (runs_root/<case_name>);
+# _case_inference_root() joins each entry under that run dir at runtime.
+INFERENCE_OUTPUT_ROOTS = ["predictions/historical/perfect/",
+        "predictions/historical/perfect/",
+        "predictions/historical/imperfect/",
+        "predictions/historical/imperfect/",
+        "predictions/mid-century/perfect/",
+        "predictions/mid-century/perfect/",
+        "predictions/mid-century/imperfect/",
+        "predictions/mid-century/imperfect/",
+        "predictions/end-century/perfect/",
+        "predictions/end-century/perfect/",
+        "predictions/end-century/imperfect/",
+        "predictions/end-century/imperfect/"
 ]
 
 # Fixed config for the fine-tuned model
 REPO_ROOT = REPO_ROOT.resolve()
 PROJECT_DIR = PROJECT_DIR.resolve()
 DATASET_ROOT = REPO_ROOT / "granite-geospatial-wxc-downscaling/CORDEX/NZ_domain"
+if not DATASET_ROOT.exists():
+    DATASET_ROOT = Path("D:/CORDEX/NZ_domain")
 CONFIG_PATH = PROJECT_DIR / "NZ_T1_ACCESS-CM2_no_static_v6.yaml"
 RUNS_ROOT = PROJECT_DIR / f"runs_v6/{CONFIG_PATH.stem.replace('_v6', '')}_train"
 
@@ -107,7 +119,7 @@ TRAIN_SPLIT = "train/ESD_pseudo_reality"
 TARGET_TEMPLATE_FILE = "pr_tasmax_ACCESS-CM2_1961-1980.nc"
 TRAIN_TARGETS = [DATASET_ROOT / TRAIN_SPLIT / "target" / TARGET_TEMPLATE_FILE]
 
-FINETUNE_RUN_NAME = getattr(get_config(str(CONFIG_PATH)), "job_id", None)  # set None to auto-pick latest
+FINETUNE_RUN_NAME = getattr(get_config(str(CONFIG_PATH)), "case_name", None)  # set None to auto-pick latest
 USE_STATIC = False
 STATIC_PATH = None  # e.g., DATASET_ROOT / TRAIN_SPLIT / "predictors" / "Static_fields.nc"
 
@@ -116,7 +128,7 @@ REPAIR_INVALID_INPUTS = True
 DEVICE_TARGET = "cuda"
 NUM_WORKERS = 2
 INFERENCE_BATCH_SIZE = 8  # inference-only; does not affect model weights
-PREFERRED_CHECKPOINT = "best"
+PREFERRED_CHECKPOINT = "last"
 MIN_FREE_GB = 8  # minimum free GPU memory to consider "idle"
 MAX_GPUS = 1  # set to an int to cap how many GPUs to expose
 RESPECT_CUDA_VISIBLE_DEVICES = True  # ignore preset CUDA_VISIBLE_DEVICES when auto-selecting idle GPUs
@@ -185,14 +197,19 @@ def _select_runs_root(preferred_runs_root: Path, run_name_hint: str | None) -> P
     return preferred_runs_root
 
 
-def _remap_runs_base(path: Path, runs_base_name: str) -> Path:
-    """Rewrite '/runs_v6/' segments to the selected runs base."""
-    text = str(path)
-    for name in ("runs_v6", "runs"):
-        token = f"/{name}/"
-        if token in text:
-            return Path(text.replace(token, f"/{runs_base_name}/", 1))
-    return path
+def _case_inference_root(entry, run_dir: Path) -> Path:
+    """Root an inference output path under the case-specific run directory.
+
+    Preserves the meaningful '.../predictions/<scenario>/<kind>/' substructure
+    while discarding any hardcoded absolute prefix, so every inference output
+    lands under the case folder (runs_root/<case_name>).
+    """
+    text = str(entry).replace("\\", "/")
+    marker = "predictions/"
+    lowered = text.lower()
+    if marker in lowered:
+        return run_dir / text[lowered.index(marker):]
+    return run_dir / "predictions"
 
 
 def _resolve_inputs(values):
@@ -301,7 +318,7 @@ def _to_pre_inverse_output(pred_inverse: torch.Tensor, model: torch.nn.Module) -
     return (pred - mu) / (sigma + 1e-12)
 
 
-def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
+def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg, head_type="deterministic", ensemble_size=1, base_seed=42):
     predictions = []
     pre_inverse_predictions = []
     targets = []
@@ -370,16 +387,18 @@ def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
             normalized_x = _normalize_predictors_for_diagnostics(batch, model)
             stage_stats["normalized_predictors"].add(normalized_x.detach().cpu().numpy())
 
-            with autocast_context():
-                out, _, out_raw_model = infer_batch_with_boundary_mitigation(
-                    model=model,
-                    batch=batch,
-                    cfg=boundary_cfg,
-                )
-
-            if FORCE_OUTPUT_FLOAT32:
-                out = out.float()
-                out_raw_model = out_raw_model.float()
+            out, _, out_raw_model = infer_batch_ensemble(
+                model=model,
+                batch=batch,
+                infer_batch=infer_batch_with_boundary_mitigation,
+                boundary_cfg=boundary_cfg,
+                head_type=head_type,
+                ensemble_size=ensemble_size,
+                base_seed=base_seed,
+                device=device,
+                autocast_context=autocast_context,
+                force_float32=FORCE_OUTPUT_FLOAT32,
+            )
 
             out_cpu = out.detach().cpu()
             out_pre_inverse_cpu = out_raw_model.detach().cpu()
@@ -391,10 +410,14 @@ def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
             stage_stats["raw_model_outputs_pre_inverse"].add(out_pre_inverse_cpu.numpy())
             stage_stats["inverse_outputs"].add(out_cpu.numpy())
             for var_idx, var_name in enumerate(target_vars):
-                stage_stats_by_var["raw_model_outputs_pre_inverse"][var_name].add(
-                    out_pre_inverse_cpu[:, var_idx].numpy()
-                )
-                stage_stats_by_var["inverse_outputs"][var_name].add(out_cpu[:, var_idx].numpy())
+                if out_pre_inverse_cpu.ndim == 5:
+                    pre_inverse_var = out_pre_inverse_cpu[:, :, var_idx].numpy()
+                    output_var = out_cpu[:, :, var_idx].numpy()
+                else:
+                    pre_inverse_var = out_pre_inverse_cpu[:, var_idx].numpy()
+                    output_var = out_cpu[:, var_idx].numpy()
+                stage_stats_by_var["raw_model_outputs_pre_inverse"][var_name].add(pre_inverse_var)
+                stage_stats_by_var["inverse_outputs"][var_name].add(output_var)
 
     if not predictions:
         raise RuntimeError("Inference produced no predictions.")
@@ -452,10 +475,7 @@ def _build_netcdf_encoding(var_names: list[str]) -> dict[str, dict[str, object]]
 
 
 def _build_var_array_map(var_names: list[str], values: np.ndarray) -> dict[str, np.ndarray]:
-    out: dict[str, np.ndarray] = {}
-    for var_idx, var_name in enumerate(var_names):
-        out[var_name] = np.asarray(values[:, var_idx], dtype=np.float32)
-    return out
+    return variable_array_map(var_names, values)
 
 
 def _compute_quantization_summary(var_values: dict[str, np.ndarray]) -> dict[str, dict[str, object]]:
@@ -561,7 +581,7 @@ def _build_dataloader(config, predictor_paths, target_paths, device):
     )
 
 
-def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, Path]:
+def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, Path, str, int, int]:
     runs_root = _select_runs_root(RUNS_ROOT, FINETUNE_RUN_NAME)
     if runs_root != RUNS_ROOT:
         print(f"[runs] Using fallback runs root: {runs_root} (preferred {RUNS_ROOT})")
@@ -621,7 +641,9 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
     if STATIC_PATH:
         config.data.static_path = str(Path(STATIC_PATH).resolve())
 
-    checkpoint_path = resolve_checkpoint(base_params, run_dir)
+    checkpoint_path = run_dir / "checkpoints" / "last.ckpt"
+    if not checkpoint_path.exists():
+        checkpoint_path = resolve_checkpoint(base_params, run_dir)
     assert_no_eccc_reference(checkpoint_path)
 
     model = get_finetune_model_UNET(config)
@@ -660,7 +682,12 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
             f"missing={missing[:8]}, unexpected={incompatible.unexpected_keys[:8]}"
         )
 
-    return run_name, run_dir, checkpoint_path, config, model, runs_root
+    head_type = infer_head_type(checkpoint=checkpoint, config=config, model=model)
+    ensemble_size = resolve_ensemble_size(config, head_type=head_type)
+    base_seed = resolve_base_seed(config)
+    print(f"[inference] head_type={head_type}, ensemble_size={ensemble_size}, base_seed={base_seed}")
+
+    return run_name, run_dir, checkpoint_path, config, model, runs_root, head_type, ensemble_size, base_seed
 
 
 def main() -> None:
@@ -697,7 +724,7 @@ def main() -> None:
     np.random.seed(42)
 
     device = _select_device()
-    run_name, run_dir, checkpoint_path, config, model, runs_root_used = _load_model_and_config()
+    run_name, run_dir, checkpoint_path, config, model, runs_root_used, head_type, ensemble_size, base_seed = _load_model_and_config()
     model.to(device)
     scaler_dtype_summary = _collect_scaler_dtype_summary(model)
     print(f"[diag] scaler dtypes: {scaler_dtype_summary}")
@@ -711,10 +738,7 @@ def main() -> None:
         test_split = TEST_SPLITS[idx]
         predictor_file = PREDICTOR_FILES[idx]
         prediction_output_name = PREDICTION_OUTPUT_NAMES[idx]
-        inference_output_root = _remap_runs_base(
-            Path(INFERENCE_OUTPUT_ROOTS[idx]),
-            runs_root_used.parent.name,
-        )
+        inference_output_root = _case_inference_root(INFERENCE_OUTPUT_ROOTS[idx], run_dir)
 
         if predictor_file:
             test_predictors = [DATASET_ROOT / test_split / predictor_file]
@@ -795,7 +819,16 @@ def main() -> None:
                 f"overlap={boundary_cfg.overlap}, blend_mode={boundary_cfg.blend_mode}, "
                 f"deblock_enabled={boundary_cfg.deblock.enabled}"
             )
-        inference_result = _run_full_inference(test_dl, model, device, target_vars, boundary_cfg)
+        inference_result = _run_full_inference(
+            test_dl,
+            model,
+            device,
+            target_vars,
+            boundary_cfg,
+            head_type=head_type,
+            ensemble_size=ensemble_size,
+            base_seed=base_seed,
+        )
         full_outputs = inference_result["predictions"]
         full_outputs_pre_inverse = inference_result["predictions_pre_inverse"]
         full_targets = inference_result["targets"]
@@ -803,9 +836,10 @@ def main() -> None:
         outputs_np = full_outputs.numpy().astype(np.float32, copy=False)
         outputs_pre_inverse_np = full_outputs_pre_inverse.numpy().astype(np.float32, copy=False)
         targets_np = full_targets.numpy().astype(np.float32, copy=False)
-        if outputs_np.shape[1] != len(target_vars):
+        output_var_axis = 2 if outputs_np.ndim == 5 else 1
+        if outputs_np.shape[output_var_axis] != len(target_vars):
             raise ValueError(
-                f"Model produced {outputs_np.shape[1]} channels but target_vars expects {len(target_vars)}"
+                f"Model produced {outputs_np.shape[output_var_axis]} channels but target_vars expects {len(target_vars)}"
             )
 
         predicted_var_values = _build_var_array_map(target_vars, outputs_np)
@@ -838,6 +872,9 @@ def main() -> None:
             "scaler_dtypes": scaler_dtype_summary,
             "mixed_precision_enabled": bool(ENABLE_MIXED_PRECISION),
             "force_output_float32": bool(FORCE_OUTPUT_FLOAT32),
+            "head_type": head_type,
+            "ensemble_size": int(ensemble_size),
+            "base_seed": int(base_seed),
             "predictands": {name: spec.to_dict() for name, spec in predictand_specs.items()},
         }
         if SAVE_DIAGNOSTICS_JSON:
@@ -884,18 +921,20 @@ def main() -> None:
 
         coords = {time_dim: predictor_time_coord, lat_dim: lat_coord, lon_dim: lon_coord}
         prediction_ds = xr.Dataset(coords=coords)
-        for var_idx, name in enumerate(target_vars):
-            prediction_ds[name] = xr.DataArray(
-                outputs_np[:, var_idx],
-                dims=(time_dim, lat_dim, lon_dim),
-                coords=coords,
-                attrs=target_attrs.get(name, {}),
-            )
-
-        for name in target_vars:
-            prediction_ds[name] = prediction_ds[name].astype(np.float32)
-
         prediction_ds.attrs.update(template_attrs)
+        prediction_ds = add_predictions_to_dataset(
+            prediction_ds=prediction_ds,
+            target_vars=target_vars,
+            outputs_np=outputs_np,
+            coords=coords,
+            time_dim=time_dim,
+            lat_dim=lat_dim,
+            lon_dim=lon_dim,
+            target_attrs=target_attrs,
+            head_type=head_type,
+            ensemble_size=ensemble_size,
+            base_seed=base_seed,
+        )
         prediction_output_path = output_root / prediction_output_stub
         prediction_ds.to_netcdf(
             prediction_output_path,

@@ -35,6 +35,25 @@ def _to_scalar(value):
     return value
 
 
+def _default_checkpoint_dir(config) -> str:
+    """Return the case-specific checkpoint directory for ``config``.
+
+    Prefers the case-derived ``config.path_checkpoints`` (i.e.
+    ``<path_experiment>/<case_name>/checkpoints``) so that checkpoints are always
+    organized under the case folder. Falls back to the legacy
+    ``<path_experiment>/weights`` layout when no ``case_name`` is available (e.g.
+    plain dict-like configs used in some unit tests).
+    """
+
+    try:
+        path_checkpoints = getattr(config, "path_checkpoints", None)
+    except Exception:
+        path_checkpoints = None
+    if path_checkpoints:
+        return str(path_checkpoints)
+    return os.path.join(config.path_experiment, "weights")
+
+
 def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device | int):
     for state in optimizer.state.values():
         for key, value in state.items():
@@ -110,6 +129,39 @@ def _auto_resume_enabled(config) -> bool:
     if env is not None:
         return env
     return True
+
+
+def _save_epoch_checkpoints_enabled(config) -> bool:
+    top_level = _coerce_bool(getattr(config, "save_epoch_checkpoints", None))
+    if top_level is not None:
+        return top_level
+
+    training_cfg = getattr(config, "training", None)
+    if isinstance(training_cfg, dict):
+        nested = _coerce_bool(training_cfg.get("save_epoch_checkpoints"))
+    else:
+        nested = _coerce_bool(
+            getattr(training_cfg, "save_epoch_checkpoints", None) if training_cfg is not None else None
+        )
+    if nested is not None:
+        return nested
+    return True
+
+
+def _checkpoint_head_metadata(config, model) -> dict[str, object]:
+    model_cfg = getattr(config, "model", None)
+    head_type = getattr(model_cfg, "head_type", None) if model_cfg is not None else None
+    decoder_type = getattr(model_cfg, "decoder_type", None) if model_cfg is not None else None
+    if head_type is None:
+        head_type = getattr(model, "head_type", None)
+    diffusion_enabled = bool(getattr(model, "diffusion_enabled", False))
+    if head_type is None and diffusion_enabled:
+        head_type = "diffusion"
+    return {
+        "head_type": str(head_type or "deterministic"),
+        "decoder_type": str(decoder_type) if decoder_type is not None else None,
+        "diffusion_head": diffusion_enabled or str(head_type or "").strip().lower() in {"diffusion", "diffusion_head", "sde", "score", "score_sde"},
+    }
 
 
 def _iter_wrapped_modules(model: torch.nn.Module):
@@ -503,7 +555,7 @@ def save_checkpoint(
 
     checkpoint_dir = checkpoint_dir or getattr(config, "checkpoint_dir", None)
     if checkpoint_dir is None:
-        checkpoint_dir = os.path.join(config.path_experiment, "weights")
+        checkpoint_dir = _default_checkpoint_dir(config)
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -518,7 +570,9 @@ def save_checkpoint(
         "epoch": epoch,
         "loss": train_loss,
         "val_loss": curr_val_loss,
+        "metadata": _checkpoint_head_metadata(config, model),
     }
+    state_dict.update(_checkpoint_head_metadata(config, model))
     if sche_dict is not None:
         state_dict["scheduler"] = sche_dict
     if scaler is not None:
@@ -558,7 +612,7 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
     if not resume_requested and _auto_resume_enabled(config):
         probe_checkpoint_dir = checkpoint_dir
         if probe_checkpoint_dir is None:
-            probe_checkpoint_dir = os.path.join(config.path_experiment, "weights")
+            probe_checkpoint_dir = _default_checkpoint_dir(config)
         auto_resume_checkpoint = _resolve_resume_probe_checkpoint(probe_checkpoint_dir)
         if auto_resume_checkpoint is not None:
             setattr(config, "resume_training", True)
@@ -569,7 +623,7 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
                 print(f"[resume] auto-resume enabled; found checkpoint {auto_resume_checkpoint}")
     if resume_requested:
         if checkpoint_dir is None:
-            checkpoint_dir = os.path.join(config.path_experiment, "weights")
+            checkpoint_dir = _default_checkpoint_dir(config)
         resume_checkpoint = getattr(config, "resume_checkpoint_path", None)
         if resume_checkpoint:
             resume_checkpoint = str(resume_checkpoint)
@@ -664,7 +718,7 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
             )
 
     if checkpoint_dir is None:
-        checkpoint_dir = os.path.join(config.path_experiment, "weights")
+        checkpoint_dir = _default_checkpoint_dir(config)
 
     # Ensure a resumable checkpoint exists from the beginning of training.
     # In distributed mode this decision must be synchronized across ranks;
@@ -817,7 +871,9 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
             best_val_loss = curr_val_loss_scalar
 
         save_every_n = max(1, int(save_every or 1))
-        save_epoch_checkpoint = ((epoch + 1) % save_every_n == 0) or ((epoch + 1) == config.num_epochs)
+        save_epoch_checkpoint = _save_epoch_checkpoints_enabled(config) and (
+            ((epoch + 1) % save_every_n == 0) or ((epoch + 1) == config.num_epochs)
+        )
         # Always persist a resumable last.ckpt after each completed epoch.
         save_now = True
         write_checkpoint = (not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0)

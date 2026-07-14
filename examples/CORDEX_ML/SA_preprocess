@@ -1,57 +1,52 @@
-#!/usr/bin/env bash
-set -euo pipefail
+$ErrorActionPreference = 'Stop'
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ScriptDir
 
 # SA_T1_ACCESS-CM2_static
-python compute_scalars_cordex.py \
-  --config ./SA_T1_ACCESS-CM2_static_v6.yaml \
-  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980.nc \
-  --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc \
-  --use-static \
-  --orography-file /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc \
-  --output-dir ./experiments/SA_T1_ACCESS-CM2_static_v6_scalars
+python compute_scalars_cordex.py `
+  --config ./SA_T1_ACCESS-CM2_static_v6.yaml `
+  --predictor-files D:\CORDEX\SA_domain\train\ESD_pseudo_reality\predictors\ACCESS-CM2_1961-1980.nc `
+  --target-files D:\CORDEX\SA_domain\train\ESD_pseudo_reality\target\pr_tasmax_ACCESS-CM2_1961-1980.nc `
+  --use-static `
+  --orography-file D:\CORDEX\SA_domain\train\ESD_pseudo_reality\predictors\Static_fields.nc
 
-python preproc_cordex.py \
-  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980.nc \
-  --target-sample /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc \
-  --orography-file /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc \
-  --output-dir /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/ESD_pseudo_reality/predictors \
-  --input-vars u v q t z \
-  --input-levels 850 700 500 \
+python preproc_cordex.py `
+  --predictor-files D:\CORDEX\SA_domain\train\ESD_pseudo_reality\predictors\ACCESS-CM2_1961-1980.nc `
+  --target-sample D:\CORDEX\SA_domain\train\ESD_pseudo_reality\target\pr_tasmax_ACCESS-CM2_1961-1980.nc `
+  --orography-file D:\CORDEX\SA_domain\train\ESD_pseudo_reality\predictors\Static_fields.nc `
+  --output-dir D:\CORDEX\SA_domain\train\ESD_pseudo_reality\predictors `
+  --input-vars u v q t z `
+  --input-levels 850 700 500 `
   --regrid-method bilinear
 
 # SA_T1_ACCESS-CM2_no_static
-python compute_scalars_cordex.py \
-  --config ./SA_T1_ACCESS-CM2_no_static_v6.yaml \
-  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980.nc \
-  --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc \
-  --no-static \
-  --output-dir ./experiments/SA_T1_ACCESS-CM2_no_static_v6_scalars
+python compute_scalars_cordex.py `
+  --config ./SA_T1_ACCESS-CM2_no_static_v6.yaml `
+  --predictor-files D:\CORDEX\SA_domain\train\ESD_pseudo_reality\predictors\ACCESS-CM2_1961-1980.nc `
+  --target-files D:\CORDEX\SA_domain\train\ESD_pseudo_reality\target\pr_tasmax_ACCESS-CM2_1961-1980.nc `
+  --no-static
 
 # SA_T2_ACCESS-CM2_static
-python compute_scalars_cordex.py \
-  --config ./SA_T2_ACCESS-CM2_static_v6.yaml \
-  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099.nc \
-  --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc \
-  --use-static \
-  --orography-file /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/predictors/Static_fields.nc \
-  --output-dir ./experiments/SA_T2_ACCESS-CM2_static_v6_scalars
+python compute_scalars_cordex.py `
+  --config ./SA_T2_ACCESS-CM2_static_diffusion.yaml `
+  --predictor-files D:\CORDEX\SA_domain\train\Emulator_hist_future\predictors\ACCESS-CM2_1961-1980_2080-2099.nc `
+  --target-files D:\CORDEX\SA_domain\train\Emulator_hist_future\target\pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc `
+  --use-static `
+  --orography-file D:\CORDEX\SA_domain\train\Emulator_hist_future\predictors\Static_fields.nc
 
-python preproc_cordex.py \
-  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099.nc \
-  --target-sample /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc \
-  --orography-file /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/predictors/Static_fields.nc \
-  --output-dir /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/predictors \
-  --input-vars u v q t z \
-  --input-levels 850 700 500 \
+python preproc_cordex.py `
+  --predictor-files D:\CORDEX\SA_domain\train\Emulator_hist_future\predictors\ACCESS-CM2_1961-1980_2080-2099.nc `
+  --target-sample D:\CORDEX\SA_domain\train\Emulator_hist_future\target\pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc `
+  --orography-file D:\CORDEX\SA_domain\train\Emulator_hist_future\predictors\Static_fields.nc `
+  --output-dir D:\CORDEX\SA_domain\train\Emulator_hist_future\predictors `
+  --input-vars u v q t z `
+  --input-levels 850 700 500 `
   --regrid-method bilinear
 
 # SA_T2_ACCESS-CM2_no_static
-python compute_scalars_cordex.py \
-  --config ./SA_T2_ACCESS-CM2_no_static_v6.yaml \
-  --predictor-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099.nc \
-  --target-files /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc \
-  --no-static \
-  --output-dir ./experiments/SA_T2_ACCESS-CM2_no_static_v6_scalars
+python compute_scalars_cordex.py `
+  --config ./SA_T2_ACCESS-CM2_no_static_v6.yaml `
+  --predictor-files D:\CORDEX\SA_domain\train\Emulator_hist_future\predictors\ACCESS-CM2_1961-1980_2080-2099.nc `
+  --target-files D:\CORDEX\SA_domain\train\Emulator_hist_future\target\pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc `
+  --no-static

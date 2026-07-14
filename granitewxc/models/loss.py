@@ -707,7 +707,30 @@ class CompositePredictandLoss:
         return payload
 
 
+def _head_type_is_diffusion(config: Any) -> bool:
+    model_cfg = getattr(config, "model", None)
+    if model_cfg is None:
+        return False
+    raw = getattr(model_cfg, "head_type", None)
+    if raw is None:
+        raw = getattr(model_cfg, "decoder_type", None)
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in {
+        "diffusion",
+        "diffusion_head",
+        "sde",
+        "score",
+        "score_sde",
+    }
+
+
 def build_loss_fn(config: Any, output_vars: list[str]):
+    if _head_type_is_diffusion(config):
+        from granitewxc.models.diffusion_loss import DiffusionLossPassthrough
+
+        return DiffusionLossPassthrough(output_vars=output_vars)
+
     loss_cfg = _coerce_mapping(getattr(config, "loss", {}))
     merged_cfg = dict(loss_cfg)
     for key in (

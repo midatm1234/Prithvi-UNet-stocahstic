@@ -5,7 +5,7 @@ from granitewxc.utils.config import ExperimentConfig
 from granitewxc.utils.distributed import is_main_process
 from granitewxc.decoders.downscaling import ConvEncoderDecoder
 from granitewxc.models.finetune_model import PatchEmbed
-from granitewxc.models.cordex_finetune_model import ClimateDownscaleFinetuneUNETModel, ClimateDownscaleFinetuneModel
+from granitewxc.models.cordex_finetune_model import ClimateDownscaleFinetuneUNETModel, ClimateDownscaleFinetuneModel, resolve_head_type
 from granitewxc.utils.predictands import build_predictand_specs
 from PrithviWxC.model import PrithviWxCEncoderDecoder
 
@@ -346,7 +346,11 @@ def get_finetune_model(config: ExperimentConfig) -> torch.nn.Module:
     #########################################################
     # 4. Upscale after FM 
     #########################################################
-    if config.model.encoder_decoder_type == 'conv':
+    if resolve_head_type(config) == "diffusion":
+        # The deterministic conv head is replaced by the diffusion head, which
+        # is constructed inside the model. Skip building an unused conv head.
+        head = None
+    elif config.model.encoder_decoder_type == 'conv':
         head = ConvEncoderDecoder(
                 in_channels=config.model.embed_dim,
                 channels=config.model.encoder_decoder_conv_channels,

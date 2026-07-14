@@ -20,6 +20,8 @@ class RunPaths:
     preproc: Path
     config_dir: Path
     manifest_path: Path
+    inference: Path
+    logs: Path
 
 
 def _rebase_manifest_paths(payload: Any, old_root: Path, new_root: Path) -> Any:
@@ -82,16 +84,27 @@ def _rebase_config_snapshot(snapshot_path: Path, old_root: Path, new_root: Path)
 
 
 def prepare_run_paths(root: Path, run_name: str) -> RunPaths:
-    """Create the directory structure for a run and return the corresponding paths."""
+    """Create the directory structure for a run and return the corresponding paths.
+
+    The layout mirrors the case-specific folder organization used across the
+    CORDEX workflow (see :class:`granitewxc.utils.config.ExperimentConfig`)::
+
+        <root>/<run_name>/
+            checkpoints/   scalars/   preproc/
+            inference/     logs/      config/
+            run_manifest.json
+    """
 
     run_dir = root / run_name
     checkpoints = run_dir / "checkpoints"
     scalars = run_dir / "scalars"
     preproc = run_dir / "preproc"
+    inference = run_dir / "inference"
+    logs = run_dir / "logs"
     config_dir = run_dir / "config"
     manifest_path = run_dir / "run_manifest.json"
 
-    for directory in (run_dir, checkpoints, scalars, preproc, config_dir):
+    for directory in (run_dir, checkpoints, scalars, preproc, inference, logs, config_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
     return RunPaths(
@@ -101,7 +114,42 @@ def prepare_run_paths(root: Path, run_name: str) -> RunPaths:
         preproc=preproc,
         config_dir=config_dir,
         manifest_path=manifest_path,
+        inference=inference,
+        logs=logs,
     )
+
+
+def prepare_case_paths(config: Any, root: Optional[Path] = None) -> RunPaths:
+    """Create the case-specific run layout for ``config`` and wire the config to it.
+
+    ``case_name`` (mandatory on every YAML) is used as the run/case folder name so
+    that scalars, preprocessed files, checkpoints, inference outputs and logs are
+    all organized under a single ``<root>/<case_name>`` directory. ``root``
+    defaults to ``config.path_experiment``.
+
+    The resolved sub-directories are written back onto ``config`` (``scalar_dir``,
+    ``preproc_dir``, ``checkpoint_dir``, ``inference_dir``, ``log_dir``) and
+    ``path_experiment`` is pointed at the case directory so downstream code that
+    reads these attributes picks up the case-specific locations automatically.
+    """
+
+    case_name = config.require_case_name()
+    if root is None:
+        base = Path(str(getattr(config, "path_experiment", ".") or ".")).expanduser()
+        # Avoid nesting <case>/<case> when path_experiment is already the case dir.
+        root = base.parent if base.name == case_name else base
+    else:
+        root = Path(root).expanduser()
+
+    run_paths = prepare_run_paths(root, case_name)
+
+    config.path_experiment = str(run_paths.run_dir)
+    config.checkpoint_dir = str(run_paths.checkpoints)
+    config.scalar_dir = str(run_paths.scalars)
+    config.preproc_dir = str(run_paths.preproc)
+    config.inference_dir = str(run_paths.inference)
+    config.log_dir = str(run_paths.logs)
+    return run_paths
 
 
 def _copy_if_needed(src_path: Optional[str], destination_dir: Path) -> Optional[str]:
@@ -173,6 +221,8 @@ def write_manifest(
         "checkpoint_dir": str(run_paths.checkpoints),
         "scalar_dir": str(run_paths.scalars),
         "preproc_dir": str(run_paths.preproc),
+        "inference_dir": str(run_paths.inference),
+        "log_dir": str(run_paths.logs),
         "config_snapshot": str(resolved_config),
         "base_config": base_config,
         "scalars": scalars,

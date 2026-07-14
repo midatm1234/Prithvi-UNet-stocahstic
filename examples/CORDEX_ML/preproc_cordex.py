@@ -3,12 +3,26 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
+import warnings
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Tuple, Union
 
+import numpy as np
 import xarray as xr
-import xesmf as xe
+
+try:
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+        io.StringIO()
+    ):
+        import xesmf as xe
+except Exception as exc:  # pragma: no cover - depends on optional ESMF install
+    xe = None
+    _XESMF_IMPORT_ERROR = exc
+else:  # pragma: no cover - optional import
+    _XESMF_IMPORT_ERROR = None
 
 
 LAT_CANDIDATES = ("lat", "latitude", "rlat", "y")
@@ -56,12 +70,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--regrid-method",
         default="bilinear",
-        help="xESMF regridding method",
+        help="Regridding method. Uses xESMF when available; otherwise falls back to xarray interpolation.",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Optional CORDEX YAML config. When provided and --output-dir is "
+            "omitted, regridded files are written to the case-specific "
+            "'<path_experiment>/<case_name>/preproc' folder."
+        ),
     )
     parser.add_argument(
         "--output-dir",
-        default="./preprocessed",
-        help="Directory to write the regridded NetCDF files",
+        default=None,
+        help=(
+            "Directory to write the regridded NetCDF files. Defaults to the "
+            "case-specific preproc folder when --config is given, otherwise "
+            "'./preprocessed'."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -113,6 +140,102 @@ def build_grid(ds: xr.Dataset, lat_name: str, lon_name: str) -> xr.Dataset:
     return xr.Dataset({"lat": lat, "lon": lon})
 
 
+def compute_shape(lat: xr.DataArray, lon: xr.DataArray) -> Tuple[int, int]:
+    if lat.ndim == 1 and lon.ndim == 1:
+        return lat.sizes[lat.dims[0]], lon.sizes[lon.dims[0]]
+    if lat.ndim == 2 and lon.ndim == 2:
+        return lat.shape[0], lat.shape[1]
+    raise ValueError("Unsupported coordinate dimensionality for grid definition")
+
+
+def build_regridder(grid_in: xr.Dataset, fine_grid: xr.Dataset, method: str):
+    if xe is not None:
+        try:
+            return xe.Regridder(grid_in, fine_grid, method=method, periodic=False)
+        except Exception as exc:
+            warnings.warn(
+                "xESMF regridding failed to initialize; falling back to "
+                f"xarray interpolation. Error: {exc}",
+                RuntimeWarning,
+            )
+    elif _XESMF_IMPORT_ERROR is not None:
+        warnings.warn(
+            "xESMF could not be imported; falling back to xarray interpolation "
+            f"({type(_XESMF_IMPORT_ERROR).__name__}: {_XESMF_IMPORT_ERROR}).",
+            RuntimeWarning,
+        )
+
+    return XarrayRegridder(
+        fine_grid,
+        target_shape=compute_shape(fine_grid["lat"], fine_grid["lon"]),
+        method=method,
+    )
+
+
+class XarrayRegridder:
+    """Small fallback regridder when xESMF/ESMF is unavailable."""
+
+    def __init__(
+        self,
+        grid_out: xr.Dataset,
+        target_shape: Tuple[int, int],
+        method: str = "bilinear",
+    ) -> None:
+        self.target_shape = target_shape
+        self.method = "linear" if method in {"bilinear", "linear"} else "nearest"
+        self._lat = grid_out["lat"]
+        self._lon = grid_out["lon"]
+        self._template = xr.Dataset({"lat": self._lat, "lon": self._lon})
+
+        if self._lat.ndim == 1 and self._lon.ndim == 1:
+            self._dims = ("lat", "lon")
+            self._coords = {"lat": self._lat, "lon": self._lon}
+        else:
+            self._dims = self._lat.dims
+            self._coords = {
+                "lat": (self._lat.dims, self._lat.to_numpy()),
+                "lon": (self._lon.dims, self._lon.to_numpy()),
+            }
+
+    def __call__(self, data: xr.DataArray) -> Union[xr.DataArray, np.ndarray]:
+        try:
+            return data.interp(lat=self._lat, lon=self._lon, method=self.method)
+        except Exception:
+            pass
+
+        try:
+            return data.interp_like(self._template, method=self.method)
+        except Exception:
+            pass
+
+        return self._resize_last_two_dims(data)
+
+    def _resize_last_two_dims(self, data: xr.DataArray) -> xr.DataArray:
+        import torch
+
+        array = data.to_numpy().astype(np.float32, copy=False)
+        leading_shape = array.shape[:-2]
+        spatial = array.reshape((-1,) + array.shape[-2:])
+        tensor = torch.from_numpy(spatial).unsqueeze(1)
+        resized = torch.nn.functional.interpolate(  # type: ignore[attr-defined]
+            tensor,
+            size=self.target_shape,
+            mode="bilinear" if self.method == "linear" else "nearest",
+            align_corners=False if self.method == "linear" else None,
+        )
+        upsampled = resized.squeeze(1).cpu().numpy()
+        upsampled = upsampled.reshape(leading_shape + self.target_shape)
+
+        dims = data.dims[:-2] + self._dims
+        coords = {
+            name: data.coords[name]
+            for name in data.dims[:-2]
+            if name in data.coords
+        }
+        coords.update(self._coords)
+        return xr.DataArray(upsampled, dims=dims, coords=coords, attrs=data.attrs)
+
+
 def load_regridded_orography(
     orog_path: str,
     fine_grid: xr.Dataset,
@@ -126,15 +249,46 @@ def load_regridded_orography(
         lon_name = infer_coord_name(ds, LON_CANDIDATES)
 
         grid_in = build_grid(ds, lat_name, lon_name)
-        regridder = xe.Regridder(grid_in, fine_grid, method=regrid_method, periodic=False)
+        regridder = build_regridder(grid_in, fine_grid, method=regrid_method)
         data = rename_lat_lon(ds[var_name], lat_name, lon_name)
         regridded = regridder(data)
         return regridded.rename(var_name)
 
 
+def _resolve_output_dir(args: argparse.Namespace) -> str:
+    """Determine where regridded predictors are written.
+
+    Priority: explicit ``--output-dir`` > case-specific ``<path_experiment>/
+    <case_name>/preproc`` (when ``--config`` supplies a ``case_name``) >
+    ``./preprocessed`` fallback.
+    """
+
+    if args.output_dir:
+        return args.output_dir
+
+    if args.config:
+        import sys
+        from pathlib import Path as _Path
+
+        repo_root = _Path(__file__).resolve().parents[2]
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from granitewxc.utils.config import get_config
+
+        config = get_config(args.config)
+        print(
+            f"[output] --output-dir not set; using case-specific preproc folder "
+            f"for case '{config.case_name}': {config.path_preproc}"
+        )
+        return config.path_preproc
+
+    return "./preprocessed"
+
+
 def main() -> None:
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir = _resolve_output_dir(args)
+    os.makedirs(output_dir, exist_ok=True)
 
     with xr.open_dataset(args.target_sample) as target_ds:
         fine_lat_name = infer_coord_name(target_ds, LAT_CANDIDATES)
@@ -149,7 +303,7 @@ def main() -> None:
 
     for predictor_path in args.predictor_files:
         predictor_path = os.fspath(predictor_path)
-        output_path = Path(args.output_dir) / f"{Path(predictor_path).stem}_regridded.nc"
+        output_path = Path(output_dir) / f"{Path(predictor_path).stem}_regridded.nc"
         if output_path.exists() and not args.overwrite:
             print(f"[Skip] {output_path} already exists")
             continue
@@ -158,7 +312,7 @@ def main() -> None:
             lat_name = infer_coord_name(ds, LAT_CANDIDATES)
             lon_name = infer_coord_name(ds, LON_CANDIDATES)
             grid_in = build_grid(ds, lat_name, lon_name)
-            regridder = xe.Regridder(grid_in, fine_grid, method=args.regrid_method, periodic=False)
+            regridder = build_regridder(grid_in, fine_grid, method=args.regrid_method)
 
             out_vars: List[xr.DataArray] = []
             out_names: List[str] = []
@@ -181,4 +335,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

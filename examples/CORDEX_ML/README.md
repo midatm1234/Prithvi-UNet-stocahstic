@@ -3,6 +3,219 @@
 ## Overview
 This folder hosts the CORDEX-ML benchmark workflows for multiple regional domains—European Alps (ALPS), New Zealand (NZ), and South Africa (SA)—demonstrating how to fine-tune the Prithvi WxC UNet on coarse CORDEX predictors and produce high-resolution precipitation (`pr`) and maximum temperature (`tasmax`) forecasts. The assets here reuse the helper scripts (`preproc_cordex.py`, `compute_scalars_cordex.py`, `cordex_training.py`, and the notebooks in `notebooks/`) to cover the full loop: preprocess/regrid → compute scalars → fine-tune → inference → persist predictions as NetCDF.
 
+## Case-specific output folders (`case_name`)
+
+Every YAML config in this folder **must** start with a `case_name:` on line 1.
+`case_name` is the single source of truth for where all generated artifacts are
+written and read back; it is normally the config's file stem, e.g.:
+
+```yaml
+case_name: NZ_T1_ACCESS-CM2_static_v6
+data:
+  ...
+```
+
+`granitewxc.utils.config.get_config()` parses and validates it. If `case_name`
+is missing it raises a clear `MissingCaseNameError` asking you to add it as the
+first line of the YAML.
+
+All generated outputs for a config are organized under
+`<path_experiment>/<case_name>/`:
+
+```text
+<path_experiment>/<case_name>/
+├── scalars/       # inputs_mean.npy, inputs_std.npy, targets_mean.npy, targets_std.npy, metadata.json
+├── preproc/       # optional regridded predictors from preproc_cordex.py (--config)
+├── checkpoints/   # best.ckpt / last.ckpt written by the trainer
+├── inference/     # NetCDF predictions (pr, tasmax) + diagnostics
+└── logs/          # optional run logs / evaluation summaries
+```
+
+The config exposes these as properties (`config.path_scalars`,
+`config.path_preproc`, `config.path_checkpoints`, `config.path_inference`,
+`config.path_logs`) and repoints the scalar files
+(`config.model.{input_mu,input_sigma,target_mu,target_sigma}` and
+`config.data.scalers`) at `<case_name>/scalars` automatically, so training and
+inference always agree on where the statistics live. In practice:
+
+* **Scalars** — `compute_scalars_cordex.py --config <cfg.yaml>` writes to
+  `<case_name>/scalars` by default; `--output-dir` is now optional (override only).
+* **Checkpoints** — the trainer defaults to `<case_name>/checkpoints` when
+  `config.checkpoint_dir` is not set explicitly.
+* **Inference** — the inference scripts locate the fine-tune run by `case_name`
+  and write predictions under the case-named run directory (never a hard-coded path).
+
+To opt out of repointing the scalar file paths (for example to reuse a shared
+statistics folder) set `derive_output_paths: false` in the YAML; the
+`config.path_*` helpers still resolve to the case sub-folders.
+
+## Diffusion decoder head (optional)
+
+By default the CORDEX-ML model uses the deterministic convolutional / UNet
+decoder head. An **optional score-based diffusion head** (adapted from
+[`mlde`](https://github.com/midatm1234/mlde)) can be selected from config to turn
+the model into a *generative* downscaler that samples high-resolution `pr` and
+`tasmax` fields conditioned on the Prithvi WxC backbone features. The
+deterministic workflow is untouched — the diffusion head activates only when the
+config asks for it.
+
+### How to enable it
+
+Add a `head_type: diffusion` key under `model:` (the alias
+`model.decoder_type: diffusion` also works) plus an optional `model.diffusion:`
+block of hyper-parameters. Ready-to-use examples are
+[`NZ_T1_ACCESS-CM2_static_diffusion.yaml`](./NZ_T1_ACCESS-CM2_static_diffusion.yaml)
+and [`SA_T2_ACCESS-CM2_static_diffusion.yaml`](./SA_T2_ACCESS-CM2_static_diffusion.yaml):
+
+```yaml
+model:
+  # ... all existing deterministic keys are unchanged ...
+  head_type: diffusion          # <-- the only required switch
+  diffusion:
+    sde: subvpsde               # vpsde | subvpsde | vesde
+    beta_min: 0.1               # VP/subVP noise schedule
+    beta_max: 20.0
+    sigma_min: 0.01             # VE noise schedule
+    sigma_max: 50.0
+    num_scales: 1000            # (a.k.a. num_diffusion_steps)
+    sampling_method: pc         # pc (predictor-corrector) | ode
+    predictor: euler_maruyama   # euler_maruyama | reverse_diffusion | none
+    corrector: none             # langevin | none
+    num_sampling_steps: 128     # reverse steps used at inference
+    base_channels: 64           # score-network width
+    channel_multipliers: [1, 2, 2]
+    output_channels: 2          # pr + tasmax (inferred from the model too)
+```
+
+To go back to the deterministic head, delete `head_type` (or set it to
+`deterministic`). No other change is needed.
+
+> **Note:** the hurdle precipitation model (`precip_model: hurdle`) is not
+> compatible with the diffusion head, which models `pr`/`tasmax` jointly. Use
+> `precip_model: single_head` (as in the example config). Requesting the hurdle
+> model together with the diffusion head raises a clear error at model build
+> time.
+
+### How training differs
+
+* **Deterministic head** minimizes a regression loss (RMSE / composite predictand
+  loss) between the decoded prediction and the target.
+* **Diffusion head** minimizes a **score-matching (denoising) loss**. The model's
+  `forward(batch)` returns the scalar diffusion loss directly, and
+  `build_loss_fn` returns a thin passthrough so the existing trainer loop
+  (`prediction = model(batch); loss = loss_func(prediction, batch)`) is unchanged.
+  The loss is computed in **standardized target space** (the same scaling that the
+  deterministic decoder inverts), so the existing scalers and per-variable scaling
+  methods (`zscore` / `divide_only` / `log1p`) are reused.
+
+Training is launched exactly like the deterministic workflow — just point it at
+the diffusion config:
+
+```bash
+python examples/CORDEX_ML/cordex_training.py \
+    --config examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static_diffusion.yaml
+```
+
+Both training and validation call `model(batch)` without return flags and
+therefore compute the (cheap) score-matching loss — validation does **not** run
+the expensive sampler.
+
+### How inference sampling works
+
+Inference is unchanged at the call site: the inference helpers call the model
+with `return_pre_inverse=True, return_raw_output=True`. In diffusion mode this
+triggers the **reverse-diffusion sampler** instead of a single forward pass:
+
+1. The backbone produces conditioning features from the coarse predictors
+   (+ optional static/orography fields).
+2. Gaussian noise at the target resolution is denoised over
+   `num_sampling_steps` reverse SDE steps (predictor–corrector or ODE),
+   conditioned on those features.
+3. The standardized sample is inverse-scaled back to physical `pr`/`tasmax`,
+   including **precipitation non-negativity** (configured non-negative channels
+   are clamped at 0 after decoding).
+
+The sampler returns one stochastic tensor of shape
+`[B, output_channels, H_target, W_target]` (i.e.
+`[B, 2, target_size_lat, target_size_lon]`). The inference workflow detects
+diffusion checkpoints and runs the sampler repeatedly to build an ensemble.
+Each member uses an independent, reproducible seed:
+
+```text
+ensemble_seed = base_seed + ensemble_index
+```
+
+### Using the existing notebooks and scripts
+
+The diffusion head plugs into the **existing** CORDEX-ML finetune and inference
+workflows — no Python edits are required, only a config switch (and, for
+inference, a diffusion-trained checkpoint):
+
+**Finetuning** (`cordex_training.py` and the `notebooks/*finetune*` notebooks):
+
+* Point the run at a diffusion config. In the notebooks this is the
+  `config_path` in the *USER PARAMETERS* cell (e.g. change
+  `SA_T2_ACCESS-CM2_static_v6.yaml` → `SA_T2_ACCESS-CM2_static_diffusion.yaml`);
+  for the CLI pass `--config .../<name>_diffusion.yaml`.
+* The model is built through `create_finetune_model` → `get_finetune_model_UNET`,
+  which constructs the diffusion head automatically when `head_type: diffusion`.
+  `build_loss_fn` returns the diffusion loss passthrough, and the trainer loop
+  (`model(batch)` → scalar loss) is unchanged. The notebooks' default
+  `precip_model` fallback keeps the config's `single_head` setting.
+
+**Inference** (`notebooks/*inference*` scripts/notebooks):
+
+* Set `CONFIG_PATH` to the diffusion config so the script locates the matching
+  training-run directory. The script reloads the run's resolved-config snapshot,
+  so `head_type: diffusion` carries through and `get_finetune_model_UNET` rebuilds
+  the diffusion head.
+* **Use a checkpoint from a diffusion finetune run.** Inference validates weights
+  strictly (missing/unexpected keys raise). A deterministic checkpoint has no
+  `diffusion_head.*` weights and will fail with a clear mismatch error — this is
+  expected, not a bug.
+* **Tiling/boundary blending:** if you enable `inference.boundary_mitigation`
+  with tiles, the sampler runs per tile with independent noise, producing seams.
+  Prefer a single full-frame sampler call (the default when no `inference:` block
+  is present, or set `boundary_mitigation.force_full_frame: true`).
+* **Cost & stochasticity:** each ensemble member runs `num_sampling_steps`
+  reverse steps. Lower `num_sampling_steps` to trade quality for speed.
+
+Example inference settings:
+
+```yaml
+inference:
+  ensemble_size: 10
+  base_seed: 42
+```
+
+For diffusion-head checkpoints, `ensemble_size` defaults to 10 and smaller
+values are automatically raised to 10. Deterministic convolutional-head
+checkpoints keep the previous one-member deterministic behavior unless an
+explicit downstream workflow adds its own ensemble support.
+
+### Expected output locations and shapes
+
+* Output NetCDF files are written to the same case-name-based locations as the
+  deterministic workflow.
+* Deterministic checkpoints keep variables shaped `[time, lat, lon]`.
+* Diffusion checkpoints write `pr` and `tasmax` with dimensions
+  `[time, ensemble, lat, lon]`, plus an `ensemble = 0..ensemble_size-1`
+  coordinate and global attrs including `head_type=diffusion`,
+  `ensemble_size`, `ensemble_generation=diffusion_sampling`, and `base_seed`.
+* Postprocessing that needs a single field should explicitly call
+  `ensemble_mean_xr()` from `examples/CORDEX_ML/utils/postprocess_outputs.py`;
+  the workflow does not silently squeeze or drop the ensemble dimension.
+
+### Smoke test
+
+A dummy-tensor smoke test (no data or GPU required) verifies the deterministic
+head still imports, the diffusion training loss is finite, and the sampler
+returns the expected shape:
+
+```bash
+python examples/CORDEX_ML/diffusion_smoke_test.py
+```
+
 ## v6 Block Artifact Root-Cause Fixes
 
 The remaining coarse block patterns in `pr` and `tasmax` are now addressed in the training/inference pipeline itself, not by cosmetic post-smoothing.
@@ -389,22 +602,22 @@ python examples/CORDEX_ML/preproc_cordex.py \
 #   --orography-file ./granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc \
 #   --output-dir ./granite-geospatial-wxc-downscaling/CORDEX/ALPS_domain/train/ESD_pseudo_reality/predictors
 
-# Compute normalization scalars for tasmax/pr fine-tuning (static/orography included)
+# Compute normalization scalars for tasmax/pr fine-tuning (static/orography included).
+# Scalars are written to <path_experiment>/<case_name>/scalars automatically
+# (case_name is read from line 1 of the YAML); pass --output-dir only to override.
 python examples/CORDEX_ML/compute_scalars_cordex.py \
   --config ./examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static.yaml \
   --predictor-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/*_regridded.nc \
   --target-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_*.nc \
   --use-static \
-  --orography-file ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc \
-  --output-dir ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_scalars
+  --orography-file ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc
 
-# For no-static scalars, drop orography and use a separate output dir:
+# For no-static scalars, drop orography (still writes under <case_name>/scalars):
 # python examples/CORDEX_ML/compute_scalars_cordex.py \
 #   --config ./examples/CORDEX_ML/NZ_T1_ACCESS-CM2_no_static.yaml \
 #   --predictor-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/*_regridded.nc \
 #   --target-files ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_*.nc \
-#   --no-static \
-#   --output-dir ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_no_static_scalars
+#   --no-static
 
 # Launch notebooks (Jupyter or VS Code works)
 # For NZ domain:
@@ -414,7 +627,7 @@ jupyter lab examples/CORDEX_ML/notebooks/NZ_downscaling_inference.ipynb
 # For ALPS or SA domains, similarly use ALPS_downscaling_*.ipynb or SA_downscaling_*.ipynb
 ```
 > Tip: set `distributed_strategy: fsdp` in the YAML when fine-tuning on multiple GPUs; switch `device_target: cpu` when only CPUs are available.
-> Tip: use the provided wrapper scripts (`examples/CORDEX_ML/ALPS_preprocess`, `NZ_preprocess`, `SA_preprocess`) for batch pre-processing and scalar generation; they now pass `--config` to `compute_scalars_cordex.py` automatically.
+> Tip: use the provided wrapper scripts (`examples/CORDEX_ML/ALPS_preprocess`, `NZ_preprocess`, `SA_preprocess`) for batch pre-processing and scalar generation; they pass `--config` to `compute_scalars_cordex.py` so scalars land in each case's `<case_name>/scalars` folder automatically.
 > Tip: if scalar logs print `[predictands] no --config provided; using defaults (pr -> divide_only + p95, others -> zscore)`, your run is not using the intended YAML predictand settings.
 
 ## I/O Variables

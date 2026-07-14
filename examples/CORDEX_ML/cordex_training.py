@@ -377,6 +377,12 @@ def _resolve_checkpoint_dir(config: ExperimentConfig) -> str | None:
     checkpoint_dir = getattr(config, "checkpoint_dir", None)
     if checkpoint_dir:
         return str(checkpoint_dir)
+    try:
+        path_checkpoints = getattr(config, "path_checkpoints", None)
+    except Exception:
+        path_checkpoints = None
+    if path_checkpoints:
+        return str(path_checkpoints)
     path_experiment = getattr(config, "path_experiment", None)
     if path_experiment:
         return os.path.join(str(path_experiment), "weights")
@@ -1310,6 +1316,38 @@ def _single_gpu_worker(rank: int, config: ExperimentConfig, save_every: int, ret
     return_dict["val_losses"] = val_losses
 
 
+def _run_single_gpu_in_process(config: ExperimentConfig, save_every: int):
+    """Run single-GPU training in the current process so notebook tqdm is visible."""
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+
+    train_loader, val_loader = get_dataloaders(config, use_gpu=True, rank=0, world_size=1)
+
+    model = create_finetune_model(config, verbose=True).to(device)
+    _configure_skip_offload(model, config)
+
+    optimizer, scaler, scheduler = build_optimizer_scheduler(
+        config, model, len(train_loader), use_gpu=True
+    )
+    loss_fn = build_loss_fn(config, list(config.data.output_vars))
+    if hasattr(loss_fn, "describe"):
+        print(f"[loss] active: {loss_fn.describe()}")
+
+    return train_model(
+        config,
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        scaler,
+        local_rank=0,
+        use_gpu=True,
+        save_every=save_every,
+        loss_func=loss_fn,
+    )
+
+
 def _run_distributed_from_env(config: ExperimentConfig, save_every: int):
     local_rank, global_rank = init_ddp(use_gpu=True)
     try:
@@ -1461,6 +1499,10 @@ def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_eve
         return train_losses, val_losses
 
     if num_gpus == 1:
+        if bool(getattr(config, "run_single_gpu_in_process", False)):
+            print("[training] running single-GPU training in the notebook process for visible tqdm.")
+            return _run_single_gpu_in_process(config, save_every=save_every)
+
         mp.set_start_method("spawn", force=True)
         single_gpu_entry_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
 

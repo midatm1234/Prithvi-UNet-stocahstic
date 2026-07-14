@@ -5,11 +5,30 @@ import scipy.stats as stats
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 import matplotlib.animation as animation
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-from pysteps.utils.spectral import rapsd
 from granitewxc.utils.eccc_contants import RLAT_GDPS, RLON_GDPS, RLAT_HRDPS, RLON_HRDPS 
 from granitewxc.utils.eccc_contants import GRID_NORTH_POLE_LATITUDE, GRID_NORTH_POLE_LONGITUDE
+
+
+def _get_cartopy():
+    try:
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+    except ImportError as exc:
+        raise ImportError(
+            "Cartopy is required for map plotting functions in granitewxc.utils.plot. "
+            "Install or repair cartopy/pyproj before calling these functions."
+        ) from exc
+    return ccrs, cfeature
+
+
+def _get_rapsd():
+    try:
+        from pysteps.utils.spectral import rapsd
+    except ImportError as exc:
+        raise ImportError(
+            "pysteps is required for RAPSD power spectrum plots in granitewxc.utils.plot."
+        ) from exc
+    return rapsd
 
 
 def plot_spatial(sample, ax, title, **kwargs):
@@ -165,6 +184,7 @@ def plot_loss(train_loss, val_loss):
 
 
 def plot_with_bbox(ax, data, rotated_crs, bounding_boxes, rlat, rlon, cmap='coolwarm', vmin=-10, vmax=10):
+    ccrs, cfeature = _get_cartopy()
     mesh = ax.pcolormesh(rlon, rlat, data, cmap=cmap, transform=rotated_crs, vmin=vmin, vmax=vmax)
     
     ax.coastlines()
@@ -209,6 +229,7 @@ def plot_with_bbox(ax, data, rotated_crs, bounding_boxes, rlat, rlon, cmap='cool
     return mesh
 
 def plot_power_spectrum_with_rapsd(img, ax, label=None, save_fig=False, fs=1/2.5):
+    rapsd = _get_rapsd()
     spectrum, k = rapsd(img, fft_method = np.fft, return_freq=True, d=1/fs, normalize=False)
 
     spectrum_db = 10 * np.log10(spectrum + 1e-10)  # add epsilon to avoid log(0)
@@ -248,6 +269,7 @@ def crop_region(data, rlon, rlat, lon_min, lon_max, lat_min, lat_max):
     )
 
 def convert_bbox_to_rotated(lon_min, lon_max, lat_min, lat_max, rotated_crs):
+    ccrs, _ = _get_cartopy()
     geographic_crs = ccrs.PlateCarree()
     lon = np.array([lon_min, lon_max, lon_max, lon_min])
     lat = np.array([lat_min, lat_min, lat_max, lat_max])
@@ -302,6 +324,7 @@ def plot_maps(plot_input, plot_pred, plot_target, regions, rotated_crs):
     plt.show()
 
 def plot_by_region(plot_input, plot_pred, plot_target, regions, rotated_crs):
+    _, cfeature = _get_cartopy()
     n_regions = len(regions)
     
     fig, axes = plt.subplots(n_regions, n_regions, figsize=(22, 20), subplot_kw={'projection': rotated_crs})
@@ -365,6 +388,7 @@ def plot_by_region(plot_input, plot_pred, plot_target, regions, rotated_crs):
     plt.show()
 
 def plot_eccc_results(plot_input, plot_pred, plot_target):
+    ccrs, _ = _get_cartopy()
     # define bounding boxes for each region
     regions = {
         "Mountains (BC)": (-116 - 5.88/2,
