@@ -11,7 +11,6 @@ import xarray as xr
 
 
 DIFFUSION_HEAD_ALIASES = {"diffusion", "diffusion_head", "sde", "score", "score_sde"}
-DEFAULT_DIFFUSION_ENSEMBLE_SIZE = 10
 
 
 def _get_nested(obj: Any, *keys: str) -> Any:
@@ -96,18 +95,21 @@ def resolve_ensemble_size(
     *,
     requested: int | None = None,
     head_type: str = "deterministic",
-    minimum_diffusion_size: int = DEFAULT_DIFFUSION_ENSEMBLE_SIZE,
 ) -> int:
-    """Resolve ensemble size, enforcing at least 10 for diffusion checkpoints."""
+    """Resolve ensemble size from an explicit request or the loaded config.
+
+    Both deterministic and diffusion paths default to one member when the YAML
+    omits ``inference.ensemble_size``. No diffusion-specific size is imposed.
+    """
     value = requested
     if value is None:
         value = _get_nested(config, "inference", "ensemble_size")
     if value is None:
         value = 1
     value = int(value)
-    if canonical_head_type(head_type) == "diffusion":
-        return max(minimum_diffusion_size, value)
-    return max(1, value)
+    if value < 1:
+        raise ValueError(f"ensemble_size must be at least 1, got {value}")
+    return value
 
 
 def resolve_base_seed(config: Any = None, *, default: int = 42) -> int:

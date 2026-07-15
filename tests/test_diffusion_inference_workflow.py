@@ -38,10 +38,15 @@ def test_diffusion_checkpoint_state_keys_trigger_detection():
     assert infer_head_type(checkpoint=checkpoint, config=config, model=None) == "diffusion"
 
 
-def test_diffusion_ensemble_size_is_at_least_ten():
+def test_diffusion_ensemble_size_honors_explicit_value():
     config = SimpleNamespace(inference=SimpleNamespace(ensemble_size=3))
-    assert resolve_ensemble_size(config, head_type="diffusion") == 10
+    assert resolve_ensemble_size(config, head_type="diffusion") == 3
     assert resolve_ensemble_size(config, head_type="deterministic") == 3
+
+
+def test_diffusion_ensemble_size_defaults_to_one():
+    config = SimpleNamespace(inference=SimpleNamespace())
+    assert resolve_ensemble_size(config, head_type="diffusion") == 1
 
 
 def test_diffusion_ensemble_uses_independent_seeded_samples():

@@ -51,6 +51,10 @@ statistics folder) set `derive_output_paths: false` in the YAML; the
 
 ## Diffusion decoder head (optional)
 
+For the residual-refinement design, exact configuration defaults, checkpoint
+compatibility, tensor dimensions, and current limitations, see
+[`DIFFUSION_RESIDUAL_CORRECTION.md`](./DIFFUSION_RESIDUAL_CORRECTION.md).
+
 By default the CORDEX-ML model uses the deterministic convolutional / UNet
 decoder head. An **optional score-based diffusion head** (adapted from
 [`mlde`](https://github.com/midatm1234/mlde)) can be selected from config to turn
@@ -188,10 +192,11 @@ inference:
   base_seed: 42
 ```
 
-For diffusion-head checkpoints, `ensemble_size` defaults to 10 and smaller
-values are automatically raised to 10. Deterministic convolutional-head
-checkpoints keep the previous one-member deterministic behavior unless an
-explicit downstream workflow adds its own ensemble support.
+`ensemble_size` defaults to 1 when omitted. An explicit positive value is used
+as configured; diffusion inference does not impose a minimum ensemble of 10.
+Deterministic convolutional-head checkpoints keep the previous one-member
+deterministic behavior unless an explicit downstream workflow adds its own
+ensemble support.
 
 ### Expected output locations and shapes
 

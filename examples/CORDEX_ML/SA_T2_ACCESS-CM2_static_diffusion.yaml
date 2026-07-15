@@ -195,7 +195,7 @@ fsdp_min_num_params: 5000000
 backbone_gradient_checkpointing: true
 skip_activation_offload: true
 inference:
-  ensemble_size: 10
+  ensemble_size: 3
   base_seed: 42
 training:
   distributed: none
