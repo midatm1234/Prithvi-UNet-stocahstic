@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from granitewxc.utils.normalization import target_mode
 from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.target_transforms import apply_pr_positive_link
 
@@ -106,6 +107,22 @@ def test_gridpoint_normalization_block_is_parsed():
     assert by_name["pr"].scaling.eps_std == 1e-5
     assert by_name["tasmax"].scaling.method == "zscore"
     assert by_name["tasmax"].scaling.mode == "gridpoint"
+
+
+def test_gridpoint_target_mode_survives_predictand_canonicalization():
+    config = _make_config(
+        ["pr", "tasmax"],
+        predictands={
+            "pr": {"normalization": {"method": "divide_only", "mode": "global"}},
+            "tasmax": {"normalization": {"method": "standardize", "mode": "gridpoint"}},
+        },
+    )
+
+    assert target_mode(config) == "spatial"
+    build_predictand_specs(config, output_vars=config.data.output_vars)
+    assert "normalization" not in config.predictands["tasmax"]
+    assert config.predictands["tasmax"]["scaling"]["mode"] == "gridpoint"
+    assert target_mode(config) == "spatial"
 
 
 def test_pr_zero_roundtrip_with_log1p_standardize():

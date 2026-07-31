@@ -7,7 +7,7 @@ Steps performed:
   4. Write preprocessed NetCDF files (one per date) to the output directory.
 
 Usage:
-    python preproc_merra_prism.py --config MERRA_PRISM.yaml [--mode training|validation|inference]
+    python preproc_merra_prism.py --config MERRA_PRISM_subdomain.yaml [--mode training|validation|inference]
 """
 
 from __future__ import annotations
@@ -49,6 +49,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from granitewxc.utils import normalization as norm
+from granitewxc.utils import prism_grid as prism_grid_contract
+from granitewxc.utils.prism_preprocessed import (
+    build_preprocessing_contract,
+    inclusive_daily_dates,
+    preprocessing_attrs,
+    source_artifact_signature,
+    validate_daily_product,
+)
 
 
 LAT_CANDIDATES = ("lat", "latitude", "y")
@@ -201,6 +209,11 @@ def _build_regridder(
             return xe.Regridder(coarse_grid, fine_grid, method=method, periodic=False)
         except Exception as exc:
             print(f"[preproc] xESMF init failed ({exc}); falling back to xarray interp")
+    if str(method).lower() not in {"linear", "bilinear"}:
+        raise RuntimeError(
+            f"Regridding method {method!r} requires xESMF; a linear xarray "
+            "fallback would violate the configured remapping semantics"
+        )
     return None
 
 
@@ -270,7 +283,14 @@ def _write_preprocessed_dataset(
         name: {"_FillValue": FILL_VALUE, "dtype": "float32"}
         for name in out_ds_vars
     }
-    out_ds.to_netcdf(str(out_file), encoding=encoding)
+    # Publish atomically so an interrupted date shard cannot leave a corrupt
+    # file that a subsequent non-overwrite run would silently accept.
+    temporary = out_file.with_name(f".{out_file.name}.{os.getpid()}.tmp")
+    try:
+        out_ds.to_netcdf(str(temporary), encoding=encoding)
+        os.replace(temporary, out_file)
+    finally:
+        temporary.unlink(missing_ok=True)
     return list(out_ds_vars)
 
 
@@ -278,6 +298,8 @@ def preprocess(
     cfg: Dict[str, Any],
     mode: str = "training",
     overwrite: bool = False,
+    date_shard_index: int = 0,
+    date_shard_count: int = 1,
 ) -> Path:
     """Run preprocessing for *mode* (training | validation | inference)."""
     if xr is None:
@@ -288,10 +310,11 @@ def preprocess(
     data_cfg = cfg.get("data", {})
     pp_cfg = _preprocess_cfg(cfg)
     predictor_dir = resolve_path(data_cfg["predictor_dir"])
-    target_dir = resolve_path(data_cfg["target_dir"])
+    target_dir_value = data_cfg.get("target_dir")
+    target_dir = resolve_path(target_dir_value) if target_dir_value else None
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
     predictor_variables = expand_predictor_variables(data_cfg.get("predictor_variables", {}))
-    regrid_method: str = data_cfg.get("regrid_method", "bilinear")
+    regrid_method = str(data_cfg.get("regrid_method", "bilinear")).lower()
     include_targets = _mode_saves_targets(cfg, mode)
 
     case_name = get_case_name(cfg)
@@ -313,7 +336,12 @@ def preprocess(
         f"{pp_cfg.get('inference_include_observed_targets_for_eval', False)})"
     )
 
-    validate_target_variables(target_dir, target_variables)
+    if include_targets:
+        if target_dir is None:
+            raise ValueError(
+                "data.target_dir is required when preprocessing observed PRISM targets"
+            )
+        validate_target_variables(target_dir, target_variables)
 
     # Date range
     start, end = parse_date_range_from_config(cfg, mode)
@@ -321,34 +349,101 @@ def preprocess(
 
     # Discover files
     merra_files = discover_merra2_files(predictor_dir, start, end)
-    prism_files = discover_all_prism_targets(target_dir, target_variables, start, end)
+    prism_files = (
+        discover_all_prism_targets(target_dir, target_variables, start, end)
+        if include_targets
+        else {variable: [] for variable in target_variables}
+    )
 
     if not merra_files:
         raise RuntimeError(f"No MERRA2 files found in {predictor_dir} for {start}–{end}")
-    for var in target_variables:
-        if not prism_files.get(var):
-            raise RuntimeError(f"No PRISM files found for variable '{var}' in {start}–{end}")
+    if include_targets:
+        for var in target_variables:
+            if not prism_files.get(var):
+                raise RuntimeError(
+                    f"No PRISM files found for variable '{var}' in {start}–{end}"
+                )
 
     # Align dates
     predictor_dates = [d for d, _ in merra_files]
     target_date_maps = {var: [d for d, _ in fl] for var, fl in prism_files.items()}
-    aligned_dates = align_dates(predictor_dates, target_date_maps)
-    print(f"[preproc] aligned {len(aligned_dates)} dates")
-
-    validate_dates_exist(aligned_dates, predictor_dates, "predictor")
+    requested_dates = inclusive_daily_dates(start, end)
+    validate_dates_exist(requested_dates, predictor_dates, "predictor")
+    if include_targets:
+        for var, available_dates in target_date_maps.items():
+            validate_dates_exist(
+                requested_dates, available_dates, f"target ({var})"
+            )
+        aligned_dates = align_dates(predictor_dates, target_date_maps)
+        if aligned_dates != requested_dates:
+            raise RuntimeError(
+                "Aligned MERRA/PRISM dates do not exactly cover the configured split"
+            )
+    else:
+        # PRISM supplies the canonical reference grid, but target-free inference
+        # does not require a daily truth file for every predictor date.
+        aligned_dates = requested_dates
+    if date_shard_count < 1 or not 0 <= date_shard_index < date_shard_count:
+        raise ValueError(
+            f"invalid date shard {date_shard_index}/{date_shard_count}"
+        )
+    total_aligned = len(aligned_dates)
+    aligned_dates = [
+        value
+        for idx, value in enumerate(aligned_dates)
+        if idx % date_shard_count == date_shard_index
+    ]
+    print(
+        f"[preproc] aligned {total_aligned} dates; shard "
+        f"{date_shard_index}/{date_shard_count} processes {len(aligned_dates)}"
+    )
 
     # Build predictor lookup
     pred_map = {d: p for d, p in merra_files}
     target_maps = {var: {d: p for d, p in fl} for var, fl in prism_files.items()}
 
-    # Get target grid from first PRISM file
-    target_grid, (target_lat, target_lon), target_slices = _get_target_grid(prism_files, data_cfg)
+    # Target-bearing splits establish/validate the case's canonical grid from
+    # raw PRISM. Predictor-only inference must use that persisted contract and
+    # must not require PRISM files for the inference dates merely to recover
+    # coordinates that preprocessing/training have already fixed.
+    if include_targets:
+        target_grid, (target_lat, target_lon), target_slices = _get_target_grid(
+            prism_files, data_cfg
+        )
+        first_target_path = next(
+            str(path)
+            for file_list in prism_files.values()
+            for _, path in file_list[:1]
+        )
+        canonical_grid = prism_grid_contract.ensure_canonical_grid(
+            norm.case_preprocess_dir(cfg),
+            target_lat,
+            target_lon,
+            source=first_target_path,
+            context="MERRA preprocessing target grid",
+        )
+    else:
+        canonical_grid = prism_grid_contract.load_canonical_grid(
+            norm.case_preprocess_dir(cfg), required=True
+        )
+        assert canonical_grid is not None
+        target_lat, target_lon = canonical_grid.lat, canonical_grid.lon
+        target_slices = (slice(None), slice(None))
+    target_lat, target_lon = canonical_grid.lat, canonical_grid.lon
+    target_grid = xr.Dataset(
+        {"lat": ("lat", target_lat), "lon": ("lon", target_lon)}
+    )
     print(f"[preproc] PRISM target grid {len(target_lat)}x{len(target_lon)}")
+    print(
+        f"[preproc] canonical PRISM grid fingerprint="
+        f"{canonical_grid.fingerprint[:12]}"
+    )
 
     # Load static elevation and regrid to the PRISM target grid
     elev_file = data_cfg.get("static_elevation_file", None)
     elev_var = data_cfg.get("static_elevation_var", None)
     elevation_arr: Optional[np.ndarray] = None
+    elevation_sha256: Optional[str] = None
     if elev_file:
         elev_path = resolve_path(elev_file)
         if elev_path.exists():
@@ -356,9 +451,26 @@ def preprocess(
                 elev_path, var_name=elev_var or None,
                 target_lat=target_lat, target_lon=target_lon,
             )
+            elevation_sha256 = norm.sha256_file(elev_path)
             print(f"[preproc] loaded elevation {elevation_arr.shape} from {elev_path.name}")
         else:
-            print(f"[preproc] WARN: elevation file not found: {elev_path}")
+            raise FileNotFoundError(
+                f"Configured static_elevation_file was not found: {elev_path}"
+            )
+
+    required_product_variables = [
+        f"predictor_{var}_{int(level)}" for var, level in predictor_variables
+    ]
+    if include_targets:
+        required_product_variables.extend(
+            f"target_{var}" for var in target_variables
+        )
+    if elevation_arr is not None:
+        required_product_variables.append("static_elevation")
+
+    if not aligned_dates:
+        print(f"[preproc] shard {date_shard_index} has no dates; nothing to write")
+        return output_dir
 
     # Build regridder from first MERRA2 file
     regridder = None
@@ -366,23 +478,81 @@ def preprocess(
     with xr.open_dataset(str(first_merra_path)) as ds_pred:
         pred_lat_name = _infer_coord_name(ds_pred, LAT_CANDIDATES)
         pred_lon_name = _infer_coord_name(ds_pred, LON_CANDIDATES)
+        reference_pred_lat = np.asarray(ds_pred[pred_lat_name].values, dtype=np.float64)
+        reference_pred_lon = np.asarray(ds_pred[pred_lon_name].values, dtype=np.float64)
+        source_grid_contract = prism_grid_contract.validate_prism_grid(
+            reference_pred_lat,
+            reference_pred_lon,
+            context=f"MERRA source grid {first_merra_path}",
+        )
         pred_grid = _build_grid(ds_pred, pred_lat_name, pred_lon_name)
         regridder = _build_regridder(pred_grid, target_grid, method=regrid_method)
+
+    preprocessing_contract = build_preprocessing_contract(
+        data_type="merra_prism",
+        predictor_variables=predictor_variables,
+        target_variables=target_variables,
+        include_targets=include_targets,
+        regrid_method=regrid_method,
+        canonical_grid_fingerprint=canonical_grid.fingerprint,
+        static_elevation_sha256=elevation_sha256,
+        static_elevation_variable=elev_var,
+        source_grid_fingerprint=source_grid_contract.fingerprint,
+        algorithm=(
+            f"xesmf-{regrid_method}-v1"
+            if regridder is not None
+            else "xarray-linear-v1"
+        ),
+    )
 
     # Process each date
     for i, sample_date in enumerate(aligned_dates):
         out_file = output_dir / f"merra_prism_{sample_date:%Y%m%d}.nc"
+        merra_path = pred_map[sample_date]
+        daily_sources = {"predictor:merra2": merra_path}
+        if include_targets:
+            daily_sources.update(
+                {
+                    f"target:{variable}": target_maps[variable][sample_date]
+                    for variable in target_variables
+                }
+            )
+        daily_source_signature = source_artifact_signature(daily_sources)
         if out_file.exists() and not overwrite:
-            continue
+            try:
+                with xr.open_dataset(str(out_file)) as existing:
+                    validate_daily_product(
+                        existing,
+                        out_file,
+                        canonical_grid,
+                        mode=mode,
+                        sample_date=sample_date,
+                        required_variables=required_product_variables,
+                        expected_preprocessing_contract=preprocessing_contract,
+                        expected_source_artifact_signature=daily_source_signature,
+                    )
+            except Exception as exc:
+                print(
+                    f"[preproc] regenerating stale/invalid {out_file.name}: {exc}"
+                )
+            else:
+                continue
 
         # Read MERRA2 predictors and regrid. NaNs (e.g. pressure levels that lie
         # BELOW the surface over high terrain — MERRA stores these as missing)
         # are PRESERVED, not converted to zero. Bilinear interp/regrid propagates
         # NaN, which conservatively grows the below-surface mask by one stencil.
-        merra_path = pred_map[sample_date]
         pred_arrays: Dict[str, np.ndarray] = {}
         pred_levels: Dict[str, Optional[float]] = {}
         with xr.open_dataset(str(merra_path)) as ds_pred:
+            current_lat_name = _infer_coord_name(ds_pred, LAT_CANDIDATES)
+            current_lon_name = _infer_coord_name(ds_pred, LON_CANDIDATES)
+            prism_grid_contract.assert_grid_matches(
+                source_grid_contract,
+                np.asarray(ds_pred[current_lat_name].values, dtype=np.float64),
+                np.asarray(ds_pred[current_lon_name].values, dtype=np.float64),
+                context=f"MERRA source grid {merra_path}",
+            )
             for var, level in predictor_variables:
                 channel_name = f"{var}_{int(level)}"
                 pred_levels[channel_name] = level
@@ -399,7 +569,7 @@ def preprocess(
                     da = da.isel(time=0, drop=True)
                 if "lev" in da.dims:
                     da = da.sel(lev=level, drop=True)
-                da = _rename_lat_lon(da, pred_lat_name, pred_lon_name)
+                da = _rename_lat_lon(da, current_lat_name, current_lon_name)
                 if regridder is not None:
                     regridded = regridder(da)
                     arr = regridded.values.astype(np.float32)
@@ -422,10 +592,29 @@ def preprocess(
                     da = ds_tgt[dvar]
                     if "time" in da.dims:
                         da = da.isel(time=0, drop=True)
-                    arr = da.values.astype(np.float32)
                     lat_slice, lon_slice = target_slices
-                    if arr.ndim >= 2:
-                        arr = arr[lat_slice, lon_slice]
+                    lat_name = _infer_coord_name(ds_tgt, LAT_CANDIDATES)
+                    lon_name = _infer_coord_name(ds_tgt, LON_CANDIDATES)
+                    observed_lat = np.asarray(
+                        ds_tgt[lat_name].values, dtype=np.float64
+                    )[lat_slice]
+                    observed_lon = np.asarray(
+                        ds_tgt[lon_name].values, dtype=np.float64
+                    )[lon_slice]
+                    prism_grid_contract.assert_grid_matches(
+                        canonical_grid,
+                        observed_lat,
+                        observed_lon,
+                        context=f"PRISM target {tgt_path}",
+                    )
+                    if lat_name not in da.dims or lon_name not in da.dims:
+                        raise ValueError(
+                            f"PRISM target {tgt_path} variable {dvar!r} must use "
+                            f"coordinate dimensions ({lat_name!r}, {lon_name!r}); "
+                            f"got {da.dims}"
+                        )
+                    da = da.transpose(lat_name, lon_name)
+                    arr = da.values[lat_slice, lon_slice].astype(np.float32)
                     arr[np.isinf(arr)] = np.nan
                     tgt_arrays[var] = arr
 
@@ -464,6 +653,9 @@ def preprocess(
                 "source_merra2": str(merra_path),
                 "has_elevation": str(elevation_arr is not None),
                 "mode": mode,
+                "prism_grid_fingerprint": canonical_grid.fingerprint,
+                "source_artifact_signature": daily_source_signature,
+                **preprocessing_attrs(preprocessing_contract),
                 "target_variables": ",".join(target_variables),
                 "predictor_channels": ",".join(pred_arrays.keys()),
                 "lag_offsets": "0",
@@ -496,7 +688,7 @@ def parse_args() -> argparse.Namespace:
         description="Preprocess MERRA2 predictors and PRISM targets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", required=True, help="Path to MERRA_PRISM.yaml")
+    parser.add_argument("--config", required=True, help="Path to MERRA_PRISM_subdomain.yaml")
     parser.add_argument(
         "--mode",
         choices=["training", "validation", "inference", "both"],
@@ -504,6 +696,8 @@ def parse_args() -> argparse.Namespace:
         help="Which date range to preprocess",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+    parser.add_argument("--date-shard-index", type=int, default=0)
+    parser.add_argument("--date-shard-count", type=int, default=1)
     return parser.parse_args()
 
 
@@ -520,7 +714,13 @@ def main() -> None:
     else:
         modes = [args.mode]
     for mode in modes:
-        preprocess(cfg, mode=mode, overwrite=args.overwrite)
+        preprocess(
+            cfg,
+            mode=mode,
+            overwrite=args.overwrite,
+            date_shard_index=args.date_shard_index,
+            date_shard_count=args.date_shard_count,
+        )
 
 
 if __name__ == "__main__":

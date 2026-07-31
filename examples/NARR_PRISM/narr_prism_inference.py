@@ -4,7 +4,7 @@ Loads a trained checkpoint, runs prediction over the YAML-defined inference
 date range, denormalizes outputs, and writes NetCDF files.
 
 Usage:
-    python narr_prism_inference.py --config NARR_PRISM_subdomain_old.yaml [--checkpoint path/to/last.ckpt]
+    python narr_prism_inference.py --config NARR_PRISM_subdomain.yaml [--checkpoint path/to/last.ckpt]
 """
 
 from __future__ import annotations
@@ -51,6 +51,17 @@ from granitewxc.utils.normalization import (
     seam_gradient_ratio,
     targets_are_spatial,
 )
+from granitewxc.utils.prism_tiling import (
+    TilePlan,
+    WeightedTileStitcher,
+    blend_window,
+    boundary_gradient_ratio,
+    extract_halo_context,
+    overlap_crossovers,
+    overlap_disagreement,
+    tile_origins as shared_tile_origins,
+)
+from granitewxc.utils.prism_grid import validate_prism_grid
 
 from narr_prism_dataset import NarrPrismDataset
 from narr_prism_utils import (
@@ -58,6 +69,7 @@ from narr_prism_utils import (
     expand_predictor_variables,
     get_case_name,
     load_yaml,
+    narr_source_var,
     parse_date_range_from_config,
     resolve_path,
 )
@@ -116,33 +128,11 @@ def _find_checkpoint(cfg: Dict[str, Any], explicit: Optional[str]) -> str:
         if p.exists():
             return str(p)
 
-    # Fallback: if case_name does not match the trained run, use the most recent
-    # checkpoint under known checkpoint roots.
-    search_roots: List[Path] = []
-    if checkpoint_dir:
-        search_roots.append(resolve_path(checkpoint_dir))
-    if run_dir:
-        search_roots.append(resolve_path(run_dir))
-    search_roots.append(exp / "checkpoints")
-
-    found: List[Tuple[float, Path]] = []
-    for root in search_roots:
-        if not root.exists():
-            continue
-        for candidate in candidates:
-            for p in root.rglob(candidate):
-                if p.is_file():
-                    found.append((p.stat().st_mtime, p))
-    if found:
-        # Prefer latest modified checkpoint; "last.ckpt" is preferred via candidate order.
-        found.sort(key=lambda item: item[0], reverse=True)
-        return str(found[0][1])
-
-    roots_msg = ", ".join(str(r) for r in search_roots)
     raise FileNotFoundError(
         "Cannot locate a trained checkpoint. "
-        f"Searched case '{case_name}' and roots: {roots_msg}. "
-        "Pass --checkpoint explicitly."
+        f"Searched only case-scoped directories for '{case_name}'. Pass "
+        "--checkpoint explicitly if the checkpoint lives elsewhere; checkpoints "
+        "from sibling cases are never selected automatically."
     )
 
 
@@ -165,6 +155,15 @@ def _load_model(
 
     model = get_finetune_model_UNET(config)
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    from granitewxc.utils.prism_checkpoint import validate_prism_checkpoint_contract
+
+    # A serialized module/object has no auditable pipeline envelope.  Corrected
+    # PRISM configurations therefore reject it just like any other checkpoint
+    # that predates the contract.
+    checkpoint_envelope = ckpt if isinstance(ckpt, dict) else {}
+    validate_prism_checkpoint_contract(
+        config, checkpoint_envelope, role="NARR inference"
+    )
     if isinstance(ckpt, dict) and "model" in ckpt:
         state = ckpt["model"]
     elif isinstance(ckpt, dict):
@@ -186,7 +185,56 @@ def _load_model(
             )
         cleaned[key] = v
 
-    model.load_state_dict(cleaned, strict=False)
+    model_state = model.state_dict()
+    scaler_state_keys = {
+        "input_scalers_mu",
+        "input_scalers_sigma",
+        "output_scalers_mu",
+        "output_scalers_sigma",
+        "static_input_scalers_mu",
+        "static_input_scalers_sigma",
+        "static_output_scalers_mu",
+        "static_output_scalers_sigma",
+    }
+    compatible = {}
+    skipped_scalers = []
+    for key, value in cleaned.items():
+        # Scalers are coordinate-bearing, case-scoped config artifacts. Never
+        # let an explicitly supplied or stale checkpoint override them, even
+        # when the tensor shape happens to match.
+        if key in scaler_state_keys:
+            skipped_scalers.append(key)
+            continue
+        expected = model_state.get(key)
+        if (
+            expected is not None
+            and torch.is_tensor(value)
+            and tuple(value.shape) != tuple(expected.shape)
+        ):
+            raise ValueError(
+                f"Checkpoint tensor '{key}' shape {tuple(value.shape)} does not "
+                f"match configured model shape {tuple(expected.shape)}"
+            )
+        compatible[key] = value
+
+    if skipped_scalers:
+        print(
+            "[inference] keeping case-scoped config scalers authoritative; "
+            f"ignored {len(skipped_scalers)} scaler tensor(s) stored in checkpoint"
+        )
+
+    load_result = model.load_state_dict(compatible, strict=False)
+    disallowed_missing = [
+        key for key in load_result.missing_keys if key not in scaler_state_keys
+    ]
+    if disallowed_missing or load_result.unexpected_keys:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} is not architecture-complete for the "
+            "configured NARR model: "
+            f"missing={disallowed_missing}, "
+            f"unexpected={list(load_result.unexpected_keys)}. Only case-scoped "
+            "scaler buffers may be absent or replaced."
+        )
     model.to(device)
     model.eval()
 
@@ -380,12 +428,7 @@ def _tile_origins(total: int, tile: int, stride: int) -> List[int]:
     The final tile is shifted so it ends exactly at ``total`` (no out-of-bounds,
     full coverage of the domain edge).
     """
-    if tile >= total:
-        return [0]
-    origins = list(range(0, total - tile + 1, stride))
-    if origins[-1] != total - tile:
-        origins.append(total - tile)
-    return origins
+    return shared_tile_origins(total, tile, stride)
 
 
 def _hann_window_2d(h: int, w: int) -> np.ndarray:
@@ -420,10 +463,58 @@ def _date_strings_to_epoch_days(date_strings: Iterable[str]) -> np.ndarray:
     return (dates - epoch).astype("timedelta64[D]").astype(np.int32)
 
 
+def _select_inference_dates(
+    available_dates: Sequence[date],
+    selected_dates: Optional[Sequence[Any]],
+) -> List[date]:
+    """Return requested dates in caller order after exact availability checks.
+
+    ``None`` preserves the normal full-range behavior.  Explicit selection is
+    primarily useful for small CPU smoke tests: the model is loaded once and
+    only the requested, non-contiguous days are evaluated.
+    """
+    available = list(available_dates)
+    if selected_dates is None:
+        return available
+    if len(selected_dates) == 0:
+        raise ValueError("selected_dates must contain at least one date")
+
+    available_by_date = {date.fromisoformat(str(value)[:10]): value for value in available}
+    requested: List[date] = []
+    for value in selected_dates:
+        try:
+            normalized = date.fromisoformat(str(value)[:10])
+        except ValueError as exc:
+            raise ValueError(
+                f"selected_dates contains an invalid ISO date: {value!r}"
+            ) from exc
+        requested.append(normalized)
+
+    if len(set(requested)) != len(requested):
+        raise ValueError("selected_dates must not contain duplicates")
+    missing = [value.isoformat() for value in requested if value not in available_by_date]
+    if missing:
+        raise ValueError(
+            "selected_dates are outside the configured/available inference dates: "
+            + ", ".join(missing)
+        )
+    return [available_by_date[value] for value in requested]
+
+
 def _sync_if_cuda(device: torch.device) -> None:
     if device.type == "cuda":
         for idx in range(torch.cuda.device_count()):
             torch.cuda.synchronize(idx)
+
+
+def _tensor_to_float32_numpy(value: torch.Tensor) -> np.ndarray:
+    """Detach inference output and cross the NumPy boundary as float32.
+
+    NumPy cannot consume ``torch.bfloat16`` tensors directly. Raw diagnostic
+    predictions retain the autocast dtype, so cast explicitly while copying to
+    CPU instead of relying on ``numpy().astype(...)`` after the transfer.
+    """
+    return value.detach().to(device="cpu", dtype=torch.float32).numpy()
 
 
 def _add_time(times: Dict[str, float], key: str, seconds: float) -> None:
@@ -500,6 +591,42 @@ def _clear_cuda_memory(device: torch.device) -> None:
         torch.cuda.ipc_collect()
 
 
+def _load_native_predictor_diagnostic(
+    dataset: NarrPrismDataset, sample_date: Any
+) -> Dict[str, np.ndarray]:
+    """Load the first configured NARR channel before PRISM regridding."""
+    variable, level = dataset.predictor_vars[0]
+    if dataset._predictor_map:
+        path = dataset._predictor_map[sample_date][variable]
+    else:
+        product = dataset._preprocessed_map[sample_date]
+        with xr.open_dataset(str(product)) as product_ds:
+            sources = str(product_ds.attrs.get("source_narr", ""))
+        source_map = {
+            item.split("=", 1)[0]: item.split("=", 1)[1]
+            for item in sources.split(";")
+            if "=" in item
+        }
+        if variable not in source_map:
+            raise ValueError(
+                f"Preprocessed product {product} does not identify native source for {variable}"
+            )
+        path = Path(source_map[variable])
+    with xr.open_dataset(str(path)) as ds:
+        da = ds[narr_source_var(variable)]
+        if "time" in da.dims:
+            da = da.sel(time=np.datetime64(sample_date), drop=True)
+        level_name = "level" if "level" in da.dims else "lev" if "lev" in da.dims else None
+        if level_name is not None:
+            da = da.sel({level_name: level}, drop=True)
+        return {
+            "native_predictor": np.asarray(da.values, dtype=np.float32),
+            "native_lat": np.asarray(ds["lat"].values, dtype=np.float64),
+            "native_lon": np.asarray(ds["lon"].values, dtype=np.float64),
+            "native_predictor_name": np.asarray(f"{variable}_{level}"),
+        }
+
+
 def _open_streaming_output(
     out_path: Path,
     target_variables: Sequence[str],
@@ -527,10 +654,12 @@ def _open_streaming_output(
     time_var.units = "days since 1970-01-01"
     time_var.calendar = "proleptic_gregorian"
 
-    lat_var = nc.createVariable("lat", "f", ("lat",))
-    lon_var = nc.createVariable("lon", "f", ("lon",))
-    lat_var[:] = target_lat.astype(np.float32)
-    lon_var[:] = target_lon.astype(np.float32)
+    # Preserve the exact canonical PRISM coordinates.  Float32 down-casting can
+    # move an endpoint enough for a later inclusive slice to lose one grid cell.
+    lat_var = nc.createVariable("lat", "d", ("lat",))
+    lon_var = nc.createVariable("lon", "d", ("lon",))
+    lat_var[:] = target_lat.astype(np.float64)
+    lon_var[:] = target_lon.astype(np.float64)
 
     for var in target_variables:
         out_var = nc.createVariable(var, "f", ("time", "lat", "lon"))
@@ -540,6 +669,9 @@ def _open_streaming_output(
 
     nc.description = "NARR-to-PRISM downscaling inference output"
     nc.case_name = case_name
+    nc.prism_grid_fingerprint = validate_prism_grid(
+        target_lat, target_lon, context="NARR inference NetCDF"
+    ).fingerprint
     nc.checkpoint = checkpoint_path
     nc.inference_start = str(inference_dates[0])
     nc.inference_end = str(inference_dates[-1])
@@ -561,12 +693,16 @@ def run_inference(
     batch_size: int = 1,
     date_shard_index: int = 0,
     date_shard_count: int = 1,
+    show_progress: bool = True,
     data_parallel: bool = True,
+    selected_dates: Optional[Sequence[Any]] = None,
 ) -> Path:
     """Execute inference over the YAML-defined date range and write daily NetCDF outputs.
 
     The PRISM grid (~3105x7025) is far too large for a single forward pass, so
     each day is predicted tile-by-tile and stitched with a Hann blend window.
+    Pass ``selected_dates`` to evaluate a small, possibly non-contiguous subset
+    while loading the model only once.
 
     Key correctness points (the previous version was broken on all three):
       * Predictors are regridded onto each PRISM tile (co-registered with the
@@ -597,7 +733,28 @@ def run_inference(
     apply_scalar_paths(config)
     log_scalar_summary(config, "inference")
 
-    # Load model
+    # Co-registered, raw-physical dataset (same class used for training). It
+    # regrids NARR onto the PRISM grid on the fly and exposes the fine grid.
+    dataset = NarrPrismDataset(config_path, mode="inference")
+    all_inference_dates = list(dataset.dates)
+    dates_to_process = _select_inference_dates(all_inference_dates, selected_dates)
+    if date_shard_count < 1:
+        raise ValueError("date_shard_count must be >= 1")
+    if date_shard_index < 0 or date_shard_index >= date_shard_count:
+        raise ValueError(
+            f"date_shard_index must be in [0, {date_shard_count}), got {date_shard_index}"
+        )
+    inference_dates = [
+        sample_date
+        for idx, sample_date in enumerate(dates_to_process)
+        if idx % date_shard_count == date_shard_index
+    ]
+    if not inference_dates:
+        raise ValueError(
+            f"Date shard {date_shard_index}/{date_shard_count} has no dates to process"
+        )
+
+    # Load the multi-gigabyte model only after cheap date/config validation.
     print(f"[inference] loading checkpoint: {checkpoint_path}")
     model = _load_model(config, checkpoint_path, device, data_parallel=data_parallel)
     n_gpu = torch.cuda.device_count() if device.type == "cuda" else 1
@@ -622,31 +779,13 @@ def run_inference(
         f"{f' dtype={amp_dtype_label}' if mixed_precision else ''}"
     )
 
-    # Co-registered, raw-physical dataset (same class used for training). It
-    # regrids NARR onto the PRISM grid on the fly and exposes the fine grid.
-    dataset = NarrPrismDataset(config_path, mode="inference")
-    all_inference_dates = dataset.dates
-    if date_shard_count < 1:
-        raise ValueError("date_shard_count must be >= 1")
-    if date_shard_index < 0 or date_shard_index >= date_shard_count:
-        raise ValueError(
-            f"date_shard_index must be in [0, {date_shard_count}), got {date_shard_index}"
-        )
-    inference_dates = [
-        sample_date
-        for idx, sample_date in enumerate(all_inference_dates)
-        if idx % date_shard_count == date_shard_index
-    ]
-    if not inference_dates:
-        raise ValueError(
-            f"Date shard {date_shard_index}/{date_shard_count} has no dates to process"
-        )
     target_lat = dataset.fine_lat
     target_lon = dataset.fine_lon
     fine_h, fine_w = dataset.fine_shape
     n_vars = len(target_variables)
     print(
-        f"[inference] {len(inference_dates)}/{len(all_inference_dates)} dates; "
+        f"[inference] {len(inference_dates)}/{len(all_inference_dates)} configured dates; "
+        f"selected={len(dates_to_process)}; "
         f"date_shard={date_shard_index}/{date_shard_count}; PRISM grid {fine_h}x{fine_w}"
     )
 
@@ -657,12 +796,28 @@ def run_inference(
     overlap_cfg = inf_cfg.get("inference_overlap") or inf_cfg.get(
         "boundary_mitigation", {}
     ).get("overlap") or [128, 128]
-    tile_h = min(int(tile_cfg[0]), fine_h)
-    tile_w = min(int(tile_cfg[1]), fine_w)
-    ov_h = int(overlap_cfg[0])
-    ov_w = int(overlap_cfg[1])
-    stride_h = max(1, tile_h - ov_h)
-    stride_w = max(1, tile_w - ov_w)
+    halo_cfg = inf_cfg.get("inference_halo") or inf_cfg.get(
+        "boundary_mitigation", {}
+    ).get("halo") or [0, 0]
+    force_full_frame = bool(
+        inf_cfg.get(
+            "force_full_frame",
+            inf_cfg.get("boundary_mitigation", {}).get("force_full_frame", False),
+        )
+    )
+    if force_full_frame:
+        tile_cfg = [fine_h, fine_w]
+        overlap_cfg = [0, 0]
+        # Keep the configured exterior halo so full-frame and tiled runs use
+        # identical boundary context before retaining the same domain core.
+    plan = TilePlan.build(
+        (fine_h, fine_w), tile_cfg, overlap=overlap_cfg, halo=halo_cfg
+    )
+    if str(getattr(config.model, "backbone_attention_scope", "legacy_global")).lower() == "windowed_local":
+        plan.assert_globally_aligned(getattr(config, "mask_unit_size", [16, 16]))
+    tile_h, tile_w = plan.core_shape
+    ov_h, ov_w = plan.overlap
+    halo_h, halo_w = plan.halo
 
     pad_multiple = _pad_multiple_from_config(config)
     # Per-gridpoint (spatial) target scalers are cropped per tile by the model
@@ -673,12 +828,6 @@ def run_inference(
     scalar_dir = resolve_scalar_dir(config, for_writing=False)
     spatial_targets = targets_are_spatial(scalar_dir)
     if spatial_targets:
-        if tile_h % pad_multiple != 0 or tile_w % pad_multiple != 0:
-            raise ValueError(
-                f"Per-gridpoint target scalers require pad-free tiles, but tile "
-                f"({tile_h},{tile_w}) is not a multiple of pad_multiple={pad_multiple}. "
-                f"Choose an inference_tile size divisible by {pad_multiple}."
-            )
         _tmean = np.load(os.path.join(str(scalar_dir), "targets_mean.npy"), mmap_mode="r")
         assert_target_grid_matches("targets_mean", _tmean, fine_h, fine_w)
         print(
@@ -686,11 +835,9 @@ def run_inference(
             f"{tuple(_tmean.shape[-2:])} == domain ({fine_h},{fine_w}); "
             f"passing per-tile __scaler_offset"
         )
-    lat_origins = _tile_origins(fine_h, tile_h, stride_h)
-    lon_origins = _tile_origins(fine_w, tile_w, stride_w)
-    candidate_tile_positions = [
-        (lat0, lon0) for lat0 in lat_origins for lon0 in lon_origins
-    ]
+    lat_origins = list(plan.lat_origins)
+    lon_origins = list(plan.lon_origins)
+    candidate_tile_positions = plan.positions
     skip_empty_target_tiles = bool(data_cfg.get("skip_empty_target_tiles", True))
     min_valid_target_fraction = float(data_cfg.get("min_valid_target_fraction", 1.0e-4))
     if skip_empty_target_tiles and min_valid_target_fraction > 0.0:
@@ -710,18 +857,25 @@ def run_inference(
     batch_size = _cap_tile_batch_for_cuda_indexing(
         batch_size=batch_size,
         config=config,
-        tile_h=tile_h,
-        tile_w=tile_w,
+        tile_h=plan.context_shape[0],
+        tile_w=plan.context_shape[1],
         device=device,
         inf_cfg=inf_cfg,
     )
     print(
-        f"[inference] tiling: tile=({tile_h},{tile_w}) overlap=({ov_h},{ov_w}) "
+        f"[inference] tiling: core=({tile_h},{tile_w}) halo=({halo_h},{halo_w}) "
+        f"context={plan.context_shape} overlap=({ov_h},{ov_w}) "
         f"-> {len(lat_origins)}x{len(lon_origins)} = "
         f"{len(candidate_tile_positions)} candidate, {n_tiles} kept/day; "
         f"batch={batch_size}"
     )
     cache_predictors = bool(inf_cfg.get("cache_regridded_predictors", True))
+    if (halo_h or halo_w) and not cache_predictors:
+        print(
+            "[inference] enabling full-day predictor cache because halo extraction "
+            "requires context outside each output core"
+        )
+        cache_predictors = True
     print(
         f"[inference] predictor cache={'on' if cache_predictors else 'off'}; "
         "timing stages: preprocessing transfer forward postprocess write"
@@ -731,9 +885,19 @@ def run_inference(
     output_path.mkdir(parents=True, exist_ok=True)
     print(f"[inference] case_name={case_name}")
     print(f"[inference] output_dir={output_path}")
+    diagnostics_cfg = inf_cfg.get("diagnostics", {}) or {}
+    diagnostics_enabled = bool(diagnostics_cfg.get("enabled", False))
+    diagnostics_max_days = max(0, int(diagnostics_cfg.get("max_days", 1)))
+    diagnostics_dir = output_path / str(diagnostics_cfg.get("directory", "diagnostics"))
+    if diagnostics_enabled:
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"[inference] intermediate diagnostics enabled for first "
+            f"{diagnostics_max_days} shard day(s): {diagnostics_dir}"
+        )
 
     date_iter = enumerate(inference_dates)
-    if tqdm is not None:
+    if tqdm is not None and show_progress:
         date_iter = tqdm(
             list(enumerate(inference_dates)),
             total=len(inference_dates),
@@ -746,6 +910,7 @@ def run_inference(
     with torch.inference_mode():
         for _di, sample_date in date_iter:
             date_string = str(sample_date)
+            diagnostic_active = diagnostics_enabled and _di < diagnostics_max_days
             day_times: Dict[str, float] = {
                 "preprocessing": 0.0,
                 "transfer": 0.0,
@@ -754,11 +919,19 @@ def run_inference(
                 "write": 0.0,
             }
 
-            # Accumulators for the stitched full-grid prediction.
-            accum = np.zeros((n_vars, fine_h, fine_w), dtype=np.float32)
-            weight = np.zeros((fine_h, fine_w), dtype=np.float32)
-
-            win = _hann_window_2d(tile_h, tile_w)
+            # Float64 accumulation avoids order-dependent roundoff across many
+            # overlaps. Only output cores are accumulated; halo pixels are never
+            # retained.
+            stitcher = WeightedTileStitcher(n_vars, (fine_h, fine_w))
+            blend_mode = str(
+                inf_cfg.get(
+                    "inference_blend_window",
+                    inf_cfg.get("blend_window", inf_cfg.get("boundary_mitigation", {}).get("blend_mode", "hann")),
+                )
+            ).lower()
+            win = blend_window(plan.core_shape, plan.overlap, mode=blend_mode)
+            tile_predictions: Dict[Tuple[int, int], np.ndarray] = {}
+            raw_tile_predictions: Dict[Tuple[int, int], np.ndarray] = {}
 
             day_predictors: Optional[torch.Tensor] = None
             if cache_predictors:
@@ -771,7 +944,7 @@ def run_inference(
             while start < len(tile_positions):
                 chunk = tile_positions[start : start + current_batch_size]
 
-                xb_cpu = xb = yb = pred = pred_np = None
+                xb_cpu = xb = yb = pred = raw_pred = pred_np = None
                 xs: List[torch.Tensor] = []
                 try:
                     # Raw-physical, co-registered predictor tiles (model normalizes
@@ -779,12 +952,14 @@ def run_inference(
                     # (tile_h, tile_w) shape, so they stack into one batch.
                     t0 = time.perf_counter()
                     for lat0, lon0 in chunk:
-                        lat_slice = slice(lat0, lat0 + tile_h)
-                        lon_slice = slice(lon0, lon0 + tile_w)
                         if day_predictors is None:
-                            x = dataset._load_predictor(sample_date, lat_slice, lon_slice)
-                        else:
-                            x = day_predictors[:, lat_slice, lon_slice]
+                            day_predictors = dataset._load_predictor_day(sample_date)
+                        x = extract_halo_context(
+                            day_predictors,
+                            (lat0, lon0),
+                            plan.core_shape,
+                            plan.halo,
+                        )
                         xs.append(_pad_to_multiple(x.unsqueeze(0), pad_multiple))
                     xb_cpu = torch.cat(xs, dim=0)
                     scaler_offsets_cpu = torch.tensor(chunk, dtype=torch.long)
@@ -797,7 +972,7 @@ def run_inference(
                     # Real tensor (not a shape-only stub) so DataParallel scatters it
                     # along the batch dim consistently with x.
                     yb = torch.zeros(
-                        (xb.shape[0], n_vars, xb.shape[-2], xb.shape[-1]),
+                        (xb.shape[0], n_vars, tile_h, tile_w),
                         dtype=xb.dtype,
                         device=device,
                     )
@@ -811,29 +986,55 @@ def run_inference(
                         else nullcontext()
                     )
                     with amp_context:
-                        pred = model({
-                            "x": xb,
-                            "y": yb,
-                            "__scaler_offset": scaler_offsets,
-                        })
+                        input_offsets = scaler_offsets - torch.tensor(
+                            [halo_h, halo_w], dtype=torch.long, device=device
+                        )
+                        output_crop = torch.tensor(
+                            [plan.output_crop] * xb.shape[0],
+                            dtype=torch.long,
+                            device=device,
+                        )
+                        model_batch = {
+                                "x": xb,
+                                "y": yb,
+                                # Legacy key remains for old checkpoints/models.
+                                "__scaler_offset": scaler_offsets,
+                                "__input_scaler_offset": input_offsets,
+                                "__output_scaler_offset": scaler_offsets,
+                                "__output_crop": output_crop,
+                        }
+                        model_result = model(
+                            model_batch, return_raw_output=diagnostic_active
+                        )
+                        if diagnostic_active:
+                            pred, raw_pred = model_result
+                        else:
+                            pred = model_result
                     if isinstance(pred, dict):
                         pred = pred.get(
                             "y_hat", pred.get("output", next(iter(pred.values())))
                         )
-                    # Crop away the reflect padding -> back to tile size.
+                    # New models crop the normalized prediction before spatial
+                    # decoding. This fallback preserves compatibility with legacy
+                    # models when halo is zero.
                     pred = pred[..., :tile_h, :tile_w]
                     _sync_if_cuda(device)
                     _add_time(day_times, "forward", time.perf_counter() - t0)
 
                     t0 = time.perf_counter()
                     # Model output is already physical units -> write directly.
-                    pred_np = pred.detach().cpu().numpy().astype(np.float32)
+                    pred_np = _tensor_to_float32_numpy(pred)
+                    raw_pred_np = (
+                        _tensor_to_float32_numpy(raw_pred)
+                        if raw_pred is not None
+                        else None
+                    )
 
                     for i, (lat0, lon0) in enumerate(chunk):
-                        lat_slice = slice(lat0, lat0 + tile_h)
-                        lon_slice = slice(lon0, lon0 + tile_w)
-                        accum[:, lat_slice, lon_slice] += pred_np[i] * win[np.newaxis]
-                        weight[lat_slice, lon_slice] += win
+                        tile_predictions[(lat0, lon0)] = pred_np[i]
+                        if raw_pred_np is not None:
+                            raw_tile_predictions[(lat0, lon0)] = raw_pred_np[i]
+                        stitcher.add(pred_np[i], (lat0, lon0), win)
                     _add_time(day_times, "postprocess", time.perf_counter() - t0)
                     start += len(chunk)
                 except BaseException as exc:
@@ -850,13 +1051,17 @@ def run_inference(
                     _clear_cuda_memory(device)
                     continue
                 finally:
-                    del xb_cpu, xb, yb, pred, pred_np, xs
+                    del xb_cpu, xb, yb, pred, raw_pred, pred_np, xs
 
             t0 = time.perf_counter()
-            # Blend: normalize by accumulated Hann weights -> (C, H, W).
-            prediction = np.full_like(accum, np.nan)
-            valid_weight = weight > 0.0
-            prediction[:, valid_weight] = accum[:, valid_weight] / weight[valid_weight]
+            # Blend: divide the weighted sum by accumulated weights. Ocean-only
+            # tiles may be skipped, but every valid target cell must be covered.
+            if target_valid_mask is None:
+                if np.any(stitcher.weight <= 0.0):
+                    raise ValueError("Tiled inference left domain cells uncovered")
+            elif np.any(target_valid_mask & (stitcher.weight <= 0.0)):
+                raise ValueError("Tiled inference left valid PRISM cells uncovered")
+            prediction = stitcher.finalize(require_full_coverage=False).astype(np.float32)
             prediction = prediction[np.newaxis]  # (1, C, H, W) for the helpers
             if target_valid_mask is not None:
                 prediction[:, :, ~target_valid_mask] = np.nan
@@ -877,14 +1082,14 @@ def run_inference(
             # tmax<tmin crossings without failing.
             _sanity_check_outputs(prediction, target_variables, date_string)
 
-            # Seam / block-artifact sanity metric: ratio of the mean |gradient|
-            # at tile boundaries to the interior mean. ~1.0 means seams are
-            # indistinguishable from the interior (good Hann blend); >~1.5
-            # indicates visible low-resolution block edges at the tile grid.
+            # Measure the actual equal-weight crossover bands (not merely tile
+            # origins) and disagreement between unblended neighboring cores.
+            lat_crossovers = overlap_crossovers(lat_origins, tile_h)
+            lon_crossovers = overlap_crossovers(lon_origins, tile_w)
             for _ci, _vname in enumerate(target_variables):
                 _field = prediction[0, _ci]
-                _r_lat = seam_gradient_ratio(_field, lat_origins, axis=0)
-                _r_lon = seam_gradient_ratio(_field, lon_origins, axis=1)
+                _r_lat = boundary_gradient_ratio(_field, lat_crossovers, axis=0)
+                _r_lon = boundary_gradient_ratio(_field, lon_crossovers, axis=1)
                 _flag = (
                     "  <-- possible block artifact"
                     if (np.isfinite(_r_lat) and _r_lat > 1.5)
@@ -892,16 +1097,100 @@ def run_inference(
                     else ""
                 )
                 print(
-                    f"[inference] {date_string} seam-gradient ratio {_vname}: "
-                    f"lat={_r_lat:.2f} lon={_r_lon:.2f} (1.0=no seam){_flag}"
+                    f"[inference] {date_string} overlap-crossover gradient ratio {_vname}: "
+                    f"lat={_r_lat:.2f} lon={_r_lon:.2f} (1.0=background){_flag}"
                 )
+            pair_metrics: List[Dict[str, float]] = []
+            for lat0 in lat_origins:
+                for left, right in zip(lon_origins[:-1], lon_origins[1:]):
+                    if (lat0, left) in tile_predictions and (lat0, right) in tile_predictions:
+                        pair_metrics.append(
+                            overlap_disagreement(
+                                tile_predictions[(lat0, left)], (lat0, left),
+                                tile_predictions[(lat0, right)], (lat0, right),
+                            )
+                        )
+            for lon0 in lon_origins:
+                for top, bottom in zip(lat_origins[:-1], lat_origins[1:]):
+                    if (top, lon0) in tile_predictions and (bottom, lon0) in tile_predictions:
+                        pair_metrics.append(
+                            overlap_disagreement(
+                                tile_predictions[(top, lon0)], (top, lon0),
+                                tile_predictions[(bottom, lon0)], (bottom, lon0),
+                            )
+                        )
+            finite_rmse = [m["rmse"] for m in pair_metrics if np.isfinite(m["rmse"])]
+            if finite_rmse:
+                print(
+                    f"[inference] {date_string} preblend overlap disagreement: "
+                    f"mean_rmse={np.mean(finite_rmse):.4f} degC/mm "
+                    f"max_rmse={np.max(finite_rmse):.4f} pairs={len(finite_rmse)}"
+                )
+
+            if diagnostic_active:
+                channel_indices = [
+                    int(idx) for idx in diagnostics_cfg.get("predictor_channels", [0])
+                ]
+                if day_predictors is None:
+                    raise RuntimeError("diagnostic predictor cache was not populated")
+                n_predictor_channels = int(day_predictors.shape[0])
+                channel_indices = [
+                    idx for idx in channel_indices if 0 <= idx < n_predictor_channels
+                ]
+                if not channel_indices:
+                    channel_indices = [0]
+                input_mean = np.load(Path(config.model.input_mu), mmap_mode="r")
+                input_std = np.load(Path(config.model.input_sigma), mmap_mode="r")
+                regridded = day_predictors[channel_indices].cpu().numpy().astype(np.float32)
+                normalized = (
+                    regridded
+                    - np.asarray(input_mean[channel_indices], dtype=np.float32)[:, None, None]
+                ) / (
+                    np.asarray(input_std[channel_indices], dtype=np.float32)[:, None, None]
+                    + float(getattr(config, "input_scalers_epsilon", 1.0e-6))
+                )
+                truth = dataset._load_targets(
+                    sample_date, slice(None), slice(None)
+                ).cpu().numpy().astype(np.float32)
+                tile_order = list(tile_predictions)
+                diagnostic_payload: Dict[str, Any] = {
+                    "date": np.asarray(date_string),
+                    "lat": np.asarray(target_lat, dtype=np.float64),
+                    "lon": np.asarray(target_lon, dtype=np.float64),
+                    "predictor_channel_indices": np.asarray(channel_indices, dtype=np.int32),
+                    "regridded_predictors": regridded,
+                    "normalized_predictors": normalized.astype(np.float32),
+                    "tile_origins": np.asarray(tile_order, dtype=np.int32),
+                    "individual_tile_predictions": np.stack(
+                        [tile_predictions[pos] for pos in tile_order]
+                    ),
+                    "tile_weight_sum": stitcher.weight.astype(np.float32),
+                    "stitched_denormalized_output": prediction[0],
+                    "prism_target": truth,
+                    "inference_minus_prism": prediction[0] - truth,
+                    "overlap_crossovers_lat": np.asarray(lat_crossovers, dtype=np.int32),
+                    "overlap_crossovers_lon": np.asarray(lon_crossovers, dtype=np.int32),
+                }
+                if raw_tile_predictions:
+                    diagnostic_payload["normalized_tile_predictions"] = np.stack(
+                        [raw_tile_predictions[pos] for pos in tile_order]
+                    )
+                diagnostic_payload.update(
+                    _load_native_predictor_diagnostic(dataset, sample_date)
+                )
+                diagnostic_path = diagnostics_dir / f"stages_{date_string}.npz"
+                np.savez_compressed(diagnostic_path, **diagnostic_payload)
+                print(f"[inference] wrote intermediate stage diagnostics: {diagnostic_path}")
             _add_time(day_times, "postprocess", time.perf_counter() - t0)
 
             date_token = np.datetime64(date_string, "D").astype(object).strftime("%Y%m%d")
             out_path = output_path / f"{case_name}_inference_{date_token}.nc"
+            temporary_path = out_path.with_name(
+                f".{out_path.name}.{os.getpid()}.tmp"
+            )
             t0 = time.perf_counter()
             out_nc = _open_streaming_output(
-                out_path,
+                temporary_path,
                 target_variables,
                 target_lat,
                 target_lon,
@@ -916,12 +1205,13 @@ def run_inference(
                 out_nc.flush()
             finally:
                 out_nc.close()
+            os.replace(temporary_path, out_path)
             _add_time(day_times, "write", time.perf_counter() - t0)
             write_count += 1
             for key, value in day_times.items():
                 _add_time(run_times, key, value)
             print(f"[timing] {date_string} {_format_timing(day_times)}")
-            del day_predictors, accum, weight, prediction
+            del day_predictors, stitcher, tile_predictions, raw_tile_predictions, prediction
 
     if write_count != len(inference_dates):
         raise RuntimeError(
@@ -980,6 +1270,7 @@ def run_parallel_inference(
     procs: List[subprocess.Popen] = []
     log_handles: List[Any] = []
     worker_logs: List[Path] = []
+    run_started_ns = time.time_ns()
     try:
         for shard_idx, gpu_id in enumerate(gpu_ids):
             env = os.environ.copy()
@@ -1004,6 +1295,7 @@ def run_parallel_inference(
                 "--date-shard-count",
                 str(n_workers),
                 "--no-data-parallel",
+                "--no-progress",
             ]
             print(
                 f"[parallel] worker {shard_idx}: GPU {gpu_id}, "
@@ -1024,32 +1316,40 @@ def run_parallel_inference(
             )
 
         failures: List[Tuple[int, int]] = []
-        last_done = -1
-        last_report = 0.0
-        while True:
-            done = len(list(output_path.glob(f"{case_name}_inference_*.nc")))
-            now = time.monotonic()
-            if done != last_done or now - last_report >= 60.0:
-                pct = 100.0 * done / max(total_dates, 1)
-                live = sum(1 for proc in procs if proc.poll() is None)
-                print(
-                    f"[parallel] completed {done}/{total_dates} daily files "
-                    f"({pct:.1f}%); live_workers={live}",
-                    flush=True,
+        progress = (
+            tqdm(total=total_dates, desc="NARR-PRISM inference (days)", unit="day")
+            if tqdm is not None
+            else None
+        )
+        last_done = 0
+        try:
+            while True:
+                # Count only files written by this invocation. This keeps a resumed
+                # or repeated run from starting the bar with stale outputs included.
+                done = sum(
+                    path.stat().st_mtime_ns >= run_started_ns
+                    for path in output_path.glob(f"{case_name}_inference_*.nc")
                 )
+                done = min(done, total_dates)
+                live = sum(1 for proc in procs if proc.poll() is None)
+                if progress is not None:
+                    progress.n = done
+                    progress.set_postfix(live_workers=live, refresh=True)
+                elif done != last_done:
+                    print(f"[parallel] completed {done}/{total_dates} daily files", flush=True)
                 last_done = done
-                last_report = now
 
-            failures = [
-                (worker_idx, proc.returncode)
-                for worker_idx, proc in enumerate(procs)
-                if proc.poll() not in (None, 0)
-            ]
-            if failures:
-                break
-            if all(proc.poll() is not None for proc in procs):
-                break
-            time.sleep(15.0)
+                failures = [
+                    (worker_idx, proc.returncode)
+                    for worker_idx, proc in enumerate(procs)
+                    if proc.poll() not in (None, 0)
+                ]
+                if failures or all(proc.poll() is not None for proc in procs):
+                    break
+                time.sleep(2.0)
+        finally:
+            if progress is not None:
+                progress.close()
 
         if failures:
             for log_fh in log_handles:
@@ -1095,7 +1395,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         required=True,
-        help="Path to the same YAML used for training (e.g., NARR_PRISM_subdomain_old.yaml)",
+        help="Path to the same YAML used for training (e.g., NARR_PRISM_subdomain.yaml)",
     )
     parser.add_argument("--checkpoint", default=None, help="Override checkpoint path")
     parser.add_argument("--output-dir", default=None, help="Override output directory")
@@ -1108,6 +1408,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--date-shard-index", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--date-shard-count", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--no-progress", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--no-data-parallel",
         action="store_true",
@@ -1159,6 +1460,7 @@ def main() -> None:
         batch_size=args.batch_size,
         date_shard_index=args.date_shard_index,
         date_shard_count=args.date_shard_count,
+        show_progress=not args.no_progress,
         data_parallel=not args.no_data_parallel,
     )
 

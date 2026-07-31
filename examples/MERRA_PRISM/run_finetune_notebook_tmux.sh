@@ -35,6 +35,7 @@ run_worker() {
 
     cd "$SCRIPT_DIR"
     export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
+    export PYTHONUNBUFFERED=1
 
     if command -v conda >/dev/null 2>&1; then
         source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -50,7 +51,9 @@ run_worker() {
     echo ""
 
     if python -m papermill --version >/dev/null 2>&1; then
-        python -m papermill "$NOTEBOOK" "$output_notebook"
+        # Forward notebook cell output to this tmux pane so tqdm epoch bars and
+        # training metrics remain visible while the session is attached.
+        python -m papermill --log-output "$NOTEBOOK" "$output_notebook"
     else
         output_dir="$(cd "$(dirname "$output_notebook")" && pwd)"
         output_name="$(basename "$output_notebook")"

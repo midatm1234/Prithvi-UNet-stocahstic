@@ -170,6 +170,10 @@ examples/MERRA_PRISM/experiments/inference_output/
 examples/MERRA_PRISM/experiments/checkpoints/
 examples/MERRA_PRISM/scalars/
 
+# NARR_PRISM canonical grids, preprocessing products, and case scalars are
+# generated locally from large source datasets and must not be versioned.
+examples/NARR_PRISM/preprocessed/
+
 # Binary data/model artifacts must stay out of Git
 *.nc
 *.nc4

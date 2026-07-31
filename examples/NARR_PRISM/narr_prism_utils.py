@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
+import warnings
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -214,6 +216,409 @@ def _select_narr_day_level(da: Any, sample_date: date, level: float) -> Any:
     return da
 
 
+_NARR_REGRID_CACHE_VERSION = 1
+_NARR_REGRID_CACHE_NAME = "narr_barycentric_regrid_weights.npz"
+
+
+def _coordinate_fingerprint(*arrays: Any) -> str:
+    """Return a stable fingerprint for ordered floating-point coordinates."""
+    digest = hashlib.sha256()
+    for value in arrays:
+        array = np.ascontiguousarray(np.asarray(value, dtype="<f8"))
+        digest.update(str(array.shape).encode("ascii"))
+        digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def narr_regrid_cache_path(case_preprocess_dir: str | Path) -> Path:
+    """Return the case-scoped cache path for NARR-to-PRISM geometry."""
+    return Path(case_preprocess_dir) / _NARR_REGRID_CACHE_NAME
+
+
+class NARRBarycentricRegridder:
+    """Reusable linear regridder for a curvilinear NARR source grid.
+
+    Delaunay simplex lookup and barycentric weights depend only on the source
+    and target coordinates, not on a day's predictor values.  They are built
+    once and can be cached per case.  Applying the weights is then a small
+    gather/multiply operation, including for a rectangular target crop.
+
+    Missing values are deliberately conservative: a target is finite only if
+    it is inside the source convex hull *and* all three values at its source
+    simplex vertices are finite.  No nearest-neighbour fallback is performed.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_shape: Sequence[int],
+        target_shape: Sequence[int],
+        vertices: np.ndarray,
+        weights: np.ndarray,
+        source_fingerprint: str,
+        target_fingerprint: str,
+        loaded_from_cache: bool = False,
+    ) -> None:
+        self.source_shape = tuple(int(value) for value in source_shape)
+        self.target_shape = tuple(int(value) for value in target_shape)
+        if len(self.source_shape) != 2 or len(self.target_shape) != 2:
+            raise ValueError("NARR source and target grids must both be two-dimensional")
+
+        self.vertices = np.ascontiguousarray(vertices, dtype=np.int32)
+        self.weights = np.ascontiguousarray(weights, dtype=np.float64)
+        expected = (int(np.prod(self.target_shape)), 3)
+        if self.vertices.shape != expected or self.weights.shape != expected:
+            raise ValueError(
+                "Invalid barycentric cache arrays: expected "
+                f"{expected}, got vertices={self.vertices.shape}, "
+                f"weights={self.weights.shape}"
+            )
+        self.source_fingerprint = str(source_fingerprint)
+        self.target_fingerprint = str(target_fingerprint)
+        self.loaded_from_cache = bool(loaded_from_cache)
+        self._sparse_operator = None
+
+    @property
+    def valid_target_count(self) -> int:
+        """Number of target cells inside the source coordinate convex hull."""
+        return int(np.count_nonzero(self.vertices[:, 0] >= 0))
+
+    @classmethod
+    def from_grids(
+        cls,
+        source_lat: Any,
+        source_lon: Any,
+        target_lat: Any,
+        target_lon: Any,
+        *,
+        cache_path: Optional[str | Path] = None,
+    ) -> "NARRBarycentricRegridder":
+        """Build or load geometry for an ordered source and target grid."""
+        source_lat_array = np.asarray(source_lat, dtype=np.float64)
+        source_lon_array = np.asarray(source_lon, dtype=np.float64)
+        target_lat_array = np.asarray(target_lat, dtype=np.float64)
+        target_lon_array = np.asarray(target_lon, dtype=np.float64)
+
+        if source_lat_array.ndim != 2 or source_lon_array.ndim != 2:
+            raise ValueError("NARR latitude/longitude coordinates must be two-dimensional")
+        if source_lat_array.shape != source_lon_array.shape:
+            raise ValueError(
+                "NARR latitude/longitude shapes differ: "
+                f"{source_lat_array.shape} versus {source_lon_array.shape}"
+            )
+        if target_lat_array.ndim != 1 or target_lon_array.ndim != 1:
+            raise ValueError("PRISM target latitude/longitude must be one-dimensional")
+        if target_lat_array.size == 0 or target_lon_array.size == 0:
+            raise ValueError("PRISM target latitude/longitude must be non-empty")
+        if not np.isfinite(target_lat_array).all() or not np.isfinite(target_lon_array).all():
+            raise ValueError("PRISM target coordinates contain non-finite values")
+
+        source_shape = source_lat_array.shape
+        target_shape = (target_lat_array.size, target_lon_array.size)
+        source_fingerprint = _coordinate_fingerprint(
+            source_lat_array, source_lon_array
+        )
+        target_fingerprint = _coordinate_fingerprint(
+            target_lat_array, target_lon_array
+        )
+
+        resolved_cache = Path(cache_path) if cache_path is not None else None
+        if resolved_cache is not None and resolved_cache.is_file():
+            try:
+                cached = cls._load_cache(
+                    resolved_cache,
+                    source_shape=source_shape,
+                    target_shape=target_shape,
+                    source_fingerprint=source_fingerprint,
+                    target_fingerprint=target_fingerprint,
+                )
+            except (KeyError, OSError, ValueError, EOFError) as exc:
+                warnings.warn(
+                    f"Ignoring invalid NARR regrid cache {resolved_cache}: {exc}",
+                    RuntimeWarning,
+                )
+            else:
+                if cached is not None:
+                    return cached
+
+        built = cls._build(
+            source_lat_array,
+            source_lon_array,
+            target_lat_array,
+            target_lon_array,
+            source_fingerprint=source_fingerprint,
+            target_fingerprint=target_fingerprint,
+        )
+        if resolved_cache is not None:
+            built._write_cache(resolved_cache)
+        return built
+
+    @classmethod
+    def _build(
+        cls,
+        source_lat: np.ndarray,
+        source_lon: np.ndarray,
+        target_lat: np.ndarray,
+        target_lon: np.ndarray,
+        *,
+        source_fingerprint: str,
+        target_fingerprint: str,
+    ) -> "NARRBarycentricRegridder":
+        try:
+            from scipy.spatial import Delaunay
+        except ImportError as exc:
+            raise ImportError("scipy is required for NARR interpolation") from exc
+
+        source_points_all = np.column_stack(
+            [source_lon.ravel(), source_lat.ravel()]
+        )
+        finite_source = np.isfinite(source_points_all).all(axis=1)
+        source_indices = np.flatnonzero(finite_source)
+        if source_indices.size < 3:
+            raise ValueError("NARR grid has fewer than three finite coordinate points")
+        source_points = source_points_all[finite_source]
+        if np.unique(source_points, axis=0).shape[0] < 3:
+            raise ValueError("NARR grid has fewer than three unique coordinate points")
+
+        triangulation = Delaunay(source_points)
+        target_lon_2d, target_lat_2d = np.meshgrid(target_lon, target_lat)
+        target_points = np.column_stack(
+            [target_lon_2d.ravel(), target_lat_2d.ravel()]
+        )
+        simplex = triangulation.find_simplex(target_points)
+        inside = simplex >= 0
+
+        vertices = np.full((target_points.shape[0], 3), -1, dtype=np.int32)
+        weights = np.full((target_points.shape[0], 3), np.nan, dtype=np.float64)
+        if inside.any():
+            inside_simplex = simplex[inside]
+            transform = triangulation.transform[inside_simplex]
+            delta = target_points[inside] - transform[:, 2, :]
+            first_weights = np.einsum(
+                "nij,nj->ni", transform[:, :2, :], delta
+            )
+            inside_weights = np.column_stack(
+                [first_weights, 1.0 - first_weights.sum(axis=1)]
+            )
+            inside_vertices = source_indices[
+                triangulation.simplices[inside_simplex]
+            ]
+            vertices[inside] = inside_vertices.astype(np.int32, copy=False)
+            weights[inside] = inside_weights
+
+        return cls(
+            source_shape=source_lat.shape,
+            target_shape=(target_lat.size, target_lon.size),
+            vertices=vertices,
+            weights=weights,
+            source_fingerprint=source_fingerprint,
+            target_fingerprint=target_fingerprint,
+        )
+
+    @classmethod
+    def _load_cache(
+        cls,
+        path: Path,
+        *,
+        source_shape: Sequence[int],
+        target_shape: Sequence[int],
+        source_fingerprint: str,
+        target_fingerprint: str,
+    ) -> Optional["NARRBarycentricRegridder"]:
+        with np.load(path, allow_pickle=False) as data:
+            version = int(np.asarray(data["format_version"]).item())
+            cached_source_shape = tuple(
+                int(value) for value in np.asarray(data["source_shape"]).tolist()
+            )
+            cached_target_shape = tuple(
+                int(value) for value in np.asarray(data["target_shape"]).tolist()
+            )
+            cached_source_fingerprint = str(
+                np.asarray(data["source_fingerprint"]).item()
+            )
+            cached_target_fingerprint = str(
+                np.asarray(data["target_fingerprint"]).item()
+            )
+            if (
+                version != _NARR_REGRID_CACHE_VERSION
+                or cached_source_shape != tuple(source_shape)
+                or cached_target_shape != tuple(target_shape)
+                or cached_source_fingerprint != source_fingerprint
+                or cached_target_fingerprint != target_fingerprint
+            ):
+                return None
+            return cls(
+                source_shape=cached_source_shape,
+                target_shape=cached_target_shape,
+                vertices=np.asarray(data["vertices"], dtype=np.int32),
+                weights=np.asarray(data["weights"], dtype=np.float64),
+                source_fingerprint=cached_source_fingerprint,
+                target_fingerprint=cached_target_fingerprint,
+                loaded_from_cache=True,
+            )
+
+    def _write_cache(self, path: Path) -> None:
+        """Atomically persist this geometry so date shards can safely share it."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            with open(temporary, "wb") as handle:
+                np.savez_compressed(
+                    handle,
+                    format_version=np.asarray(_NARR_REGRID_CACHE_VERSION, dtype=np.int64),
+                    source_shape=np.asarray(self.source_shape, dtype=np.int64),
+                    target_shape=np.asarray(self.target_shape, dtype=np.int64),
+                    source_fingerprint=np.asarray(self.source_fingerprint),
+                    target_fingerprint=np.asarray(self.target_fingerprint),
+                    vertices=self.vertices,
+                    weights=self.weights,
+                )
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def assert_grids_match(
+        self,
+        source_lat: Any,
+        source_lon: Any,
+        target_lat: Any,
+        target_lon: Any,
+    ) -> None:
+        """Reject applying cached weights to differently ordered coordinates."""
+        observed_source = _coordinate_fingerprint(source_lat, source_lon)
+        observed_target = _coordinate_fingerprint(target_lat, target_lon)
+        if observed_source != self.source_fingerprint:
+            raise ValueError(
+                "NARR source grid differs from the grid used to build regrid weights"
+            )
+        if observed_target != self.target_fingerprint:
+            raise ValueError(
+                "PRISM target grid differs from the grid used to build regrid weights"
+            )
+
+    def _operator(self) -> Any:
+        """Return a lazily built CSR operator with three entries per simplex."""
+        if self._sparse_operator is None:
+            try:
+                from scipy.sparse import csr_matrix
+            except ImportError as exc:
+                raise ImportError("scipy is required for NARR interpolation") from exc
+
+            valid = self.vertices[:, 0] >= 0
+            counts = np.where(valid, 3, 0).astype(np.int64, copy=False)
+            indptr = np.empty(self.vertices.shape[0] + 1, dtype=np.int64)
+            indptr[0] = 0
+            np.cumsum(counts, out=indptr[1:])
+            self._sparse_operator = csr_matrix(
+                (
+                    self.weights[valid].ravel(),
+                    self.vertices[valid].ravel(),
+                    indptr,
+                ),
+                shape=(self.vertices.shape[0], int(np.prod(self.source_shape))),
+            )
+        return self._sparse_operator
+
+    def apply(
+        self,
+        values: Any,
+        *,
+        target_slices: Optional[Tuple[slice, slice]] = None,
+        target_chunk_size: Optional[int] = None,
+    ) -> np.ndarray:
+        """Apply cached weights to one or more ``[..., y, x]`` source fields."""
+        source = np.asarray(values)
+        if source.ndim < 2 or tuple(source.shape[-2:]) != self.source_shape:
+            raise ValueError(
+                f"NARR values end in {source.shape[-2:]}, expected {self.source_shape}"
+            )
+        if target_chunk_size is not None and target_chunk_size < 1:
+            raise ValueError("target_chunk_size must be positive")
+
+        if target_slices is None:
+            target_indices = np.arange(self.vertices.shape[0], dtype=np.int64)
+            output_shape = self.target_shape
+        else:
+            if len(target_slices) != 2:
+                raise ValueError("target_slices must contain latitude and longitude slices")
+            rows = np.arange(self.target_shape[0], dtype=np.int64)[target_slices[0]]
+            columns = np.arange(self.target_shape[1], dtype=np.int64)[target_slices[1]]
+            target_indices = (
+                rows[:, np.newaxis] * self.target_shape[1] + columns[np.newaxis, :]
+            ).ravel()
+            output_shape = (rows.size, columns.size)
+
+        flat_source = source.reshape((-1, int(np.prod(self.source_shape))))
+        operator = self._operator()
+        if target_slices is None and target_chunk_size is None:
+            flat_output = np.asarray(operator.dot(flat_source.T)).T
+            flat_output[:, self.vertices[:, 0] < 0] = np.nan
+            result = flat_output.reshape(source.shape[:-2] + self.target_shape)
+            result[~np.isfinite(result)] = np.nan
+            return result.astype(np.float32, copy=False)
+
+        flat_output = np.full(
+            (flat_source.shape[0], target_indices.size), np.nan, dtype=np.float64
+        )
+        chunk_size = (
+            max(1, target_indices.size)
+            if target_chunk_size is None
+            else target_chunk_size
+        )
+        for start in range(0, target_indices.size, chunk_size):
+            stop = min(start + chunk_size, target_indices.size)
+            selected = target_indices[start:stop]
+            valid_geometry = self.vertices[selected, 0] >= 0
+            if not valid_geometry.any():
+                continue
+            interpolated = np.asarray(operator[selected].dot(flat_source.T)).T
+            interpolated[:, ~valid_geometry] = np.nan
+            flat_output[:, start:stop] = interpolated
+
+        result = flat_output.reshape(source.shape[:-2] + tuple(output_shape))
+        result[~np.isfinite(result)] = np.nan
+        return result.astype(np.float32, copy=False)
+
+
+def load_narr_grid(
+    file_map: Mapping[str, Path] | Path,
+    var: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load the two-dimensional NARR latitude and longitude coordinates."""
+    try:
+        import xarray as xr
+    except ImportError as exc:
+        raise ImportError("xarray is required for NARR interpolation") from exc
+
+    path = Path(file_map[var]) if isinstance(file_map, Mapping) else Path(file_map)
+    with xr.open_dataset(str(path)) as dataset:
+        lat = np.asarray(dataset["lat"].values, dtype=np.float64)
+        lon = np.asarray(dataset["lon"].values, dtype=np.float64)
+    return lat, lon
+
+
+def build_narr_regridder(
+    file_map: Mapping[str, Path] | Path,
+    var: str,
+    target_lat: Any,
+    target_lon: Any,
+    *,
+    cache_path: Optional[str | Path] = None,
+) -> NARRBarycentricRegridder:
+    """Build/load a reusable regridder using coordinates from one NARR file."""
+    source_lat, source_lon = load_narr_grid(file_map, var)
+    return NARRBarycentricRegridder.from_grids(
+        source_lat,
+        source_lon,
+        target_lat,
+        target_lon,
+        cache_path=cache_path,
+    )
+
+
 def interpolate_narr_to_grid(
     file_map: Mapping[str, Path] | Path,
     var: str,
@@ -221,14 +626,22 @@ def interpolate_narr_to_grid(
     sample_date: date,
     target_lat: Any,
     target_lon: Any,
+    *,
+    regridder: Optional[NARRBarycentricRegridder] = None,
+    target_slices: Optional[Tuple[slice, slice]] = None,
 ) -> "np.ndarray":
-    """Load one NARR channel and interpolate it onto a 1D PRISM lat/lon grid."""
+    """Load one NARR channel and linearly interpolate it to a PRISM grid.
+
+    Continuous predictors are only defined where linear interpolation is
+    supported by finite source points.  In particular, values outside the
+    finite-point convex hull remain NaN; filling those cells by nearest
+    neighbour would create artificial constant blocks at the domain edge.
+    """
     try:
         import numpy as np
         import xarray as xr
-        from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
     except ImportError as exc:
-        raise ImportError("numpy, xarray, and scipy are required for NARR interpolation") from exc
+        raise ImportError("numpy and xarray are required for NARR interpolation") from exc
 
     if isinstance(file_map, Mapping):
         path = Path(file_map[var])
@@ -244,26 +657,13 @@ def interpolate_narr_to_grid(
         lat = np.asarray(ds["lat"].values, dtype=np.float64)
         lon = np.asarray(ds["lon"].values, dtype=np.float64)
 
-    points = np.column_stack([lon.ravel(), lat.ravel()])
-    flat_values = values.ravel()
-    finite = np.isfinite(flat_values) & np.isfinite(points).all(axis=1)
-    target_lon2d, target_lat2d = np.meshgrid(
-        np.asarray(target_lon, dtype=np.float64),
-        np.asarray(target_lat, dtype=np.float64),
-    )
-    target_points = np.column_stack([target_lon2d.ravel(), target_lat2d.ravel()])
-
-    out = np.full(target_points.shape[0], np.nan, dtype=np.float32)
-    if finite.any():
-        linear = LinearNDInterpolator(points[finite], flat_values[finite], fill_value=np.nan)
-        out = np.asarray(linear(target_points), dtype=np.float32)
-        missing = ~np.isfinite(out)
-        if missing.any():
-            nearest = NearestNDInterpolator(points[finite], flat_values[finite])
-            nearest_values = np.asarray(nearest(target_points[missing]), dtype=np.float32)
-            out[missing] = nearest_values
-    out[np.isinf(out)] = np.nan
-    return out.reshape(target_lat2d.shape).astype(np.float32)
+    if regridder is None:
+        regridder = NARRBarycentricRegridder.from_grids(
+            lat, lon, target_lat, target_lon
+        )
+    else:
+        regridder.assert_grids_match(lat, lon, target_lat, target_lon)
+    return regridder.apply(values, target_slices=target_slices)
 
 
 # ---------------------------------------------------------------------------
@@ -450,9 +850,17 @@ def load_elevation(
     if not elevation_file.exists():
         raise FileNotFoundError(f"Elevation file not found: {elevation_file}")
 
+    if (target_lat is None) != (target_lon is None):
+        raise ValueError("target_lat and target_lon must be provided together")
+
     with xr.open_dataset(str(elevation_file)) as ds:
         # Auto-detect variable
-        if var_name and var_name in ds.data_vars:
+        if var_name is not None:
+            if var_name not in ds.data_vars:
+                raise ValueError(
+                    f"Elevation file {elevation_file} does not contain variable "
+                    f"'{var_name}'"
+                )
             da = ds[var_name]
         else:
             candidates = [v for v in ds.data_vars if "elev" in v.lower() or "dem" in v.lower() or "topo" in v.lower()]
@@ -464,21 +872,58 @@ def load_elevation(
 
         # Regrid if target grid provided
         if target_lat is not None and target_lon is not None:
+            target_lat_array = np.asarray(target_lat, dtype=np.float64)
+            target_lon_array = np.asarray(target_lon, dtype=np.float64)
+            if target_lat_array.ndim != 1 or target_lon_array.ndim != 1:
+                raise ValueError("target_lat and target_lon must be one-dimensional")
+            if target_lat_array.size == 0 or target_lon_array.size == 0:
+                raise ValueError("target_lat and target_lon must be non-empty")
+
             lat_candidates = ("lat", "latitude", "y")
             lon_candidates = ("lon", "longitude", "x")
             lat_name = next((n for n in lat_candidates if n in da.dims or n in da.coords), None)
             lon_name = next((n for n in lon_candidates if n in da.dims or n in da.coords), None)
-            if lat_name and lon_name:
-                try:
-                    da = da.interp(
-                        {lat_name: target_lat, lon_name: target_lon},
-                        method="linear",
-                    )
-                except Exception:
-                    pass  # Keep original resolution if regrid fails
+            if lat_name is None or lon_name is None:
+                raise ValueError(
+                    f"Cannot align elevation variable '{da.name}' from "
+                    f"{elevation_file}: no latitude/longitude coordinates"
+                )
+            if lat_name not in da.coords or lon_name not in da.coords:
+                raise ValueError(
+                    f"Cannot align elevation variable '{da.name}' from "
+                    f"{elevation_file}: latitude/longitude coordinates are required"
+                )
+            if da.coords[lat_name].ndim != 1 or da.coords[lon_name].ndim != 1:
+                raise ValueError(
+                    f"Cannot align elevation variable '{da.name}' from "
+                    f"{elevation_file}: latitude/longitude coordinates must be "
+                    "one-dimensional"
+                )
+
+            try:
+                da = da.interp(
+                    {lat_name: target_lat_array, lon_name: target_lon_array},
+                    method="linear",
+                )
+                da = da.transpose(lat_name, lon_name)
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to interpolate elevation variable '{da.name}' from "
+                    f"{elevation_file} to target grid "
+                    f"({target_lat_array.size}, {target_lon_array.size})"
+                ) from exc
 
         arr = da.values.astype(np.float32)
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-        if arr.ndim == 1:
-            raise ValueError("Elevation field is 1-D; expected a 2-D lat/lon grid")
+        if arr.ndim != 2:
+            raise ValueError(
+                f"Elevation field has shape {arr.shape}; expected a 2-D lat/lon grid"
+            )
+        if target_lat is not None and target_lon is not None:
+            expected_shape = (target_lat_array.size, target_lon_array.size)
+            if arr.shape != expected_shape:
+                raise ValueError(
+                    f"Interpolated elevation shape {arr.shape} does not match "
+                    f"target grid {expected_shape}"
+                )
         return arr

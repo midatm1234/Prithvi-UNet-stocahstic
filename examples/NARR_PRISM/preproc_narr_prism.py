@@ -7,7 +7,7 @@ Steps performed:
   4. Write preprocessed NetCDF files (one per date) to the output directory.
 
 Usage:
-    python preproc_narr_prism.py --config NARR_PRISM.yaml [--mode training|inference]
+    python preproc_narr_prism.py --config NARR_PRISM_subdomain.yaml [--mode training|validation|inference]
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ except Exception:
 
 from narr_prism_utils import (
     align_dates,
+    build_narr_regridder,
     discover_all_prism_targets,
     discover_narr_files,
     expand_predictor_variables,
@@ -39,6 +40,7 @@ from narr_prism_utils import (
     interpolate_narr_to_grid,
     load_elevation,
     load_yaml,
+    narr_regrid_cache_path,
     parse_date_range_from_config,
     resolve_path,
     validate_dates_exist,
@@ -50,6 +52,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from granitewxc.utils import normalization as norm
+from granitewxc.utils import prism_grid as prism_grid_contract
+from granitewxc.utils.prism_preprocessed import (
+    build_preprocessing_contract,
+    inclusive_daily_dates,
+    preprocessing_attrs,
+    source_artifact_signature,
+    validate_daily_product,
+)
 
 
 LAT_CANDIDATES = ("lat", "latitude", "y")
@@ -230,8 +240,10 @@ def preprocess(
     cfg: Dict[str, Any],
     mode: str = "training",
     overwrite: bool = False,
+    date_shard_index: int = 0,
+    date_shard_count: int = 1,
 ) -> Path:
-    """Run the full preprocessing pipeline for *mode* (training | inference)."""
+    """Run the full preprocessing pipeline for training/validation/inference."""
     if xr is None:
         raise ImportError("xarray is required for preprocessing")
 
@@ -240,7 +252,18 @@ def preprocess(
     target_dir = resolve_path(data_cfg["target_dir"])
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
     predictor_variables = expand_predictor_variables(data_cfg.get("predictor_variables", {}))
-    regrid_method: str = data_cfg.get("regrid_method", "bilinear")
+    regrid_method = str(data_cfg.get("regrid_method", "bilinear")).lower()
+    if regrid_method not in {"linear", "bilinear"}:
+        raise ValueError(
+            "NARR continuous predictors use piecewise-linear barycentric "
+            f"regridding; data.regrid_method={regrid_method!r} is unsupported"
+        )
+    if regrid_method == "bilinear":
+        print(
+            "[preproc] NOTE: NARR regrid_method='bilinear' is a legacy alias "
+            "for curvilinear Delaunay barycentric linear interpolation; prefer "
+            "regrid_method='linear' for unambiguous provenance"
+        )
 
     case_name = get_case_name(cfg)
     # Case-scoped layout: <preprocessed_dir>/<case_name>/<mode>. Isolating by
@@ -271,10 +294,29 @@ def preprocess(
     # Align dates
     predictor_dates = [d for d, _ in narr_files]
     target_date_maps = {var: [d for d, _ in fl] for var, fl in prism_files.items()}
+    requested_dates = inclusive_daily_dates(start, end)
+    validate_dates_exist(requested_dates, predictor_dates, "predictor")
+    for var, available_dates in target_date_maps.items():
+        validate_dates_exist(requested_dates, available_dates, f"target ({var})")
     aligned_dates = align_dates(predictor_dates, target_date_maps)
-    print(f"[preproc] aligned {len(aligned_dates)} dates")
-
-    validate_dates_exist(aligned_dates, predictor_dates, "predictor")
+    if aligned_dates != requested_dates:
+        raise RuntimeError(
+            "Aligned NARR/PRISM dates do not exactly cover the configured split"
+        )
+    if date_shard_count < 1 or not 0 <= date_shard_index < date_shard_count:
+        raise ValueError(
+            f"invalid date shard {date_shard_index}/{date_shard_count}"
+        )
+    total_aligned = len(aligned_dates)
+    aligned_dates = [
+        value
+        for idx, value in enumerate(aligned_dates)
+        if idx % date_shard_count == date_shard_index
+    ]
+    print(
+        f"[preproc] aligned {total_aligned} dates; shard "
+        f"{date_shard_index}/{date_shard_count} processes {len(aligned_dates)}"
+    )
 
     # Build predictor lookup
     pred_map = {d: p for d, p in narr_files}
@@ -282,12 +324,52 @@ def preprocess(
 
     # Get target grid from first PRISM file
     target_grid, (target_lat, target_lon), target_slices = _get_target_grid(prism_files, data_cfg)
+    first_target_path = next(
+        str(path)
+        for file_list in prism_files.values()
+        for _, path in file_list[:1]
+    )
+    canonical_grid = prism_grid_contract.ensure_canonical_grid(
+        norm.case_preprocess_dir(cfg),
+        target_lat,
+        target_lon,
+        source=first_target_path,
+        context="NARR preprocessing target grid",
+    )
+    target_lat, target_lon = canonical_grid.lat, canonical_grid.lon
+    target_grid = xr.Dataset(
+        {"lat": ("lat", target_lat), "lon": ("lon", target_lon)}
+    )
     print(f"[preproc] PRISM target grid {len(target_lat)}x{len(target_lon)}")
+    print(
+        f"[preproc] canonical PRISM grid fingerprint="
+        f"{canonical_grid.fingerprint[:12]}"
+    )
+
+    # NARR coordinates are fixed across variables and dates.  Build the
+    # Delaunay simplex/weight geometry once on the complete canonical PRISM
+    # grid, cache it under this case, and reuse it for every daily channel.
+    first_predictor_var = predictor_variables[0][0]
+    regrid_cache = narr_regrid_cache_path(norm.case_preprocess_dir(cfg))
+    narr_regridder = build_narr_regridder(
+        narr_files[0][1],
+        first_predictor_var,
+        target_lat,
+        target_lon,
+        cache_path=regrid_cache,
+    )
+    cache_state = "loaded" if narr_regridder.loaded_from_cache else "built"
+    print(
+        f"[preproc] {cache_state} NARR barycentric geometry: "
+        f"{narr_regridder.valid_target_count}/{int(np.prod(narr_regridder.target_shape))} "
+        f"target cells inside source hull; cache={regrid_cache}"
+    )
 
     # Load static elevation and regrid to the PRISM target grid
     elev_file = data_cfg.get("static_elevation_file", None)
     elev_var = data_cfg.get("static_elevation_var", None)
     elevation_arr: Optional[np.ndarray] = None
+    elevation_sha256: Optional[str] = None
     if elev_file:
         elev_path = resolve_path(elev_file)
         if elev_path.exists():
@@ -295,21 +377,71 @@ def preprocess(
                 elev_path, var_name=elev_var or None,
                 target_lat=target_lat, target_lon=target_lon,
             )
+            elevation_sha256 = norm.sha256_file(elev_path)
             print(f"[preproc] loaded elevation {elevation_arr.shape} from {elev_path.name}")
         else:
-            print(f"[preproc] WARN: elevation file not found: {elev_path}")
+            raise FileNotFoundError(
+                f"Configured static_elevation_file was not found: {elev_path}"
+            )
+
+    required_product_variables = [
+        f"predictor_{var}_{int(level)}" for var, level in predictor_variables
+    ] + [f"target_{var}" for var in target_variables]
+    if elevation_arr is not None:
+        required_product_variables.append("static_elevation")
+
+    preprocessing_contract = build_preprocessing_contract(
+        data_type="narr_prism",
+        predictor_variables=predictor_variables,
+        target_variables=target_variables,
+        include_targets=True,
+        regrid_method=regrid_method,
+        canonical_grid_fingerprint=canonical_grid.fingerprint,
+        static_elevation_sha256=elevation_sha256,
+        static_elevation_variable=elev_var,
+        source_grid_fingerprint=narr_regridder.source_fingerprint,
+        algorithm="scipy-delaunay-barycentric-linear-v1",
+    )
 
     # Process each date
     for i, sample_date in enumerate(aligned_dates):
         out_file = output_dir / f"narr_prism_{sample_date:%Y%m%d}.nc"
+        narr_file_map = pred_map[sample_date]
+        daily_sources = {
+            **{
+                f"predictor:{variable}": path
+                for variable, path in narr_file_map.items()
+            },
+            **{
+                f"target:{variable}": target_maps[variable][sample_date]
+                for variable in target_variables
+            },
+        }
+        daily_source_signature = source_artifact_signature(daily_sources)
         if out_file.exists() and not overwrite:
-            continue
+            try:
+                with xr.open_dataset(str(out_file)) as existing:
+                    validate_daily_product(
+                        existing,
+                        out_file,
+                        canonical_grid,
+                        mode=mode,
+                        sample_date=sample_date,
+                        required_variables=required_product_variables,
+                        expected_preprocessing_contract=preprocessing_contract,
+                        expected_source_artifact_signature=daily_source_signature,
+                    )
+            except Exception as exc:
+                print(
+                    f"[preproc] regenerating stale/invalid {out_file.name}: {exc}"
+                )
+            else:
+                continue
 
         # Read NARR predictors and regrid. NaNs (e.g. pressure levels that lie
         # BELOW the surface over high terrain — NARR stores these as missing)
         # are PRESERVED, not converted to zero. Bilinear interp/regrid propagates
         # NaN, which conservatively grows the below-surface mask by one stencil.
-        narr_file_map = pred_map[sample_date]
         pred_arrays: Dict[str, np.ndarray] = {}
         pred_levels: Dict[str, Optional[float]] = {}
         for var, level in predictor_variables:
@@ -322,6 +454,7 @@ def preprocess(
                 sample_date,
                 target_lat,
                 target_lon,
+                regridder=narr_regridder,
             )
 
         # Read PRISM targets. PRISM is NaN over ocean / outside CONUS (~44%);
@@ -335,10 +468,29 @@ def preprocess(
                 da = ds_tgt[dvar]
                 if "time" in da.dims:
                     da = da.isel(time=0, drop=True)
-                arr = da.values.astype(np.float32)
                 lat_slice, lon_slice = target_slices
-                if arr.ndim >= 2:
-                    arr = arr[lat_slice, lon_slice]
+                lat_name = _infer_coord_name(ds_tgt, LAT_CANDIDATES)
+                lon_name = _infer_coord_name(ds_tgt, LON_CANDIDATES)
+                observed_lat = np.asarray(
+                    ds_tgt[lat_name].values, dtype=np.float64
+                )[lat_slice]
+                observed_lon = np.asarray(
+                    ds_tgt[lon_name].values, dtype=np.float64
+                )[lon_slice]
+                prism_grid_contract.assert_grid_matches(
+                    canonical_grid,
+                    observed_lat,
+                    observed_lon,
+                    context=f"PRISM target {tgt_path}",
+                )
+                if lat_name not in da.dims or lon_name not in da.dims:
+                    raise ValueError(
+                        f"PRISM target {tgt_path} variable {dvar!r} must use "
+                        f"coordinate dimensions ({lat_name!r}, {lon_name!r}); "
+                        f"got {da.dims}"
+                    )
+                da = da.transpose(lat_name, lon_name)
+                arr = da.values[lat_slice, lon_slice].astype(np.float32)
                 arr[np.isinf(arr)] = np.nan
                 tgt_arrays[var] = arr
 
@@ -382,6 +534,9 @@ def preprocess(
                 ),
                 "has_elevation": str(elevation_arr is not None),
                 "mode": mode,
+                "prism_grid_fingerprint": canonical_grid.fingerprint,
+                "source_artifact_signature": daily_source_signature,
+                **preprocessing_attrs(preprocessing_contract),
                 "missing_value_note": (
                     "NaN marks missing data: pressure-level predictors below the "
                     "surface over high terrain, and PRISM targets over ocean / "
@@ -395,7 +550,14 @@ def preprocess(
             name: {"_FillValue": FILL_VALUE, "dtype": "float32"}
             for name in out_ds_vars
         }
-        out_ds.to_netcdf(str(out_file), encoding=encoding)
+        # A killed date shard must not leave a partial file that a later run
+        # mistakes for a complete preprocessing product.
+        temporary = out_file.with_name(f".{out_file.name}.{os.getpid()}.tmp")
+        try:
+            out_ds.to_netcdf(str(temporary), encoding=encoding)
+            os.replace(temporary, out_file)
+        finally:
+            temporary.unlink(missing_ok=True)
 
         if (i + 1) % 100 == 0 or i == 0:
             print(f"[preproc] processed {i + 1}/{len(aligned_dates)} dates")
@@ -409,14 +571,16 @@ def parse_args() -> argparse.Namespace:
         description="Preprocess NARR predictors and PRISM targets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", required=True, help="Path to NARR_PRISM.yaml")
+    parser.add_argument("--config", required=True, help="Path to NARR_PRISM_subdomain.yaml")
     parser.add_argument(
         "--mode",
-        choices=["training", "inference", "both"],
+        choices=["training", "validation", "inference", "both"],
         default="both",
         help="Which date range to preprocess",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+    parser.add_argument("--date-shard-index", type=int, default=0)
+    parser.add_argument("--date-shard-count", type=int, default=1)
     return parser.parse_args()
 
 
@@ -424,9 +588,22 @@ def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
 
-    modes = ["training", "inference"] if args.mode == "both" else [args.mode]
+    if args.mode == "both":
+        modes = ["training"]
+        validation = (cfg.get("dates") or {}).get("validation") or {}
+        if validation.get("start") and validation.get("end"):
+            modes.append("validation")
+        modes.append("inference")
+    else:
+        modes = [args.mode]
     for mode in modes:
-        preprocess(cfg, mode=mode, overwrite=args.overwrite)
+        preprocess(
+            cfg,
+            mode=mode,
+            overwrite=args.overwrite,
+            date_shard_index=args.date_shard_index,
+            date_shard_count=args.date_shard_count,
+        )
 
 
 if __name__ == "__main__":

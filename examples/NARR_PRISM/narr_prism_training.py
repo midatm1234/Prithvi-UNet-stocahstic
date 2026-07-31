@@ -4,7 +4,7 @@ Closely mirrors the CORDEX_ML training logic but loads data through
 the NARR_PRISM dataset and uses the NARR_PRISM YAML configuration.
 
 Usage (via narr_prism_finetune.py):
-    python narr_prism_finetune.py --config NARR_PRISM.yaml
+    python narr_prism_finetune.py --config NARR_PRISM_subdomain.yaml
 """
 
 from __future__ import annotations
@@ -68,7 +68,10 @@ try:
         MixedPrecision,
         ShardingStrategy,
     )
-    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+    from torch.distributed.fsdp.wrap import (
+        size_based_auto_wrap_policy,
+        transformer_auto_wrap_policy,
+    )
     _FSDP_AVAILABLE = True
 except ImportError:
     _FSDP_AVAILABLE = False
@@ -132,7 +135,32 @@ def _build_fsdp_precision(config: ExperimentConfig):
 def _wrap_fsdp(model: torch.nn.Module, local_rank: int, config: ExperimentConfig):
     min_params = getattr(config, "fsdp_min_num_params", None)
     policy = None
-    if min_params:
+    attention_scope = str(
+        getattr(getattr(config, "model", None), "backbone_attention_scope", "")
+    ).strip().lower()
+    if attention_scope == "windowed_local":
+        # ``ClimateDownscaleFinetuneUNETModel._windowed_local_backbone`` calls
+        # the Prithvi transformer blocks directly instead of entering through
+        # LocalGlobalLocalBlock.forward().  A size-based policy can leave the
+        # small LayerNorm parameters owned by an enclosing FSDP wrapper while
+        # wrapping only the large MLP child.  The enclosing wrapper is then
+        # bypassed, so non-owner ranks see zero-length LayerNorm parameters.
+        # Make every directly called transformer an atomic FSDP unit instead.
+        transformer_types = {
+            type(module)
+            for module in model.modules()
+            if module.__class__.__name__ == "Transformer"
+            and module.__class__.__module__.startswith("PrithviWxC")
+        }
+        if not transformer_types:
+            raise RuntimeError(
+                "windowed_local FSDP training requires Prithvi transformer blocks"
+            )
+        policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=transformer_types,
+        )
+    elif min_params:
         policy = partial(size_based_auto_wrap_policy, min_num_params=int(min_params))
     mp_ = _build_fsdp_precision(config)
     return FSDP(
@@ -195,23 +223,35 @@ class _WrappedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.base[idx]
         x_full = sample["x"]  # (C_dyn [+ num_static], H_in, W_in)
+        tile_metadata = {
+            key: sample[key]
+            for key in (
+                "__scaler_offset",
+                "__input_scaler_offset",
+                "__output_scaler_offset",
+                "__output_crop",
+            )
+            if key in sample
+        }
 
         if self.num_static_channels > 0 and self._static_y is not None:
             x_dyn = x_full[: -self.num_static_channels]
             static_x = x_full[-self.num_static_channels:]
-            return {
+            wrapped = {
                 "x": self._pad_to_multiple(x_dyn),
                 "y": sample["y"],
                 "static_x": self._pad_to_multiple(static_x),
                 "static_y": self._static_y,
-                "__scaler_offset": sample["__scaler_offset"],
             }
+            wrapped.update(tile_metadata)
+            return wrapped
 
-        return {
+        wrapped = {
             "x": self._pad_to_multiple(x_full),
             "y": sample["y"],
-            "__scaler_offset": sample["__scaler_offset"],
         }
+        wrapped.update(tile_metadata)
+        return wrapped
 
 
 def _build_dataloader(
@@ -258,12 +298,32 @@ def get_dataloaders(
     world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader]:
     distributed = world_size > 1
+    dates_cfg = getattr(config, "dates", {}) or {}
+    validation_cfg = (
+        dates_cfg.get("validation", {})
+        if isinstance(dates_cfg, dict)
+        else getattr(dates_cfg, "validation", {})
+    ) or {}
+    validation_mode = (
+        "validation"
+        if (
+            (validation_cfg.get("start") if isinstance(validation_cfg, dict) else getattr(validation_cfg, "start", None))
+            and (validation_cfg.get("end") if isinstance(validation_cfg, dict) else getattr(validation_cfg, "end", None))
+        )
+        else "training"
+    )
+    if validation_mode == "training":
+        print(
+            "[training] WARNING: dates.validation is absent; using the legacy "
+            "in-sample validation fallback. Add a held-out validation split "
+            "before comparing model checkpoints."
+        )
     train_loader = _build_dataloader(
         config_path, config, "training",
         shuffle=True, distributed=distributed, rank=rank, world_size=world_size,
     )
     val_loader = _build_dataloader(
-        config_path, config, "training",
+        config_path, config, validation_mode,
         shuffle=False, distributed=distributed, rank=rank, world_size=world_size,
     )
     return train_loader, val_loader

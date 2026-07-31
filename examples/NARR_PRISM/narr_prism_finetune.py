@@ -2,7 +2,7 @@
 """CLI entry-point for NARR-to-PRISM fine-tuning.
 
 Usage:
-    python narr_prism_finetune.py --config NARR_PRISM.yaml [--num-gpus 1] [--save-every 5]
+    python narr_prism_finetune.py --config NARR_PRISM_subdomain.yaml [--num-gpus 1] [--save-every 5]
 """
 
 from __future__ import annotations

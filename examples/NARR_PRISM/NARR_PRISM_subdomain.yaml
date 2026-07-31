@@ -110,6 +110,9 @@ data:
   - tmax
   - tmin
   use_static: false
+  # Single source of truth: training/scalars/inference consume only the daily
+  # products generated under preprocessed/<case_name>/<mode>.
+  use_preprocessed: true
   preprocessed_dir: ./examples/NARR_PRISM/preprocessed
   scalar_dir: ./examples/NARR_PRISM/scalars_with_H
   scalers:
@@ -117,18 +120,21 @@ data:
     inputs_std: ./examples/NARR_PRISM/scalars_with_H/inputs_std.npy
     targets_mean: ./examples/NARR_PRISM/scalars_with_H/targets_mean.npy
     targets_std: ./examples/NARR_PRISM/scalars_with_H/targets_std.npy
-  # Full-domain coverage via deterministic fixed-size spatial tiles.
-  # Edge tiles are shifted inward so every sample remains 256x256.
+  # Match inference geometry: overlapping 256-pixel output cores are trained
+  # with 32 pixels of predictor context on every side.
   train_crop_size_lat: 256
   train_crop_size_lon: 256
   training_spatial_sampling: tiled
-  training_tile_stride_lat: 256
-  training_tile_stride_lon: 256
+  training_tile_stride_lat: 192
+  training_tile_stride_lon: 192
+  training_halo_lat: 32
+  training_halo_lon: 32
   min_valid_target_fraction: 1.0e-04
   max_crop_retries: 32
   skip_empty_target_tiles: true
   n_input_timestamps: 1
-  regrid_method: bilinear
+  # NARR is curvilinear; use piecewise-linear Delaunay barycentric weights.
+  regrid_method: linear
   scalar_stride: 1
   spatial_subset:
     enabled: true
@@ -143,6 +149,9 @@ data:
 dates:
   training:
     start: '1996-01-01'
+    end: '2013-12-31'
+  validation:
+    start: '2014-01-01'
     end: '2015-12-31'
   inference:
     start: '2016-01-01'
@@ -216,7 +225,7 @@ model:
   - 2
   downscaling_embed_dim: 512
   encoder_decoder_type: conv
-  encoder_decoder_upsampling_mode: pixel_shuffle
+  encoder_decoder_upsampling_mode: bilinear
   encoder_decoder_kernel_size_per_stage:
   - - 3
   - - 3
@@ -225,8 +234,17 @@ model:
   - - 3
   encoder_decoder_conv_channels: 128
   residual_connection: true
+  # Correct the historical UNET bug that discarded the shallow residual before
+  # conv_after_backbone. Legacy configs omit this key to preserve old checkpoints.
+  backbone_residual_mode: pre_conv_add
   encoder_shift: false
   unet: true
+  # Elevation and predictor masks already live on the PRISM grid in x. Route
+  # those native-resolution features through the UNET skips instead of zeros.
+  decoder_skip_source: dynamic
+  # Bound attention to globally aligned 16x16 mask units. Legacy global
+  # attention changes with tile contents and cannot satisfy tiled/full equality.
+  backbone_attention_scope: windowed_local
   decoder_upsampling_mode: bilinear
   output_scaler_resize_mode: bilinear
   output_scaler_align_corners: false
@@ -248,7 +266,7 @@ dl_prefetch_size: 1
 learning_rate: 1.0e-05
 max_grad_norm: 1.0
 limit_steps_train: 100000
-limit_steps_valid: 10
+limit_steps_valid: 100
 min_lr: 1.0e-06
 max_lr: 0.0001
 warm_up_steps: 0
@@ -278,7 +296,7 @@ training:
   num_gpus: 2
   per_device_batch_size: 1
   gradient_accumulation_steps: 32
-  auto_resume_if_checkpoint_exists: true
+  auto_resume_if_checkpoint_exists: false
 gradient_accumulation_steps: 32
 loss:
   base: rmse
@@ -357,9 +375,12 @@ inference:
   boundary_mitigation:
     enabled: true
     tile_size:
-    - 96
-    - 96
+    - 256
+    - 256
     overlap:
+    - 64
+    - 64
+    halo:
     - 32
     - 32
     blend_mode: hann
@@ -379,8 +400,16 @@ inference:
   inference_overlap:
   - 64
   - 64
+  inference_halo:
+  - 32
+  - 32
   inference_blend_window: hann
   inference_blend_sigma: 0.35
+  diagnostics:
+    enabled: true
+    max_days: 1
+    predictor_channels:
+    - 0
   force_full_frame: false
   use_seam_deblocking: false
   seam_deblocking_strength: 0.1
@@ -391,5 +420,5 @@ precip_lambda_occurrence: 1.0
 precip_lambda_amount: 1.0
 precip_amount_loss_type: smoothl1
 resume_training: true
-resume_checkpoint_path: ./examples/NARR_PRISM/experiments/checkpoints/narr_prism_LA_county/last.ckpt
-auto_resume_if_checkpoint_exists: true
+resume_checkpoint_path: /data/granite-wxc/examples/NARR_PRISM/experiments/checkpoints/narr_prism_California/last.ckpt
+auto_resume_if_checkpoint_exists: false

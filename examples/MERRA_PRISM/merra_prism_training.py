@@ -4,7 +4,7 @@ Closely mirrors the CORDEX_ML training logic but loads data through
 the MERRA_PRISM dataset and uses the MERRA_PRISM YAML configuration.
 
 Usage (via merra_prism_finetune.py):
-    python merra_prism_finetune.py --config MERRA_PRISM.yaml
+    python merra_prism_finetune.py --config MERRA_PRISM_subdomain.yaml
 """
 
 from __future__ import annotations
@@ -195,18 +195,36 @@ class _WrappedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.base[idx]
         x_full = sample["x"]  # (C_dyn [+ num_static], H_in, W_in)
+        # Preserve domain-frame normalization offsets and halo/core geometry.
+        # Dropping __scaler_offset previously made every MERRA crop resize the
+        # entire spatial PRISM climatology to 256x256 instead of taking its own
+        # geographic slice.
+        tile_metadata = {
+            key: sample[key]
+            for key in (
+                "__scaler_offset",
+                "__input_scaler_offset",
+                "__output_scaler_offset",
+                "__output_crop",
+            )
+            if key in sample
+        }
 
         if self.num_static_channels > 0 and self._static_y is not None:
             x_dyn = x_full[: -self.num_static_channels]
             static_x = x_full[-self.num_static_channels:]
-            return {
+            wrapped = {
                 "x": self._pad_to_multiple(x_dyn),
                 "y": sample["y"],
                 "static_x": self._pad_to_multiple(static_x),
                 "static_y": self._static_y,
             }
+            wrapped.update(tile_metadata)
+            return wrapped
 
-        return {"x": self._pad_to_multiple(x_full), "y": sample["y"]}
+        wrapped = {"x": self._pad_to_multiple(x_full), "y": sample["y"]}
+        wrapped.update(tile_metadata)
+        return wrapped
 
 
 def _build_dataloader(
@@ -236,14 +254,22 @@ def _build_dataloader(
 
     batch_size = int(getattr(config, "batch_size", 1))
     num_workers = int(getattr(config, "dl_num_workers", 0))
-    return DataLoader(
+    loader_kwargs: Dict[str, Any] = dict(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=bool(getattr(config, "dl_pin_memory", torch.cuda.is_available())),
     )
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(
+            getattr(config, "dl_persistent_workers", True)
+        )
+        prefetch_factor = int(getattr(config, "dl_prefetch_size", 2) or 0)
+        if prefetch_factor > 0:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(**loader_kwargs)
 
 
 def get_dataloaders(
@@ -253,12 +279,32 @@ def get_dataloaders(
     world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader]:
     distributed = world_size > 1
+    dates_cfg = getattr(config, "dates", {}) or {}
+    validation_cfg = (
+        dates_cfg.get("validation", {})
+        if isinstance(dates_cfg, dict)
+        else getattr(dates_cfg, "validation", {})
+    ) or {}
+    validation_mode = (
+        "validation"
+        if (
+            (validation_cfg.get("start") if isinstance(validation_cfg, dict) else getattr(validation_cfg, "start", None))
+            and (validation_cfg.get("end") if isinstance(validation_cfg, dict) else getattr(validation_cfg, "end", None))
+        )
+        else "training"
+    )
+    if validation_mode == "training":
+        print(
+            "[training] WARNING: dates.validation is absent; using the legacy "
+            "in-sample validation fallback. Add a held-out validation split "
+            "before comparing model checkpoints."
+        )
     train_loader = _build_dataloader(
         config_path, config, "training",
         shuffle=True, distributed=distributed, rank=rank, world_size=world_size,
     )
     val_loader = _build_dataloader(
-        config_path, config, "training",
+        config_path, config, validation_mode,
         shuffle=False, distributed=distributed, rank=rank, world_size=world_size,
     )
     return train_loader, val_loader

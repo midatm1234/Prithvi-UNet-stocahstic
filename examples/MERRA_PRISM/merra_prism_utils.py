@@ -314,9 +314,17 @@ def load_elevation(
     if not elevation_file.exists():
         raise FileNotFoundError(f"Elevation file not found: {elevation_file}")
 
+    if (target_lat is None) != (target_lon is None):
+        raise ValueError("target_lat and target_lon must be provided together")
+
     with xr.open_dataset(str(elevation_file)) as ds:
         # Auto-detect variable
-        if var_name and var_name in ds.data_vars:
+        if var_name is not None:
+            if var_name not in ds.data_vars:
+                raise ValueError(
+                    f"Elevation file {elevation_file} does not contain variable "
+                    f"'{var_name}'"
+                )
             da = ds[var_name]
         else:
             candidates = [v for v in ds.data_vars if "elev" in v.lower() or "dem" in v.lower() or "topo" in v.lower()]
@@ -328,21 +336,58 @@ def load_elevation(
 
         # Regrid if target grid provided
         if target_lat is not None and target_lon is not None:
+            target_lat_array = np.asarray(target_lat, dtype=np.float64)
+            target_lon_array = np.asarray(target_lon, dtype=np.float64)
+            if target_lat_array.ndim != 1 or target_lon_array.ndim != 1:
+                raise ValueError("target_lat and target_lon must be one-dimensional")
+            if target_lat_array.size == 0 or target_lon_array.size == 0:
+                raise ValueError("target_lat and target_lon must be non-empty")
+
             lat_candidates = ("lat", "latitude", "y")
             lon_candidates = ("lon", "longitude", "x")
             lat_name = next((n for n in lat_candidates if n in da.dims or n in da.coords), None)
             lon_name = next((n for n in lon_candidates if n in da.dims or n in da.coords), None)
-            if lat_name and lon_name:
-                try:
-                    da = da.interp(
-                        {lat_name: target_lat, lon_name: target_lon},
-                        method="linear",
-                    )
-                except Exception:
-                    pass  # Keep original resolution if regrid fails
+            if lat_name is None or lon_name is None:
+                raise ValueError(
+                    f"Cannot align elevation variable '{da.name}' from "
+                    f"{elevation_file}: no latitude/longitude coordinates"
+                )
+            if lat_name not in da.coords or lon_name not in da.coords:
+                raise ValueError(
+                    f"Cannot align elevation variable '{da.name}' from "
+                    f"{elevation_file}: latitude/longitude coordinates are required"
+                )
+            if da.coords[lat_name].ndim != 1 or da.coords[lon_name].ndim != 1:
+                raise ValueError(
+                    f"Cannot align elevation variable '{da.name}' from "
+                    f"{elevation_file}: latitude/longitude coordinates must be "
+                    "one-dimensional"
+                )
+
+            try:
+                da = da.interp(
+                    {lat_name: target_lat_array, lon_name: target_lon_array},
+                    method="linear",
+                )
+                da = da.transpose(lat_name, lon_name)
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to interpolate elevation variable '{da.name}' from "
+                    f"{elevation_file} to target grid "
+                    f"({target_lat_array.size}, {target_lon_array.size})"
+                ) from exc
 
         arr = da.values.astype(np.float32)
         arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-        if arr.ndim == 1:
-            raise ValueError("Elevation field is 1-D; expected a 2-D lat/lon grid")
+        if arr.ndim != 2:
+            raise ValueError(
+                f"Elevation field has shape {arr.shape}; expected a 2-D lat/lon grid"
+            )
+        if target_lat is not None and target_lon is not None:
+            expected_shape = (target_lat_array.size, target_lon_array.size)
+            if arr.shape != expected_shape:
+                raise ValueError(
+                    f"Interpolated elevation shape {arr.shape} does not match "
+                    f"target grid {expected_shape}"
+                )
         return arr

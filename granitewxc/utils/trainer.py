@@ -8,7 +8,8 @@ import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
 from torch import autocast
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+from tqdm.auto import tqdm as auto_tqdm
+from tqdm.std import tqdm as terminal_tqdm
 from time import time
 
 from granitewxc.utils.distributed import is_main_process
@@ -45,7 +46,18 @@ def _loader_step_count(loader: DataLoader, limit_steps: int = 0) -> int:
 def _make_epoch_pbar(desc: str, total: int, colour: str):
     if not is_main_process():
         return None
-    return tqdm(
+    # Headless notebook runners normally make ``tqdm.auto`` choose a Jupyter
+    # display widget. Papermill stores those display updates in the executed
+    # notebook instead of emitting a useful live terminal progress bar. The
+    # tmux launcher opts into the plain-text renderer through this environment
+    # variable; interactive notebooks retain their normal automatic renderer.
+    tqdm_cls = (
+        terminal_tqdm
+        if os.environ.get("GRANITEWXC_TQDM_MODE", "").strip().lower()
+        in {"terminal", "text"}
+        else auto_tqdm
+    )
+    return tqdm_cls(
         total=total,
         unit="batch",
         colour=colour,
@@ -320,7 +332,9 @@ def batch_step(
     local_rank: int,
 ):
     if gpu:
-        batch = {k: v.to(local_rank) for k, v in batch.items()}
+        # Pinned DataLoader batches can overlap their host-to-device copy with
+        # GPU work.  ``non_blocking`` is harmless for non-pinned tensors.
+        batch = {k: v.to(local_rank, non_blocking=True) for k, v in batch.items()}
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         with autocast(device_type="cuda", dtype=dtype):
             prediction = model(batch)
@@ -624,6 +638,17 @@ def save_checkpoint(
         "loss": train_loss,
         "val_loss": curr_val_loss,
     }
+    # PRISM models have coordinate-sensitive scalers, crop offsets, and decoder
+    # skip semantics that are not encoded by tensor shapes. Persist their
+    # contract so resume/inference can reject silently incompatible checkpoints.
+    from granitewxc.utils.prism_checkpoint import (
+        CONTRACT_KEY,
+        build_prism_checkpoint_contract,
+    )
+
+    prism_contract = build_prism_checkpoint_contract(config)
+    if prism_contract is not None:
+        state_dict[CONTRACT_KEY] = prism_contract
     if sche_dict is not None:
         state_dict["scheduler"] = sche_dict
     if scaler is not None:
@@ -705,6 +730,10 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
             raise ValueError(
                 f"Expected a dictionary checkpoint when resuming, got {type(checkpoint)!r}"
             )
+
+        from granitewxc.utils.prism_checkpoint import validate_prism_checkpoint_contract
+
+        validate_prism_checkpoint_contract(config, checkpoint, role="resume")
 
         model_state = checkpoint.get("model", checkpoint)
         if not isinstance(model_state, dict):

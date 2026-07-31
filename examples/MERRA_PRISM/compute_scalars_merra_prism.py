@@ -4,7 +4,7 @@ Statistics are computed **only** over the YAML-defined training period so that
 the same scalars can be reused consistently during training and inference.
 
 Usage:
-    python compute_scalars_merra_prism.py --config MERRA_PRISM.yaml
+    python compute_scalars_merra_prism.py --config MERRA_PRISM_subdomain.yaml
 """
 
 from __future__ import annotations
@@ -50,6 +50,13 @@ except ImportError:
     build_predictand_specs = None
 
 from granitewxc.utils import normalization as norm
+from granitewxc.utils import prism_grid as prism_grid_contract
+from granitewxc.utils import prism_preprocessed
+from granitewxc.utils.streaming_quantile import (
+    StreamingHistogramQuantile,
+    percentile_probability,
+    resolve_divide_only_scale,
+)
 
 EPS = 1e-6
 
@@ -59,7 +66,7 @@ def parse_args() -> argparse.Namespace:
         description="Compute per-channel scalars for MERRA-PRISM training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", required=True, help="Path to MERRA_PRISM.yaml")
+    parser.add_argument("--config", required=True, help="Path to MERRA_PRISM_subdomain.yaml")
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -178,6 +185,7 @@ def _load_target_arrays(
     target_maps: Dict[str, Dict[Any, Path]],
     target_variables: Sequence[str],
     sample_date: Any,
+    canonical_grid: prism_grid_contract.CanonicalPrismGrid,
     lat_slice: slice = slice(None),
     lon_slice: slice = slice(None),
 ) -> np.ndarray:
@@ -190,9 +198,31 @@ def _load_target_arrays(
             da = ds[dvar]
             if "time" in da.dims:
                 da = da.isel(time=0, drop=True)
-            arr = da.values.astype(np.float32)
-            if arr.ndim >= 2:
-                arr = arr[lat_slice, lon_slice]
+            lat_name = next(
+                (n for n in ("lat", "latitude", "y") if n in ds.coords),
+                None,
+            )
+            lon_name = next(
+                (n for n in ("lon", "longitude", "x") if n in ds.coords),
+                None,
+            )
+            if lat_name is None or lon_name is None:
+                raise ValueError(f"Cannot find PRISM coordinates in {path}")
+            observed_lat = np.asarray(ds[lat_name].values, dtype=np.float64)[lat_slice]
+            observed_lon = np.asarray(ds[lon_name].values, dtype=np.float64)[lon_slice]
+            prism_grid_contract.assert_grid_matches(
+                canonical_grid,
+                observed_lat,
+                observed_lon,
+                context=f"PRISM target {path}",
+            )
+            if lat_name not in da.dims or lon_name not in da.dims:
+                raise ValueError(
+                    f"PRISM target {path} variable {dvar!r} must use coordinate "
+                    f"dimensions ({lat_name!r}, {lon_name!r}); got {da.dims}"
+                )
+            da = da.transpose(lat_name, lon_name)
+            arr = da.values[lat_slice, lon_slice].astype(np.float32)
             # Preserve PRISM missing cells as NaN so ocean/outside-CONUS pixels
             # do not bias target mean/std toward zero. Only scrub +/-inf.
             arr[np.isinf(arr)] = np.nan
@@ -211,48 +241,113 @@ def compute_scalars(
         raise ImportError("xarray is required")
 
     data_cfg = cfg.get("data", {})
-    predictor_dir = resolve_path(data_cfg["predictor_dir"])
-    target_dir = resolve_path(data_cfg["target_dir"])
+    normalization_cfg = cfg.get("normalization", {}) or {}
+    use_preprocessed = bool(data_cfg.get("use_preprocessed", False))
     predictor_variables = expand_predictor_variables(data_cfg.get("predictor_variables", {}))
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
-
-    validate_target_variables(target_dir, target_variables)
+    preprocessed_predictor_names = [
+        prism_preprocessed.predictor_name(var, level)
+        for var, level in predictor_variables
+    ]
+    preprocessed_target_names = [
+        prism_preprocessed.target_name(var) for var in target_variables
+    ]
+    include_elevation = bool(data_cfg.get("static_elevation_file"))
+    preprocessed_required_variables = [
+        *preprocessed_predictor_names,
+        *preprocessed_target_names,
+    ]
+    if include_elevation:
+        preprocessed_required_variables.append("static_elevation")
 
     # Always use training dates for scalar computation
     start, end = parse_date_range_from_config(cfg, "training")
     print(f"[scalars] computing over training period: {start} → {end}")
 
-    # Discover files
-    merra_files = discover_merra2_files(predictor_dir, start, end)
-    prism_files = discover_all_prism_targets(target_dir, target_variables, start, end)
-
-    if not merra_files:
-        raise RuntimeError(f"No MERRA2 files found in {predictor_dir} for {start}–{end}")
-
-    # Align dates
-    predictor_dates = [d for d, _ in merra_files]
-    target_date_maps_dates = {
-        var: [d for d, _ in fl] for var, fl in prism_files.items()
-    }
-    aligned_dates = align_dates(predictor_dates, target_date_maps_dates)
+    preprocessed_map: Dict[Any, Path] = {}
+    pred_map: Dict[Any, Path] = {}
+    target_maps: Dict[str, Dict[Any, Path]] = {}
+    if use_preprocessed:
+        aligned_dates = prism_preprocessed.inclusive_daily_dates(start, end)
+        preprocessed_dir = norm.case_preprocess_dir(cfg) / "training"
+        preprocessed_map = prism_preprocessed.require_daily_products(
+            preprocessed_dir, "merra_prism", aligned_dates
+        )
+        canonical_grid = prism_grid_contract.load_canonical_grid(
+            norm.case_preprocess_dir(cfg), required=True
+        )
+        assert canonical_grid is not None
+        fine_lat, fine_lon = canonical_grid.lat, canonical_grid.lon
+        lat_slice, lon_slice = slice(None), slice(None)
+        print(
+            f"[scalars] strict preprocessed source: {preprocessed_dir} "
+            f"({len(aligned_dates)} required daily products; raw fallback disabled)"
+        )
+    else:
+        predictor_dir = resolve_path(data_cfg["predictor_dir"])
+        target_dir = resolve_path(data_cfg["target_dir"])
+        validate_target_variables(target_dir, target_variables)
+        merra_files = discover_merra2_files(predictor_dir, start, end)
+        prism_files = discover_all_prism_targets(
+            target_dir, target_variables, start, end
+        )
+        if not merra_files:
+            raise RuntimeError(
+                f"No MERRA2 files found in {predictor_dir} for {start}–{end}"
+            )
+        predictor_dates = [d for d, _ in merra_files]
+        target_date_maps_dates = {
+            var: [d for d, _ in fl] for var, fl in prism_files.items()
+        }
+        aligned_dates = align_dates(predictor_dates, target_date_maps_dates)
+        if not aligned_dates:
+            raise RuntimeError("No aligned dates — cannot compute scalars")
+        pred_map = {d: p for d, p in merra_files}
+        target_maps = {
+            var: {d: p for d, p in fl} for var, fl in prism_files.items()
+        }
     print(f"[scalars] {len(aligned_dates)} aligned dates")
-
-    if not aligned_dates:
-        raise RuntimeError("No aligned dates — cannot compute scalars")
-
-    pred_map = {d: p for d, p in merra_files}
-    target_maps = {var: {d: p for d, p in fl} for var, fl in prism_files.items()}
 
     # PRISM (fine) grid, strided for fast-but-representative scalar estimation.
     # Predictors are regridded onto these coords (co-registered with targets) so
     # input scalars match what the dataset feeds the model.
     stride = int(data_cfg.get("scalar_stride", 8))
     predictands_cfg = cfg.get("predictands", {})
+    histogram_maximum = float(
+        normalization_cfg.get("quantile_histogram_maximum", 512.0)
+    )
+    histogram_bins = int(normalization_cfg.get("quantile_histogram_bins", 65536))
+    quantile_accumulators: Dict[int, StreamingHistogramQuantile] = {}
+    for ch_idx, var in enumerate(target_variables):
+        var_cfg = predictands_cfg.get(var, {}) or {}
+        scaling_cfg = var_cfg.get("scaling", {}) or {}
+        norm_cfg = var_cfg.get("normalization", {}) or {}
+        method = str(
+            scaling_cfg.get("method", norm_cfg.get("method", "zscore"))
+        ).lower()
+        default_scale_stat = "p95" if method == "divide_only" else "mean"
+        scale_stat = str(
+            norm_cfg.get(
+                "scale_stat", scaling_cfg.get("scale_stat", default_scale_stat)
+            )
+        ).lower()
+        if method == "divide_only" and scale_stat.startswith("p"):
+            percentile_probability(scale_stat)
+            quantile_accumulators[ch_idx] = StreamingHistogramQuantile(
+                maximum=histogram_maximum,
+                bins=histogram_bins,
+            )
     use_target_gridpoint = any(
         ((predictands_cfg.get(var, {}) or {}).get("normalization", {}) or {}).get("mode")
         == "gridpoint"
         for var in target_variables
     )
+    if quantile_accumulators and stride != 1:
+        print(
+            "[scalars] percentile scaling requires every training-period pixel; "
+            f"overriding scalar_stride={stride} to 1"
+        )
+        stride = 1
     if use_target_gridpoint and stride != 1:
         # Per-gridpoint TARGET scalers are a native-resolution climatology; a
         # strided (coarse) estimate would reintroduce block artifacts. Force
@@ -262,24 +357,92 @@ def compute_scalars(
             f"scalar_stride={stride} to 1 for a full-resolution target climatology"
         )
         stride = 1
-    first_tpath = target_maps[target_variables[0]][aligned_dates[0]]
-    with xr.open_dataset(str(first_tpath)) as _tds:
-        _latn = next((n for n in ("lat", "latitude", "y") if n in _tds.coords), "lat")
-        _lonn = next((n for n in ("lon", "longitude", "x") if n in _tds.coords), "lon")
-        fine_lat = _tds[_latn].values.astype(np.float64)
-        fine_lon = _tds[_lonn].values.astype(np.float64)
-    lat_slice, lon_slice = _spatial_subset_slices(fine_lat, fine_lon, data_cfg)
-    fine_lat = fine_lat[lat_slice]
-    fine_lon = fine_lon[lon_slice]
+    if not use_preprocessed:
+        first_tpath = target_maps[target_variables[0]][aligned_dates[0]]
+        with xr.open_dataset(str(first_tpath)) as _tds:
+            _latn = next(
+                (n for n in ("lat", "latitude", "y") if n in _tds.coords),
+                "lat",
+            )
+            _lonn = next(
+                (n for n in ("lon", "longitude", "x") if n in _tds.coords),
+                "lon",
+            )
+            fine_lat = _tds[_latn].values.astype(np.float64)
+            fine_lon = _tds[_lonn].values.astype(np.float64)
+        lat_slice, lon_slice = _spatial_subset_slices(
+            fine_lat, fine_lon, data_cfg
+        )
+        fine_lat = fine_lat[lat_slice]
+        fine_lon = fine_lon[lon_slice]
+        canonical_grid = prism_grid_contract.ensure_canonical_grid(
+            norm.case_preprocess_dir(cfg),
+            fine_lat,
+            fine_lon,
+            source=str(first_tpath),
+            context="MERRA scalar target grid",
+        )
+        fine_lat, fine_lon = canonical_grid.lat, canonical_grid.lon
     sub_lat = fine_lat[::stride]
     sub_lon = fine_lon[::stride]
     print(f"[scalars] estimating on strided PRISM grid {sub_lat.size}x{sub_lon.size} (stride={stride})")
+    print(
+        f"[scalars] canonical PRISM grid fingerprint="
+        f"{canonical_grid.fingerprint[:12]}"
+    )
+    expected_preprocessing_fields: Dict[str, Any] = {}
+    split_preprocessing_signature: Optional[str] = None
+    predictor_preprocessing_signature: Optional[str] = None
+    training_source_artifact_signatures: Dict[str, str] = {}
+    if use_preprocessed:
+        expected_preprocessing_fields = (
+            prism_preprocessed.preprocessing_config_fields(
+                data_type="merra_prism",
+                predictor_variables=predictor_variables,
+                target_variables=target_variables,
+                include_targets=True,
+                regrid_method=str(data_cfg.get("regrid_method", "bilinear")),
+                canonical_grid_fingerprint=canonical_grid.fingerprint,
+                static_elevation_required=include_elevation,
+                static_elevation_variable=data_cfg.get("static_elevation_var"),
+            )
+        )
 
     # Load static elevation regridded onto the strided PRISM grid.
     elev_file = data_cfg.get("static_elevation_file", None)
     elev_var = data_cfg.get("static_elevation_var", None)
     elevation_arr: Optional[np.ndarray] = None
-    if elev_file:
+    if use_preprocessed:
+        first_date = aligned_dates[0]
+        first_product = preprocessed_map[first_date]
+        with xr.open_dataset(str(first_product)) as ds:
+            lat_name, lon_name = prism_preprocessed.validate_daily_product(
+                ds,
+                first_product,
+                canonical_grid,
+                mode="training",
+                sample_date=first_date,
+                required_variables=preprocessed_required_variables,
+                expected_preprocessing_fields=expected_preprocessing_fields,
+            )
+            split_preprocessing_signature = str(
+                ds.attrs[prism_preprocessed.PREPROCESSING_SIGNATURE_ATTR]
+            )
+            predictor_preprocessing_signature = str(
+                ds.attrs[
+                    prism_preprocessed.PREDICTOR_PREPROCESSING_SIGNATURE_ATTR
+                ]
+            )
+            if include_elevation:
+                elevation_arr = prism_preprocessed.read_spatial_variable(
+                    ds,
+                    "static_elevation",
+                    lat_name,
+                    lon_name,
+                    lat_slice=slice(None, None, stride),
+                    lon_slice=slice(None, None, stride),
+                )
+    elif elev_file:
         elev_path = resolve_path(elev_file)
         if elev_path.exists():
             elevation_arr = load_elevation(
@@ -309,11 +472,76 @@ def compute_scalars(
     y_grid_count: Optional[np.ndarray] = None
 
     for idx, sample_date in enumerate(aligned_dates):
-        # Predictors regridded onto the strided PRISM grid (co-registered).
-        x = _load_predictor_arrays(pred_map[sample_date], predictor_variables, sub_lat, sub_lon)
+        if use_preprocessed:
+            product = preprocessed_map[sample_date]
+            with xr.open_dataset(str(product)) as ds:
+                lat_name, lon_name = prism_preprocessed.validate_daily_product(
+                    ds,
+                    product,
+                    canonical_grid,
+                    mode="training",
+                    sample_date=sample_date,
+                    required_variables=preprocessed_required_variables,
+                    expected_preprocessing_fields=expected_preprocessing_fields,
+                    expected_preprocessing_signature=split_preprocessing_signature,
+                )
+                training_source_artifact_signatures[str(sample_date)] = str(
+                    ds.attrs[prism_preprocessed.SOURCE_ARTIFACT_SIGNATURE_ATTR]
+                )
+                grid_slice = slice(None, None, stride)
+                x_arrays = [
+                    prism_preprocessed.read_spatial_variable(
+                        ds,
+                        name,
+                        lat_name,
+                        lon_name,
+                        lat_slice=grid_slice,
+                        lon_slice=grid_slice,
+                    )
+                    for name in preprocessed_predictor_names
+                ]
+                if include_elevation:
+                    x_arrays.append(
+                        prism_preprocessed.read_spatial_variable(
+                            ds,
+                            "static_elevation",
+                            lat_name,
+                            lon_name,
+                            lat_slice=grid_slice,
+                            lon_slice=grid_slice,
+                        )
+                    )
+                x = np.stack(x_arrays, axis=0)
+                y = np.stack(
+                    [
+                        prism_preprocessed.read_spatial_variable(
+                            ds,
+                            name,
+                            lat_name,
+                            lon_name,
+                            lat_slice=grid_slice,
+                            lon_slice=grid_slice,
+                        )
+                        for name in preprocessed_target_names
+                    ],
+                    axis=0,
+                )
+        else:
+            x = _load_predictor_arrays(
+                pred_map[sample_date], predictor_variables, sub_lat, sub_lon
+            )
+            y = _load_target_arrays(
+                target_maps,
+                target_variables,
+                sample_date,
+                canonical_grid,
+                lat_slice=lat_slice,
+                lon_slice=lon_slice,
+            )
+            y = y[:, ::stride, ::stride]
 
-        # Append elevation as the last channel (already on the strided grid).
-        if elevation_arr is not None:
+        # Append raw-source elevation; preprocessed products already supplied it.
+        if elevation_arr is not None and not use_preprocessed:
             x = np.concatenate([x, elevation_arr.astype(np.float32)[np.newaxis]], axis=0)
 
         # NaN-aware accumulation: below-surface (high-terrain) pressure-level
@@ -325,15 +553,9 @@ def compute_scalars(
         x_sumsq += np.nansum(np.where(x_valid, x_flat ** 2, 0.0), axis=1)
         x_count += x_valid.sum(axis=1)
 
-        # Targets subsampled on the same strided grid (PRISM is NaN over ocean).
-        y = _load_target_arrays(
-            target_maps,
-            target_variables,
-            sample_date,
-            lat_slice=lat_slice,
-            lon_slice=lon_slice,
-        )
-        y = y[:, ::stride, ::stride]
+        # Targets use the same strided native PRISM grid as predictors.
+        for ch_idx, accumulator in quantile_accumulators.items():
+            accumulator.update(y[ch_idx])
         y_flat = y.reshape(n_tgt, -1).astype(np.float64)
         y_valid = np.isfinite(y_flat)
         y_sum += np.nansum(np.where(y_valid, y_flat, 0.0), axis=1)
@@ -394,7 +616,7 @@ def compute_scalars(
 
     # Apply predictand-aware target scaling. This MUST run regardless of whether
     # any variable uses gridpoint normalization: e.g. ppt uses divide_only/global
-    # (mean forced to 0, std = mean) and tmax/tmin use zscore/global. Previously
+    # (mean forced to 0, scale = configured p95) and tmax/tmin use zscore. Previously
     # this whole block was gated behind `use_gridpoint`, so in the all-global
     # configuration ppt kept its raw mean (~1.2) instead of 0, breaking the
     # model's divide_only output scaler.
@@ -407,6 +629,7 @@ def compute_scalars(
     final_targets_mean = targets_mean.copy()
     final_targets_std = targets_std.copy()
     gridpoint_channels: List[int] = []
+    scaling_statistics: Dict[str, Any] = {}
 
     for ch_idx, var in enumerate(target_variables):
         var_cfg = predictands_cfg.get(var, {})
@@ -414,10 +637,18 @@ def compute_scalars(
         norm_cfg = var_cfg.get("normalization", {}) or {}
         # The active method comes from scaling.method (divide_only|zscore); fall
         # back to the normalization.method for older configs.
-        method = scaling_cfg.get("method", norm_cfg.get("method", "zscore"))
+        method = str(
+            scaling_cfg.get("method", norm_cfg.get("method", "zscore"))
+        ).lower()
         if method == "standardize":
             method = "zscore"
         mode = norm_cfg.get("mode", "global")
+        default_scale_stat = "p95" if method == "divide_only" else "mean"
+        scale_stat = str(
+            norm_cfg.get(
+                "scale_stat", scaling_cfg.get("scale_stat", default_scale_stat)
+            )
+        ).lower()
         eps = max(float(norm_cfg.get("eps_std", EPS)), EPS)
 
         if mode == "gridpoint" and method == "divide_only":
@@ -429,13 +660,33 @@ def compute_scalars(
             )
 
         if method == "divide_only":
-            # Divide-only channels (ppt): centre at 0, scale by the mean so the
-            # model's get_scalers divide_only guard (target_mu == 0) holds.
+            fixed_scale = scaling_cfg.get(
+                "fixed_scale", norm_cfg.get("fixed_scale")
+            )
+            if fixed_scale is not None:
+                fixed_scale = float(fixed_scale)
+            resolved_scale, scale_provenance = resolve_divide_only_scale(
+                scale_stat,
+                training_mean=float(targets_mean[ch_idx]),
+                finite_count=int(y_count[ch_idx]),
+                epsilon=eps,
+                fixed_scale=fixed_scale,
+                quantile_accumulator=quantile_accumulators.get(ch_idx),
+            )
+            # Divide-only channels are centred at zero and scaled by their
+            # configured training statistic (p95 for hurdle precipitation).
             final_targets_mean[ch_idx] = 0.0
-            final_targets_std[ch_idx] = max(float(targets_mean[ch_idx]), eps)
+            final_targets_std[ch_idx] = resolved_scale
+            scaling_statistics[var] = scale_provenance
         else:  # zscore / standardize -> per-channel global scalar
             final_targets_mean[ch_idx] = targets_mean[ch_idx]
             final_targets_std[ch_idx] = max(float(targets_std[ch_idx]), eps)
+            scaling_statistics[var] = {
+                "scale_stat": "mean_std",
+                "mean": float(final_targets_mean[ch_idx]),
+                "std": float(final_targets_std[ch_idx]),
+                "finite_count": int(y_count[ch_idx]),
+            }
 
         if mode == "gridpoint":
             gridpoint_channels.append(ch_idx)
@@ -482,6 +733,13 @@ def compute_scalars(
         f"= {inputs_mean.shape[0]} total"
     )
 
+    training_source_artifact_split_signature = (
+        prism_preprocessed.split_source_artifact_signature(
+            training_source_artifact_signatures
+        )
+        if use_preprocessed
+        else None
+    )
     return {
         "inputs_mean": inputs_mean,
         "inputs_std": inputs_std,
@@ -494,6 +752,14 @@ def compute_scalars(
         "input_pixel_count": x_count.tolist(),
         "target_pixel_count": y_count.tolist(),
         "target_grid_sample_count": len(aligned_dates),
+        "scaling_statistics": scaling_statistics,
+        "predictor_preprocessing_signature": predictor_preprocessing_signature,
+        norm.TRAINING_SOURCE_ARTIFACT_SIGNATURES_KEY: (
+            training_source_artifact_signatures
+        ),
+        norm.TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY: (
+            training_source_artifact_split_signature
+        ),
     }
 
 
@@ -555,6 +821,7 @@ def main() -> None:
         "target_channels": int(stats["targets_mean"].shape[0]) if stats["targets_mean"].ndim >= 1 else 0,
         "input_pixel_count": stats["input_pixel_count"],
         "target_pixel_count": stats["target_pixel_count"],
+        "scaling_statistics": stats["scaling_statistics"],
         "summary": {
             "inputs_mean": _compact_summary(stats["inputs_mean"]),
             "inputs_std": _compact_summary(stats["inputs_std"]),
@@ -579,7 +846,20 @@ def main() -> None:
         output_dir,
         case_name=norm.get_case_name(cfg),
         predictor_mode=str((cfg.get("normalization", {}) or {}).get("predictor_mode", "global")),
+        cfg=cfg,
         train_date_range=train_range,
+        extra={
+            "scaling_statistics": stats["scaling_statistics"],
+            "predictor_preprocessing_signature": stats[
+                "predictor_preprocessing_signature"
+            ],
+            norm.TRAINING_SOURCE_ARTIFACT_SIGNATURES_KEY: stats[
+                norm.TRAINING_SOURCE_ARTIFACT_SIGNATURES_KEY
+            ],
+            norm.TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY: stats[
+                norm.TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY
+            ],
+        },
     )
     print(f"[scalars] normalization manifest → {manifest_path}")
     print("[scalars] done.")

@@ -4,10 +4,11 @@ This directory contains a complete YAML-driven workflow for statistical
 downscaling of **MERRA2** reanalysis predictors to the **PRISM** 800 m
 daily observation grid over the contiguous United States.
 
-The pipeline follows the same pattern as the CORDEX_ML workflow:
+The pipeline follows a strict, case-scoped artifact contract:
 
 ```
-compute scalars → preprocessing / regridding → training / fine-tuning → inference
+training preprocessing → training-only scalars → validation/inference preprocessing
+→ training / fine-tuning → tiled inference → evaluation
 ```
 
 ---
@@ -39,7 +40,7 @@ Example file path:
 
 ---
 
-## YAML Configuration (`MERRA_PRISM.yaml`)
+## YAML Configuration (`MERRA_PRISM_subdomain.yaml`)
 
 All paths, variables, date ranges, model parameters, and training
 hyper-parameters are controlled by a single YAML file.
@@ -56,7 +57,10 @@ hyper-parameters are controlled by a single YAML file.
 | `data.scalar_dir` | Legacy scalar location (read-only, same-case fallback only); new scalars are written under `<preprocessed_dir>/<case_name>/scalars/` |
 | `data.scalers.*` | Paths to the four `.npy` scalar files |
 | `dates.training.start / end` | Training date range |
+| `dates.validation.start / end` | Optional held-out validation date range |
 | `dates.inference.start / end` | Inference date range |
+| `preprocess.*` | Controls target inclusion in each preprocessed split |
+| `normalization.*` | Predictor and target normalization contract |
 | `case_name` | Required run/case name used as an output subfolder |
 | `predictands.*` | Per-variable normalization & loss options |
 | `model.*` | Architecture hyper-parameters |
@@ -72,54 +76,44 @@ hyper-parameters are controlled by a single YAML file.
 
 ## Workflow Steps
 
-### 1. Compute Scalars
+### 1. Preprocess and Compute Scalars
 
-Compute channel-wise mean and standard deviation over the **training period only**.
+Use the launcher to generate training products, recompute scalars from those
+products, then generate optional validation and inference products in the
+required order:
 
 ```bash
 cd examples/MERRA_PRISM
 
-python compute_scalars_merra_prism.py \
-    --config MERRA_PRISM.yaml
+bash run_preprocess.sh \
+    --config MERRA_PRISM_subdomain.yaml \
+    --shards 1
 ```
 
-Optional flags:
-- `--output-dir <dir>` — override the scalar output directory.
-- `--progress-interval 100` — log every N dates.
+Use `--overwrite` to rebuild existing daily NetCDF products. Scalars are always
+recomputed. `--shards N` partitions dates across parallel preprocessing
+processes without changing the resulting artifact contract.
 
 **Outputs:** `inputs_mean.npy`, `inputs_std.npy`, `targets_mean.npy`,
 `targets_std.npy`, and `metadata.json` in `<preprocessed_dir>/<case_name>/scalars/`.
-The directory is **case-scoped**, so recomputing scalars for another
-`case_name` (or another YAML) never overwrites these files.
+The case directory also contains the persisted canonical PRISM coordinate
+contract. Each daily product records preprocessing and source-artifact
+signatures; cache hits are accepted only when those signatures still match.
+
+To run one stage manually, invoke `preproc_merra_prism.py --mode` with
+`training`, `validation`, or `inference`. With `data.use_preprocessed: true`,
+`compute_scalars_merra_prism.py` must run only after all configured
+training products exist; it never falls back to raw data.
 
 ---
 
-### 2. Preprocessing
-
-Align MERRA2 and PRISM by date, regrid MERRA2 to the PRISM grid, and
-save preprocessed NetCDF files.
-
-```bash
-python preproc_merra_prism.py \
-    --config MERRA_PRISM.yaml \
-    --mode both
-```
-
-`--mode` accepts `training`, `inference`, or `both` (default).
-
-**Outputs:** One NetCDF per aligned date in
-`<preprocessed_dir>/<case_name>/training/` and
-`<preprocessed_dir>/<case_name>/inference/`.
-
----
-
-### 3. Training / Fine-Tuning
+### 2. Training / Fine-Tuning
 
 Fine-tune the downscaling model using preprocessed data.
 
 ```bash
 python merra_prism_finetune.py \
-    --config MERRA_PRISM.yaml \
+    --config MERRA_PRISM_subdomain.yaml \
     --num-gpus 1 \
     --save-every 5
 ```
@@ -130,13 +124,13 @@ python merra_prism_finetune.py \
 
 ---
 
-### 4. Inference
+### 3. Inference
 
 Run inference over the YAML-defined inference date range.
 
 ```bash
 python merra_prism_inference.py \
-    --config MERRA_PRISM.yaml \
+    --config MERRA_PRISM_subdomain.yaml \
     [--checkpoint path/to/best.ckpt]
 ```
 
@@ -159,14 +153,33 @@ Optional flags:
 
 ---
 
+### 4. Evaluate Inference
+
+The shared evaluator streams prediction/truth pairs on the exact canonical
+PRISM grid; it does not regrid either field.
+
+```bash
+python ../evaluate_prism_inference.py \
+    --config MERRA_PRISM_subdomain.yaml \
+    --run-label merra_prism
+```
+
+It writes a flat metrics CSV, a provenance-rich JSON report, and a four-panel
+climatology/bias/RMSE PNG. Metrics include RMSE, correlation, overlap-boundary
+gradient error, native-grid boundary error, and spatial block power.
+
+---
+
 ## Expected Outputs Summary
 
 | Step | Output location |
 |------|-----------------|
 | Scalars | `<preprocessed_dir>/<case_name>/scalars/` (`.npy` + `metadata.json`) |
-| Preprocessing | `<preprocessed_dir>/<case_name>/{training,inference}/` |
+| Grid contract | `<preprocessed_dir>/<case_name>/prism_grid.{npz,json}` |
+| Preprocessing | `<preprocessed_dir>/<case_name>/{training,validation,inference}/` |
 | Training | `checkpoint_dir/<case_name>/` |
 | Inference | `inference.output_dir/<case_name>/` |
+| Evaluation | Evaluator `--output-dir` (CSV, JSON, and PNG) |
 
 ---
 
@@ -174,7 +187,8 @@ Optional flags:
 
 | File | Purpose |
 |------|---------|
-| `MERRA_PRISM.yaml` | Master configuration |
+| `MERRA_PRISM_subdomain.yaml` | Master configuration |
+| `run_preprocess.sh` | Ordered, optionally sharded preprocessing/scalar launcher |
 | `merra_prism_utils.py` | Shared helpers (YAML, dates, file discovery) |
 | `merra_prism_dataset.py` | PyTorch Dataset class |
 | `compute_scalars_merra_prism.py` | Normalization statistics |
@@ -182,17 +196,24 @@ Optional flags:
 | `merra_prism_training.py` | Training loop utilities |
 | `merra_prism_finetune.py` | Fine-tuning CLI entry-point |
 | `merra_prism_inference.py` | Inference CLI entry-point |
+| `../evaluate_prism_inference.py` | Shared exact-grid inference evaluator |
 
 ---
 
 ## Notes
 
-- **No wrapper scripts.** Unlike CORDEX_ML, this workflow targets one
-  domain and one model — no `preproc_*_wrapper` scripts are needed.
-- **YAML-driven dates.** Training and inference date ranges are never
-  hard-coded; change them in `MERRA_PRISM.yaml`.
-- **Scalar reuse.** The same scalars computed over the training period
-  are used for both training normalisation and inference denormalization.
+- **YAML-driven dates.** Training, validation, and inference date ranges are
+  never hard-coded; change them in `MERRA_PRISM_subdomain.yaml`.
+- **Strict artifact reuse.** Training, validation, and inference consume only
+  signed daily products from the active case. Scalar manifests bind channel
+  order, normalization semantics, training dates, source artifacts, and the
+  exact PRISM coordinate fingerprint.
+- **Checkpoint compatibility.** New checkpoints persist the coordinate-sensitive
+  PRISM contract. Resume and inference reject incompatible grids, scalars,
+  preprocessing signatures, crop geometry, or decoder semantics.
+- **Halo-aware tiling.** Training and inference use overlapping output cores
+  with predictor context halos. Windowed-local attention and blend windows keep
+  tiled predictions spatially aligned while reducing seam artifacts.
 - **Case isolation.** Every preprocessing artifact (scalars, normalized
   predictors/targets, cached/tiled outputs) is written under
   `<preprocessed_dir>/<case_name>/`, so preprocessing one case (or YAML)

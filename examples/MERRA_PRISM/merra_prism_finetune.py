@@ -2,7 +2,7 @@
 """CLI entry-point for MERRA2-to-PRISM fine-tuning.
 
 Usage:
-    python merra_prism_finetune.py --config MERRA_PRISM.yaml [--num-gpus 1] [--save-every 5]
+    python merra_prism_finetune.py --config MERRA_PRISM_subdomain.yaml [--num-gpus 1] [--save-every 5]
 """
 
 from __future__ import annotations

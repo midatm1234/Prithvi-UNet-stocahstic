@@ -35,6 +35,9 @@ from merra_prism_utils import (
 )
 
 from granitewxc.utils import normalization as norm
+from granitewxc.utils import prism_grid as prism_grid_contract
+from granitewxc.utils import prism_preprocessed
+from granitewxc.utils.prism_tiling import TilePlan, halo_crop_slices, pad_spatial_context
 
 
 PathLike = Union[str, os.PathLike[str]]
@@ -146,8 +149,19 @@ class MerraPrismDataset(Dataset):
         self.dtype = dtype
 
         data_cfg = self.cfg.get("data", {})
-        self.predictor_dir = resolve_path(data_cfg["predictor_dir"])
-        self.target_dir = resolve_path(data_cfg["target_dir"])
+        self.use_preprocessed = bool(data_cfg.get("use_preprocessed", False))
+        self._case_preprocess_dir = norm.case_preprocess_dir(self.cfg)
+        self._preprocessed_dir = self._case_preprocess_dir / mode
+        if self.use_preprocessed and scalars_dir is not None:
+            selected = resolve_path(scalars_dir).resolve()
+            configured = norm.resolve_scalar_dir(
+                self.cfg, for_writing=False
+            ).resolve()
+            if selected != configured:
+                raise ValueError(
+                    "Strict preprocessed MERRA datasets do not permit a scalar "
+                    f"override: selected={selected}, case contract={configured}"
+                )
 
         self.predictor_vars: List[Tuple[str, float]] = expand_predictor_variables(
             predictor_variables or data_cfg.get("predictor_variables", {})
@@ -160,36 +174,107 @@ class MerraPrismDataset(Dataset):
         if not self.target_vars:
             raise ValueError("No target variables specified")
 
-        # Validate target directories exist
-        validate_target_variables(self.target_dir, self.target_vars)
-
         # Parse dates from YAML
         self.start_date, self.end_date = parse_date_range_from_config(self.cfg, mode)
-
-        # Discover files
-        merra_files = discover_merra2_files(self.predictor_dir, self.start_date, self.end_date)
-        prism_files = discover_all_prism_targets(
-            self.target_dir, self.target_vars, self.start_date, self.end_date
-        )
-
-        # Build date -> path maps
-        self._predictor_map: Dict[Any, Path] = {d: p for d, p in merra_files}
-        self._target_maps: Dict[str, Dict[Any, Path]] = {}
-        for var, file_list in prism_files.items():
-            self._target_maps[var] = {d: p for d, p in file_list}
-
-        # Align dates across predictors and all targets
-        target_date_lists = {
-            var: list(dm.keys()) for var, dm in self._target_maps.items()
-        }
-        self._dates = align_dates(list(self._predictor_map.keys()), target_date_lists)
-
-        # Validate requested dates exist
-        validate_dates_exist(self._dates, list(self._predictor_map.keys()), "predictor")
-        for var in self.target_vars:
-            validate_dates_exist(
-                self._dates, list(self._target_maps[var].keys()), f"target ({var})"
+        self._preprocessed_predictor_names = [
+            prism_preprocessed.predictor_name(var, level)
+            for var, level in self.predictor_vars
+        ]
+        self._preprocessed_target_names = [
+            prism_preprocessed.target_name(var) for var in self.target_vars
+        ]
+        preprocess_cfg = self.cfg.get("preprocess", {}) or {}
+        if mode == "training":
+            self._preprocessed_include_targets = bool(
+                preprocess_cfg.get("save_train_targets", True)
             )
+        elif mode == "validation":
+            self._preprocessed_include_targets = bool(
+                preprocess_cfg.get("save_val_targets", True)
+            )
+        elif mode == "inference":
+            self._preprocessed_include_targets = bool(
+                preprocess_cfg.get("save_inference_targets", False)
+                or preprocess_cfg.get(
+                    "inference_include_observed_targets_for_eval", False
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported dataset mode: {mode}")
+        if mode in {"training", "validation"} and not self._preprocessed_include_targets:
+            raise ValueError(
+                f"MERRA {mode} requires embedded target_* variables; enable the "
+                f"corresponding preprocess save_{'train' if mode == 'training' else 'val'}_targets option"
+            )
+        self._preprocessed_include_elevation = bool(
+            data_cfg.get("static_elevation_file")
+        )
+        self._preprocessed_required_variables = [
+            *self._preprocessed_predictor_names,
+        ]
+        if self._preprocessed_include_targets:
+            self._preprocessed_required_variables.extend(
+                self._preprocessed_target_names
+            )
+        if self._preprocessed_include_elevation:
+            self._preprocessed_required_variables.append("static_elevation")
+
+        self._preprocessed_map: Dict[Any, Path] = {}
+        self._preprocessed_signature: Optional[str] = None
+        self._predictor_preprocessing_signature: Optional[str] = None
+        self._training_source_artifact_signatures: Dict[str, str] = {}
+        self._training_source_artifact_split_signature: Optional[str] = None
+        self._preprocessed_config_fields: Dict[str, Any] = {}
+        self._predictor_map: Dict[Any, Path] = {}
+        self._target_maps: Dict[str, Dict[Any, Path]] = {}
+        if self.use_preprocessed:
+            self._dates = prism_preprocessed.inclusive_daily_dates(
+                self.start_date, self.end_date
+            )
+            self._preprocessed_map = prism_preprocessed.require_daily_products(
+                self._preprocessed_dir, "merra_prism", self._dates
+            )
+            if mode == "training":
+                (
+                    self._training_source_artifact_signatures,
+                    self._training_source_artifact_split_signature,
+                ) = norm.training_source_artifact_contract(
+                    self.cfg,
+                    expected_dates=self._dates,
+                    role="MERRA training dataset",
+                )
+            print(
+                f"[dataset] strict preprocessed source: {self._preprocessed_dir} "
+                f"({len(self._dates)} required daily products; raw fallback disabled)"
+            )
+        else:
+            self.predictor_dir = resolve_path(data_cfg["predictor_dir"])
+            self.target_dir = resolve_path(data_cfg["target_dir"])
+            validate_target_variables(self.target_dir, self.target_vars)
+            merra_files = discover_merra2_files(
+                self.predictor_dir, self.start_date, self.end_date
+            )
+            prism_files = discover_all_prism_targets(
+                self.target_dir, self.target_vars, self.start_date, self.end_date
+            )
+            self._predictor_map = {d: p for d, p in merra_files}
+            for var, file_list in prism_files.items():
+                self._target_maps[var] = {d: p for d, p in file_list}
+            target_date_lists = {
+                var: list(dm.keys()) for var, dm in self._target_maps.items()
+            }
+            self._dates = align_dates(
+                list(self._predictor_map.keys()), target_date_lists
+            )
+            validate_dates_exist(
+                self._dates, list(self._predictor_map.keys()), "predictor"
+            )
+            for var in self.target_vars:
+                validate_dates_exist(
+                    self._dates,
+                    list(self._target_maps[var].keys()),
+                    f"target ({var})",
+                )
 
         # ------------------------------------------------------------------
         # Fine (PRISM) target grid. Predictors are regridded onto THIS grid so
@@ -197,29 +282,101 @@ class MerraPrismDataset(Dataset):
         # working CORDEX_ML dataset, which regrids coarse GCM fields onto the
         # fine target grid before cropping).
         # ------------------------------------------------------------------
-        self._full_fine_lat, self._full_fine_lon = self._load_fine_grid()
-        spatial_subset = data_cfg.get("spatial_subset", {}) or {}
-        subset_enabled = bool(spatial_subset.get("enabled", False))
-        if subset_enabled:
-            self._domain_lat_slice = _coord_subset_slice(
-                self._full_fine_lat,
-                spatial_subset.get("lat_min"),
-                spatial_subset.get("lat_max"),
-                "latitude",
+        self._elevation: Optional[np.ndarray] = None
+        if self.use_preprocessed:
+            canonical_grid = prism_grid_contract.load_canonical_grid(
+                self._case_preprocess_dir, required=True
             )
-            self._domain_lon_slice = _coord_subset_slice(
-                self._full_fine_lon,
-                spatial_subset.get("lon_min"),
-                spatial_subset.get("lon_max"),
-                "longitude",
-            )
-        else:
+            assert canonical_grid is not None
+            self._canonical_grid = canonical_grid
+            self._full_fine_lat = canonical_grid.lat
+            self._full_fine_lon = canonical_grid.lon
             self._domain_lat_slice = slice(None)
             self._domain_lon_slice = slice(None)
-
-        self.fine_lat = self._full_fine_lat[self._domain_lat_slice]
-        self.fine_lon = self._full_fine_lon[self._domain_lon_slice]
+            subset_enabled = False
+            first_date = self._dates[0]
+            first_product = self._preprocessed_map[first_date]
+            self._preprocessed_config_fields = (
+                prism_preprocessed.preprocessing_config_fields(
+                    data_type="merra_prism",
+                    predictor_variables=self.predictor_vars,
+                    target_variables=self.target_vars,
+                    include_targets=self._preprocessed_include_targets,
+                    regrid_method=str(data_cfg.get("regrid_method", "bilinear")),
+                    canonical_grid_fingerprint=canonical_grid.fingerprint,
+                    static_elevation_required=self._preprocessed_include_elevation,
+                    static_elevation_variable=data_cfg.get("static_elevation_var"),
+                )
+            )
+            with xr.open_dataset(str(first_product)) as ds:
+                lat_name, lon_name = prism_preprocessed.validate_daily_product(
+                    ds,
+                    first_product,
+                    canonical_grid,
+                    mode=self.mode,
+                    sample_date=first_date,
+                    required_variables=self._preprocessed_required_variables,
+                    expected_preprocessing_fields=self._preprocessed_config_fields,
+                    expected_source_artifact_signature=(
+                        self._training_source_artifact_signatures.get(
+                            str(first_date)
+                        )
+                    ),
+                )
+                self._preprocessed_signature = str(
+                    ds.attrs[prism_preprocessed.PREPROCESSING_SIGNATURE_ATTR]
+                )
+                self._predictor_preprocessing_signature = str(
+                    ds.attrs[
+                        prism_preprocessed.PREDICTOR_PREPROCESSING_SIGNATURE_ATTR
+                    ]
+                )
+                if self._preprocessed_include_elevation:
+                    self._elevation = prism_preprocessed.read_spatial_variable(
+                        ds, "static_elevation", lat_name, lon_name
+                    )
+            norm.assert_preprocessing_signature_matches(
+                self.cfg,
+                self._predictor_preprocessing_signature,
+                role=f"MERRA {mode} dataset",
+            )
+        else:
+            self._full_fine_lat, self._full_fine_lon = self._load_fine_grid()
+            spatial_subset = data_cfg.get("spatial_subset", {}) or {}
+            subset_enabled = bool(spatial_subset.get("enabled", False))
+            if subset_enabled:
+                self._domain_lat_slice = _coord_subset_slice(
+                    self._full_fine_lat,
+                    spatial_subset.get("lat_min"),
+                    spatial_subset.get("lat_max"),
+                    "latitude",
+                )
+                self._domain_lon_slice = _coord_subset_slice(
+                    self._full_fine_lon,
+                    spatial_subset.get("lon_min"),
+                    spatial_subset.get("lon_max"),
+                    "longitude",
+                )
+            else:
+                self._domain_lat_slice = slice(None)
+                self._domain_lon_slice = slice(None)
+            candidate_lat = self._full_fine_lat[self._domain_lat_slice]
+            candidate_lon = self._full_fine_lon[self._domain_lon_slice]
+            first_grid_source = self._target_maps[self.target_vars[0]][self._dates[0]]
+            self._canonical_grid = prism_grid_contract.ensure_canonical_grid(
+                self._case_preprocess_dir,
+                candidate_lat,
+                candidate_lon,
+                source=str(first_grid_source),
+                context="MERRA dataset target grid",
+            )
+        self.fine_lat = self._canonical_grid.lat
+        self.fine_lon = self._canonical_grid.lon
         self.fine_shape: Tuple[int, int] = (len(self.fine_lat), len(self.fine_lon))
+        print(
+            f"[dataset] canonical PRISM grid fingerprint="
+            f"{self._canonical_grid.fingerprint[:12]}"
+        )
         if subset_enabled:
             print(
                 f"[dataset] spatial subset: lat {self.fine_lat[0]:.4f}.."
@@ -241,6 +398,33 @@ class MerraPrismDataset(Dataset):
             int(data_cfg.get("training_tile_stride_lat", self.crop_size[0])),
             int(data_cfg.get("training_tile_stride_lon", self.crop_size[1])),
         )
+        self.training_halo: Tuple[int, int] = (
+            int(data_cfg.get("training_halo_lat", 0))
+            if mode in {"training", "validation"}
+            else 0,
+            int(data_cfg.get("training_halo_lon", 0))
+            if mode in {"training", "validation"}
+            else 0,
+        )
+        if min(self.training_halo) < 0:
+            raise ValueError(f"training halo must be non-negative, got {self.training_halo}")
+        model_cfg = self.cfg.get("model", {}) or {}
+        if mode in {"training", "validation"} and str(
+            model_cfg.get("backbone_attention_scope", "legacy_global")
+        ).lower() == "windowed_local":
+            overlap = tuple(
+                core - stride
+                for core, stride in zip(self.crop_size, self.training_tile_stride)
+            )
+            training_plan = TilePlan.build(
+                self.fine_shape,
+                self.crop_size,
+                overlap=overlap,
+                halo=self.training_halo,
+            )
+            training_plan.assert_globally_aligned(
+                self.cfg.get("mask_unit_size", [16, 16])
+            )
         self._tile_slices: Optional[List[Tuple[slice, slice]]] = None
         self._rng = np.random.default_rng(0)
         self.min_valid_target_fraction = float(
@@ -252,7 +436,7 @@ class MerraPrismDataset(Dataset):
         )
         self._target_valid_mask: Optional[np.ndarray] = None
 
-        if mode == "training" and self.training_spatial_sampling == "tiled":
+        if mode in {"training", "validation"} and self.training_spatial_sampling == "tiled":
             lat_origins = _tile_origins(
                 self.fine_shape[0], self.crop_size[0], self.training_tile_stride[0]
             )
@@ -283,7 +467,7 @@ class MerraPrismDataset(Dataset):
                 f"[dataset] deterministic training tiles: "
                 f"{len(lat_origins)}x{len(lon_origins)}={len(candidate_tiles)} "
                 f"candidate, {len(self._tile_slices)} kept, tile={self.crop_size}, "
-                f"stride={self.training_tile_stride}"
+                f"stride={self.training_tile_stride}, halo={self.training_halo}"
             )
 
         # Random crops for ordinary training; tiled training enumerates fixed windows.
@@ -303,7 +487,7 @@ class MerraPrismDataset(Dataset):
         # means loaded here are byte-for-byte the same per-channel scalers the
         # model uses for its internal z-score (single source of truth).
         if scalars_dir is not None:
-            scalar_dir = str(scalars_dir)
+            scalar_dir = str(resolve_path(scalars_dir).resolve())
         else:
             # Case-scoped resolution only. Never fall back to a shared/flat
             # scalar_dir: that historically mixed another case's stale
@@ -327,8 +511,7 @@ class MerraPrismDataset(Dataset):
         # channel) so it is co-registered with the regridded predictors.
         elev_file = data_cfg.get("static_elevation_file", None)
         elev_var = data_cfg.get("static_elevation_var", None)
-        self._elevation: Optional[np.ndarray] = None
-        if elev_file:
+        if elev_file and not self.use_preprocessed:
             elev_path = resolve_path(elev_file)
             if elev_path.exists():
                 full_elevation = load_elevation(
@@ -345,11 +528,8 @@ class MerraPrismDataset(Dataset):
                     f"(on PRISM grid) from {elev_path.name}"
                 )
             else:
-                import warnings as _w
-                _w.warn(
-                    f"static_elevation_file not found: {elev_path}; "
-                    "elevation channel will be omitted.",
-                    RuntimeWarning,
+                raise FileNotFoundError(
+                    f"Configured static_elevation_file was not found: {elev_path}"
                 )
 
     # ------------------------------------------------------------------
@@ -367,6 +547,53 @@ class MerraPrismDataset(Dataset):
                 ds[lat_name].values.astype(np.float64),
                 ds[lon_name].values.astype(np.float64),
             )
+
+    def _load_validated_target_array(self, ds: Any, path: Path) -> np.ndarray:
+        """Load one target on, and only on, this case's canonical PRISM grid."""
+        dvar = _find_numeric_datavar(ds, path)
+        da = ds[dvar]
+        if "time" in da.dims:
+            da = da.isel(time=0, drop=True)
+        lat_name = _infer_coord_name(ds, LAT_CANDIDATES)
+        lon_name = _infer_coord_name(ds, LON_CANDIDATES)
+        observed_lat = np.asarray(ds[lat_name].values, dtype=np.float64)[
+            self._domain_lat_slice
+        ]
+        observed_lon = np.asarray(ds[lon_name].values, dtype=np.float64)[
+            self._domain_lon_slice
+        ]
+        prism_grid_contract.assert_grid_matches(
+            self._canonical_grid,
+            observed_lat,
+            observed_lon,
+            context=f"PRISM target {path}",
+        )
+        if lat_name not in da.dims or lon_name not in da.dims:
+            raise ValueError(
+                f"PRISM target {path} variable {dvar!r} must use coordinate "
+                f"dimensions ({lat_name!r}, {lon_name!r}); got {da.dims}"
+            )
+        da = da.transpose(lat_name, lon_name)
+        arr = np.asarray(da.values, dtype=np.float32)
+        arr[np.isinf(arr)] = np.nan
+        return arr
+
+    def _validate_preprocessed_product(
+        self, ds: Any, path: Path, sample_date: Any
+    ) -> Tuple[str, str]:
+        return prism_preprocessed.validate_daily_product(
+            ds,
+            path,
+            self._canonical_grid,
+            mode=self.mode,
+            sample_date=sample_date,
+            required_variables=self._preprocessed_required_variables,
+            expected_preprocessing_fields=self._preprocessed_config_fields,
+            expected_preprocessing_signature=self._preprocessed_signature,
+            expected_source_artifact_signature=(
+                self._training_source_artifact_signatures.get(str(sample_date))
+            ),
+        )
 
     def _select_crop(self, tile_index: Optional[int] = None) -> Tuple[slice, slice]:
         """Pick a (lat_slice, lon_slice) crop window on the fine grid."""
@@ -387,29 +614,14 @@ class MerraPrismDataset(Dataset):
         return slice(lat0, lat0 + ch), slice(lon0, lon0 + cw)
 
     def _load_target_valid_mask(self) -> np.ndarray:
-        """Return a subdomain mask where any target variable is finite."""
+        """Return cells where every configured target variable is finite."""
         if self._target_valid_mask is not None:
             return self._target_valid_mask
 
         first_date = self._dates[0]
-        valid_mask: Optional[np.ndarray] = None
-        abs_lat_slice, abs_lon_slice = self._absolute_slices(slice(None), slice(None))
-        for var in self.target_vars:
-            path = self._target_maps[var][first_date]
-            with xr.open_dataset(str(path)) as ds:
-                da = ds[_find_numeric_datavar(ds, path)]
-                if "time" in da.dims:
-                    da = da.isel(time=0, drop=True)
-                arr = np.asarray(da.values, dtype=np.float32)[
-                    abs_lat_slice, abs_lon_slice
-                ]
-            finite = np.isfinite(arr)
-            valid_mask = finite if valid_mask is None else (valid_mask | finite)
-
-        if valid_mask is None:
-            raise ValueError("Could not build target valid mask")
-        self._target_valid_mask = valid_mask
-        return valid_mask
+        targets = self._load_targets(first_date).detach().cpu().numpy()
+        self._target_valid_mask = np.isfinite(targets).all(axis=0)
+        return self._target_valid_mask
 
     def target_valid_fraction(self, lat_slice: slice, lon_slice: slice) -> float:
         """Fraction of cells with finite PRISM targets for a local subdomain tile."""
@@ -456,7 +668,16 @@ class MerraPrismDataset(Dataset):
 
         sample_date = self._dates[date_index]
         lat_slice, lon_slice = self._select_crop(tile_index)
-        y = self._load_targets(sample_date, lat_slice, lon_slice)
+        if self.use_preprocessed and not self._preprocessed_include_targets:
+            lat0, lon0 = self._slice_start(lat_slice), self._slice_start(lon_slice)
+            lat1 = self.fine_shape[0] if lat_slice.stop is None else int(lat_slice.stop)
+            lon1 = self.fine_shape[1] if lon_slice.stop is None else int(lon_slice.stop)
+            y = torch.zeros(
+                (len(self.target_vars), lat1 - lat0, lon1 - lon0),
+                dtype=self.dtype,
+            )
+        else:
+            y = self._load_targets(sample_date, lat_slice, lon_slice)
 
         # Random PRISM crops can land entirely over missing ocean/outside-CONUS
         # pixels. The loss masks those safely, but such samples provide no
@@ -478,7 +699,26 @@ class MerraPrismDataset(Dataset):
         # Raw, physical-unit predictors (regridded onto the PRISM crop) and
         # targets. NO normalization here -- the model normalizes inputs and
         # denormalizes outputs internally, and the loss is in physical units.
-        x = self._load_predictor(sample_date, lat_slice, lon_slice)
+        output_y0 = self._slice_start(lat_slice)
+        output_x0 = self._slice_start(lon_slice)
+        output_h, output_w = int(y.shape[-2]), int(y.shape[-1])
+        (input_lat_slice, input_lon_slice), halo_padding = halo_crop_slices(
+            self.fine_shape,
+            (output_y0, output_x0),
+            (output_h, output_w),
+            self.training_halo,
+        )
+        x = self._load_predictor(sample_date, input_lat_slice, input_lon_slice)
+        x = pad_spatial_context(x, halo_padding, pad_mode="reflect")
+        expected_input_shape = (
+            output_h + 2 * self.training_halo[0],
+            output_w + 2 * self.training_halo[1],
+        )
+        if tuple(x.shape[-2:]) != expected_input_shape:
+            raise ValueError(
+                f"halo predictor crop has shape {tuple(x.shape[-2:])}, expected "
+                f"{expected_input_shape} for output core {(output_h, output_w)}"
+            )
 
         sample = {
             "x": x,
@@ -489,8 +729,18 @@ class MerraPrismDataset(Dataset):
             # default per-channel (global) scalers the model broadcasts [C,1,1]
             # and ignores this offset, so MERRA and NARR share one code path.
             "__scaler_offset": torch.tensor(
-                [self._slice_start(lat_slice), self._slice_start(lon_slice)],
+                [output_y0, output_x0],
                 dtype=torch.long,
+            ),
+            "__input_scaler_offset": torch.tensor(
+                [output_y0 - self.training_halo[0], output_x0 - self.training_halo[1]],
+                dtype=torch.long,
+            ),
+            "__output_scaler_offset": torch.tensor(
+                [output_y0, output_x0], dtype=torch.long
+            ),
+            "__output_crop": torch.tensor(
+                [*self.training_halo, output_h, output_w], dtype=torch.long
             ),
         }
         if tile_index is not None:
@@ -543,10 +793,14 @@ class MerraPrismDataset(Dataset):
                 f"{tuple(stacked.shape[-2:])}, expected {exp_hw} (the PRISM crop)."
             )
         if not getattr(self, "_alignment_logged", False):
+            source = (
+                "strict preprocessed product"
+                if self.use_preprocessed
+                else "on-the-fly coarse-to-fine regridding"
+            )
             print(
-                "[dataset] predictor->PRISM alignment OK: continuous predictors "
-                f"bilinearly regridded onto the PRISM target grid {exp_hw} "
-                "(coarse->fine, max|dlat|=max|dlon|=0 by construction) before tiling."
+                f"[dataset] predictor->PRISM alignment OK: {source} is on the "
+                f"canonical target grid {exp_hw} before tiling."
             )
             self._alignment_logged = True
 
@@ -567,37 +821,63 @@ class MerraPrismDataset(Dataset):
         Returned values are RAW physical units.
         """
         crop_lat, crop_lon = self._fine_coords(lat_slice, lon_slice)
-        path = self._predictor_map[sample_date]
         arrays: List[np.ndarray] = []
-        with xr.open_dataset(str(path)) as ds:
-            lat_name = _infer_coord_name(ds, LAT_CANDIDATES)
-            lon_name = _infer_coord_name(ds, LON_CANDIDATES)
-            for var, level in self.predictor_vars:
-                if var not in ds.data_vars:
-                    raise ValueError(
-                        f"MERRA2 file {path} does not contain variable '{var}'"
-                    )
-                da = ds[var]
-                if "time" in da.dims:
-                    da = da.isel(time=0, drop=True)
-                if "lev" in da.dims:
-                    da = da.sel(lev=level, drop=True)
-                # Bilinear regrid (interp) of the coarse field onto the PRISM
-                # crop coordinates -> co-registered with the target. NaN cells
-                # (pressure levels below the surface over high terrain) are
-                # PRESERVED here; they are masked + filled below.
-                da = da.interp(
-                    {lat_name: crop_lat, lon_name: crop_lon}, method="linear"
+        if self.use_preprocessed:
+            path = self._preprocessed_map[sample_date]
+            with xr.open_dataset(str(path)) as ds:
+                lat_name, lon_name = self._validate_preprocessed_product(
+                    ds, path, sample_date
                 )
-                arr = np.asarray(da.values, dtype=np.float32)
-                arr[np.isinf(arr)] = np.nan
-                arrays.append(arr)
-        stacked = np.stack(arrays, axis=0)
+                arrays.extend(
+                    prism_preprocessed.read_spatial_variable(
+                        ds,
+                        name,
+                        lat_name,
+                        lon_name,
+                        lat_slice=lat_slice,
+                        lon_slice=lon_slice,
+                    )
+                    for name in self._preprocessed_predictor_names
+                )
+                if self._preprocessed_include_elevation:
+                    arrays.append(
+                        prism_preprocessed.read_spatial_variable(
+                            ds,
+                            "static_elevation",
+                            lat_name,
+                            lon_name,
+                            lat_slice=lat_slice,
+                            lon_slice=lon_slice,
+                        )
+                    )
+            stacked = np.stack(arrays, axis=0)
+        else:
+            path = self._predictor_map[sample_date]
+            with xr.open_dataset(str(path)) as ds:
+                lat_name = _infer_coord_name(ds, LAT_CANDIDATES)
+                lon_name = _infer_coord_name(ds, LON_CANDIDATES)
+                for var, level in self.predictor_vars:
+                    if var not in ds.data_vars:
+                        raise ValueError(
+                            f"MERRA2 file {path} does not contain variable '{var}'"
+                        )
+                    da = ds[var]
+                    if "time" in da.dims:
+                        da = da.isel(time=0, drop=True)
+                    if "lev" in da.dims:
+                        da = da.sel(lev=level, drop=True)
+                    da = da.interp(
+                        {lat_name: crop_lat, lon_name: crop_lon}, method="linear"
+                    )
+                    arr = np.asarray(da.values, dtype=np.float32)
+                    arr[np.isinf(arr)] = np.nan
+                    arrays.append(arr)
+            stacked = np.stack(arrays, axis=0)
 
         self._check_predictor_alignment(stacked, crop_lat, crop_lon)
 
         # Append elevation crop as the final static channel (always valid).
-        if self._elevation is not None:
+        if self._elevation is not None and not self.use_preprocessed:
             elev = self._elevation[lat_slice, lon_slice].astype(np.float32)
             stacked = np.concatenate([stacked, elev[np.newaxis]], axis=0)
 
@@ -661,20 +941,38 @@ class MerraPrismDataset(Dataset):
         real cold temperatures).
         """
         arrays: List[np.ndarray] = []
-        for var in self.target_vars:
-            path = self._target_maps[var][sample_date]
-            with xr.open_dataset(str(path)) as ds:
-                # Identify the data variable (skip non-numeric metadata like 'crs')
-                da = ds[_find_numeric_datavar(ds, path)]
-                if "time" in da.dims:
-                    da = da.isel(time=0, drop=True)
-                arr = np.asarray(da.values, dtype=np.float32)
-                abs_lat_slice, abs_lon_slice = self._absolute_slices(
-                    lat_slice, lon_slice
+        if self.use_preprocessed:
+            if not self._preprocessed_include_targets:
+                raise RuntimeError(
+                    "This MERRA inference split was intentionally preprocessed "
+                    "without observed target_* variables"
                 )
-                arr = arr[abs_lat_slice, abs_lon_slice]
-                arr[np.isinf(arr)] = np.nan
-                arrays.append(arr)
+            path = self._preprocessed_map[sample_date]
+            with xr.open_dataset(str(path)) as ds:
+                lat_name, lon_name = self._validate_preprocessed_product(
+                    ds, path, sample_date
+                )
+                arrays.extend(
+                    prism_preprocessed.read_spatial_variable(
+                        ds,
+                        name,
+                        lat_name,
+                        lon_name,
+                        lat_slice=lat_slice,
+                        lon_slice=lon_slice,
+                    )
+                    for name in self._preprocessed_target_names
+                )
+        else:
+            for var in self.target_vars:
+                path = self._target_maps[var][sample_date]
+                with xr.open_dataset(str(path)) as ds:
+                    arr = self._load_validated_target_array(ds, path)
+                    abs_lat_slice, abs_lon_slice = self._absolute_slices(
+                        lat_slice, lon_slice
+                    )
+                    arr = arr[abs_lat_slice, abs_lon_slice]
+                    arrays.append(arr)
 
         stacked = np.stack(arrays, axis=0)
         return torch.from_numpy(stacked).to(self.dtype)
@@ -684,6 +982,18 @@ class MerraPrismDataset(Dataset):
     @property
     def dates(self) -> List[Any]:
         return list(self._dates)
+
+    @property
+    def has_observed_targets(self) -> bool:
+        return not self.use_preprocessed or self._preprocessed_include_targets
+
+    @property
+    def predictor_preprocessing_signature(self) -> Optional[str]:
+        return self._predictor_preprocessing_signature
+
+    @property
+    def training_source_artifact_split_signature(self) -> Optional[str]:
+        return self._training_source_artifact_split_signature
 
     @property
     def num_predictor_channels(self) -> int:

@@ -66,9 +66,36 @@ def _resolve_spatial_scalers(
     Scalers may be channel-only ``[1,C,1,1]`` or spatial ``[1,C,H,W]``. For
     spatial scalers and cropped batches, ``scaler_offset`` can be ``(y, x)`` or
     a batched ``[B,2]`` tensor/list so each sample receives the matching slice.
+
+    Spatial scaler fields are coordinate-bearing data, not images. If their
+    shape differs from ``reference``, an explicit, valid offset is therefore
+    required. Silently resizing the entire scaler field to a crop would apply
+    unrelated grid points to that crop and can imprint block-scale biases.
+
+    ``resize_mode`` and ``align_corners`` remain in the signature for API and
+    checkpoint-config compatibility, but mismatched spatial scalers are never
+    resized.
     """
+    del resize_mode, align_corners
+
     batch = int(reference.shape[0])
     h, w = reference.shape[-2:]
+
+    if mu_full.ndim != 4 or sigma_full.ndim != 4:
+        raise ValueError(
+            f"{name} scalers must be 4-D [1,C,H,W], got "
+            f"mu={tuple(mu_full.shape)} sigma={tuple(sigma_full.shape)}"
+        )
+    if mu_full.shape != sigma_full.shape:
+        raise ValueError(
+            f"{name} scaler mean/std shapes differ: "
+            f"mu={tuple(mu_full.shape)} sigma={tuple(sigma_full.shape)}"
+        )
+    if mu_full.shape[0] != 1:
+        raise ValueError(
+            f"{name} spatial scalers must have singleton batch dimension, "
+            f"got {tuple(mu_full.shape)}"
+        )
 
     if mu_full.shape[-2:] == (1, 1) and sigma_full.shape[-2:] == (1, 1):
         return mu_full, sigma_full
@@ -82,59 +109,224 @@ def _resolve_spatial_scalers(
         if torch.is_tensor(scaler_offset):
             offset_tensor = scaler_offset.detach().cpu()
             if offset_tensor.ndim == 1:
+                if offset_tensor.numel() != 2:
+                    raise ValueError(
+                        f"{name} scaler_offset tensor must have 2 values, "
+                        f"got shape {tuple(offset_tensor.shape)}"
+                    )
                 return [(int(offset_tensor[0].item()), int(offset_tensor[1].item()))]
+            if offset_tensor.ndim != 2 or offset_tensor.shape[1] != 2:
+                raise ValueError(
+                    f"{name} scaler_offset tensor must have shape [2] or [B,2], "
+                    f"got {tuple(offset_tensor.shape)}"
+                )
             return [
                 (int(row[0].item()), int(row[1].item()))
-                for row in offset_tensor.reshape(-1, 2)
+                for row in offset_tensor
             ]
         if isinstance(scaler_offset, (list, tuple)):
-            if len(scaler_offset) == 2 and not isinstance(scaler_offset[0], (list, tuple)):
+            if len(scaler_offset) == 2 and not isinstance(
+                scaler_offset[0], (list, tuple, torch.Tensor)
+            ):
                 return [(int(scaler_offset[0]), int(scaler_offset[1]))]
-            return [(int(row[0]), int(row[1])) for row in scaler_offset]
-        return []
+            offsets: list[tuple[int, int]] = []
+            for row in scaler_offset:
+                if torch.is_tensor(row):
+                    row = row.detach().cpu().reshape(-1).tolist()
+                if not isinstance(row, (list, tuple)) or len(row) != 2:
+                    raise ValueError(
+                        f"{name} scaler_offset rows must contain exactly 2 values, "
+                        f"got {row!r}"
+                    )
+                offsets.append((int(row[0]), int(row[1])))
+            return offsets
+        raise ValueError(
+            f"Unsupported {name} scaler_offset type: {type(scaler_offset).__name__}"
+        )
 
     offsets = _offsets()
-    if offsets:
-        if len(offsets) == 1 and batch > 1:
-            offsets = offsets * batch
-        if len(offsets) == batch:
-            mu_parts = []
-            sigma_parts = []
-            for y0, x0 in offsets:
-                y1, x1 = y0 + h, x0 + w
-                if (
-                    y0 < 0
-                    or x0 < 0
-                    or y1 > mu_full.shape[-2]
-                    or x1 > mu_full.shape[-1]
-                ):
-                    break
-                mu_parts.append(mu_full[..., y0:y1, x0:x1])
-                sigma_parts.append(sigma_full[..., y0:y1, x0:x1])
-            else:
-                return torch.cat(mu_parts, dim=0), torch.cat(sigma_parts, dim=0)
-
-    if resize_mode in {"bilinear", "bicubic"}:
-        return (
-            F.interpolate(
-                mu_full,
-                size=(h, w),
-                mode=resize_mode,
-                align_corners=align_corners,
-            ),
-            F.interpolate(
-                sigma_full,
-                size=(h, w),
-                mode=resize_mode,
-                align_corners=align_corners,
-            ),
+    if not offsets:
+        raise ValueError(
+            f"{name} spatial scaler grid {tuple(mu_full.shape[-2:])} does not "
+            f"match reference grid {(h, w)}; a scaler_offset is required"
         )
-    if resize_mode not in {"nearest", "area"}:
-        raise ValueError(f"Unsupported {name} scaler resize mode: {resize_mode}")
-    return (
-        F.interpolate(mu_full, size=(h, w), mode=resize_mode),
-        F.interpolate(sigma_full, size=(h, w), mode=resize_mode),
-    )
+    if len(offsets) == 1 and batch > 1:
+        offsets = offsets * batch
+    if len(offsets) != batch:
+        raise ValueError(
+            f"{name} scaler_offset count ({len(offsets)}) must be 1 or match "
+            f"reference batch size ({batch})"
+        )
+
+    mu_parts = []
+    sigma_parts = []
+    full_h, full_w = mu_full.shape[-2:]
+    for sample_idx, (y0, x0) in enumerate(offsets):
+        y1, x1 = y0 + h, x0 + w
+        if y0 < 0 or x0 < 0 or y1 > full_h or x1 > full_w:
+            if name != "input":
+                raise ValueError(
+                    f"{name} scaler_offset[{sample_idx}]={(y0, x0)} with crop "
+                    f"{(h, w)} is outside scaler grid {(full_h, full_w)}"
+                )
+            source_y0, source_x0 = max(0, y0), max(0, x0)
+            source_y1, source_x1 = min(full_h, y1), min(full_w, x1)
+            if source_y0 >= source_y1 or source_x0 >= source_x1:
+                raise ValueError(
+                    f"input scaler crop {(y0, x0, y1, x1)} does not overlap "
+                    f"scaler grid {(full_h, full_w)}"
+                )
+            padding = (
+                source_x0 - x0,
+                x1 - source_x1,
+                source_y0 - y0,
+                y1 - source_y1,
+            )
+
+            def _pad_input(values: torch.Tensor) -> torch.Tensor:
+                source_h, source_w = values.shape[-2:]
+                mode = "reflect"
+                if (
+                    padding[0] >= source_w
+                    or padding[1] >= source_w
+                    or padding[2] >= source_h
+                    or padding[3] >= source_h
+                ):
+                    mode = "replicate"
+                return F.pad(values, padding, mode=mode)
+
+            mu_parts.append(
+                _pad_input(mu_full[..., source_y0:source_y1, source_x0:source_x1])
+            )
+            sigma_parts.append(
+                _pad_input(
+                    sigma_full[..., source_y0:source_y1, source_x0:source_x1]
+                )
+            )
+        else:
+            mu_parts.append(mu_full[..., y0:y1, x0:x1])
+            sigma_parts.append(sigma_full[..., y0:y1, x0:x1])
+
+    return torch.cat(mu_parts, dim=0), torch.cat(sigma_parts, dim=0)
+
+
+def _normalize_output_crops(
+    output_crop: object | None,
+    batch_size: int,
+) -> list[tuple[int, int, int, int]]:
+    """Normalize ``(top, left, height, width)`` crop metadata per sample."""
+    if output_crop is None:
+        return []
+
+    if torch.is_tensor(output_crop):
+        crop_tensor = output_crop.detach().cpu()
+        if crop_tensor.ndim == 1:
+            if crop_tensor.numel() != 4:
+                raise ValueError(
+                    "__output_crop tensor must have 4 values or shape [B,4], "
+                    f"got {tuple(crop_tensor.shape)}"
+                )
+            rows = [crop_tensor.tolist()]
+        elif crop_tensor.ndim == 2 and crop_tensor.shape[1] == 4:
+            rows = crop_tensor.tolist()
+        else:
+            raise ValueError(
+                "__output_crop tensor must have shape [4] or [B,4], "
+                f"got {tuple(crop_tensor.shape)}"
+            )
+    elif isinstance(output_crop, (list, tuple)):
+        if len(output_crop) == 4 and not isinstance(
+            output_crop[0], (list, tuple, torch.Tensor)
+        ):
+            rows = [output_crop]
+        else:
+            rows = []
+            for row in output_crop:
+                if torch.is_tensor(row):
+                    row = row.detach().cpu().reshape(-1).tolist()
+                if not isinstance(row, (list, tuple)) or len(row) != 4:
+                    raise ValueError(
+                        "__output_crop rows must contain exactly 4 values "
+                        f"(top,left,height,width), got {row!r}"
+                    )
+                rows.append(row)
+    else:
+        raise ValueError(
+            f"Unsupported __output_crop type: {type(output_crop).__name__}"
+        )
+
+    crops = [tuple(int(value) for value in row) for row in rows]
+    if len(crops) == 1 and batch_size > 1:
+        crops = crops * batch_size
+    if len(crops) != batch_size:
+        raise ValueError(
+            f"__output_crop count ({len(crops)}) must be 1 or match batch "
+            f"size ({batch_size})"
+        )
+    return crops
+
+
+def _prepare_normalized_outputs(
+    raw_out: torch.Tensor,
+    wet_logits: torch.Tensor | None,
+    expected_hw: tuple[int, int] | torch.Size,
+    output_crop: object | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Crop/resize model-space outputs before constraints and denormalization."""
+    expected = (int(expected_hw[-2]), int(expected_hw[-1]))
+    if expected[0] <= 0 or expected[1] <= 0:
+        raise ValueError(f"Expected positive output dimensions, got {expected}")
+
+    crops = _normalize_output_crops(output_crop, int(raw_out.shape[0]))
+    if crops:
+        raw_parts = []
+        wet_parts = []
+        crop_shapes = set()
+        source_h, source_w = raw_out.shape[-2:]
+        for sample_idx, (top, left, height, width) in enumerate(crops):
+            bottom, right = top + height, left + width
+            if (
+                top < 0
+                or left < 0
+                or height <= 0
+                or width <= 0
+                or bottom > source_h
+                or right > source_w
+            ):
+                raise ValueError(
+                    f"__output_crop[{sample_idx}]={(top, left, height, width)} "
+                    f"is outside raw output grid {(source_h, source_w)}"
+                )
+            crop_shapes.add((height, width))
+            raw_parts.append(raw_out[sample_idx : sample_idx + 1, ..., top:bottom, left:right])
+            if wet_logits is not None:
+                wet_parts.append(
+                    wet_logits[sample_idx : sample_idx + 1, ..., top:bottom, left:right]
+                )
+        if len(crop_shapes) != 1:
+            raise ValueError(
+                "All __output_crop entries in a batch must use the same height/width"
+            )
+        raw_out = torch.cat(raw_parts, dim=0)
+        if wet_logits is not None:
+            wet_logits = torch.cat(wet_parts, dim=0)
+
+    if raw_out.shape[-2:] != expected:
+        raw_out = F.interpolate(
+            raw_out,
+            size=expected,
+            mode="bilinear",
+            align_corners=False,
+        )
+        if wet_logits is not None:
+            wet_logits = F.interpolate(
+                wet_logits,
+                size=expected,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+    return raw_out, wet_logits
 
 
 class ClimateECCCFinetuneWrapper(FinetuneWrapper):
@@ -239,6 +431,10 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             residual: (optional) Indicates the residual mode of the model. for regression
                 ['climate',  None]
             residual_connection: (optional) Use a skip/residual connection around the model backbone
+            backbone_residual_mode: (optional) ``legacy_ignored`` preserves the
+                historical UNET behavior in which the configured residual was
+                computed but discarded. ``pre_conv_add`` feeds the shallow/deep
+                sum to the post-backbone convolution.
         """
 
         super().__init__(backbone, None)
@@ -266,6 +462,33 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             getattr(config.model, "static_dropout_p", 0.0)
         )
         self.static_dropout_p = min(max(self.static_dropout_p, 0.0), 1.0)
+        self.decoder_skip_source = str(
+            getattr(config.model, "decoder_skip_source", "legacy")
+        ).strip().lower()
+        if self.decoder_skip_source not in {"legacy", "dynamic"}:
+            raise ValueError(
+                "model.decoder_skip_source must be 'legacy' or 'dynamic', "
+                f"got {self.decoder_skip_source!r}"
+            )
+        self.backbone_residual_mode = str(
+            getattr(config.model, "backbone_residual_mode", "legacy_ignored")
+        ).strip().lower()
+        if self.backbone_residual_mode not in {"legacy_ignored", "pre_conv_add"}:
+            raise ValueError(
+                "model.backbone_residual_mode must be 'legacy_ignored' or "
+                f"'pre_conv_add', got {self.backbone_residual_mode!r}"
+            )
+        self.backbone_attention_scope = str(
+            getattr(config.model, "backbone_attention_scope", "legacy_global")
+        ).strip().lower()
+        if self.backbone_attention_scope not in {
+            "legacy_global",
+            "windowed_local",
+        }:
+            raise ValueError(
+                "model.backbone_attention_scope must be 'legacy_global' or "
+                f"'windowed_local', got {self.backbone_attention_scope!r}"
+            )
         self.decoder_upsampling_mode = str(
             getattr(
                 config.model,
@@ -582,7 +805,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
     def _resolve_output_scalers(
         self,
         constrained: torch.Tensor,
-        scaler_offset: tuple[int, int] | None = None,
+        scaler_offset: object | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         sigma_full = self.output_scalers_sigma.to(device=constrained.device, dtype=constrained.dtype)
         if hasattr(self, "output_scalers_mu"):
@@ -619,7 +842,7 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
     def _decode_outputs(
         self,
         raw_out: torch.Tensor,
-        scaler_offset: tuple[int, int] | None = None,
+        scaler_offset: object | None = None,
         wet_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         constrained = self._apply_output_constraints(raw_out)
@@ -733,10 +956,13 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         B, _, H, W = batch['x'].shape
         # Scale inputs
         x_sep_time = batch['x'].view(B, self.n_input_timestamps, -1, H, W) # [batch, time x parameter, lat, lon] -> [batch, time, parameter, lat, lon]
-        scaler_offset = batch.get("__scaler_offset")
+        legacy_scaler_offset = batch.get("__scaler_offset")
+        input_scaler_offset = batch.get(
+            "__input_scaler_offset", legacy_scaler_offset
+        )
         input_mu, input_sigma = self._resolve_input_scalers(
             batch["x"],
-            scaler_offset=scaler_offset,
+            scaler_offset=input_scaler_offset,
         )
         x_scale = (x_sep_time - input_mu.unsqueeze(1)) / (
                 input_sigma.unsqueeze(1) + self.input_scalers_epsilon)
@@ -767,18 +993,34 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             if self.training and self.static_dropout_p > 0.0:
                 y_static = F.dropout2d(y_static, p=self.static_dropout_p, training=True)
 
-            # Dowsampling step
-            copy_activations = {}
-            copy_activations[0] = self.embedding_static(y_static) * self.static_skip_scale
+            if self.decoder_skip_source == "legacy":
+                # Preserve the original static-only U-Net skip pathway exactly.
+                skip_seed = self.embedding_static(y_static) * self.static_skip_scale
+                x_embedded = None
+            else:
+                # Dynamic predictors are already co-registered to the fine target
+                # grid in the PRISM workflows. Keep those fine-scale activations
+                # available to every decoder stage instead of replacing them with
+                # zero skips.
+                x_embedded = self.embedding(x)
+                skip_seed = x_embedded
+
+            copy_activations = {0: skip_seed}
             primary_device = x.device
-
             for step_idx in range(self.num_upsample):
-                current_activation = self._ensure_on_device(copy_activations[step_idx], primary_device)
+                current_activation = self._ensure_on_device(
+                    copy_activations[step_idx], primary_device
+                )
                 copy_activations[step_idx] = current_activation
-                copy_activations[step_idx + 1] = self.downsampling_layers[step_idx](current_activation)
-                copy_activations[step_idx] = self._maybe_offload_skip(copy_activations[step_idx], step_idx, primary_device)
+                copy_activations[step_idx + 1] = self.downsampling_layers[step_idx](
+                    current_activation
+                )
+                copy_activations[step_idx] = self._maybe_offload_skip(
+                    copy_activations[step_idx], step_idx, primary_device
+                )
 
-            x_embedded = self.embedding(x) # [batch, time x parameter, lat, lon] -> [batch, emb, lat*scale[0], lon*scale[0]]
+            if x_embedded is None:
+                x_embedded = self.embedding(x)
             static_embedded = self.embedding_static(x_static) * self.static_embedding_scale
             x_shallow_feats = x_embedded + static_embedded
 
@@ -792,21 +1034,55 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                     align_corners=False,
                 )
         else:
-            x_shallow_feats = self.embedding(x)
-            deepest_skip = torch.zeros_like(x_shallow_feats)
+            x_embedded = self.embedding(x)
+            x_shallow_feats = x_embedded
             primary_device = x_shallow_feats.device
             copy_activations = {}
-            current_skip = torch.zeros(
-                (B, self.downscaling_embed_dim, x_shallow_feats.shape[-2], x_shallow_feats.shape[-1]),
-                device=primary_device,
-                dtype=x_shallow_feats.dtype,
+            if self.decoder_skip_source == "dynamic":
+                copy_activations[0] = x_embedded
+                for step_idx in range(self.num_upsample):
+                    current_activation = self._ensure_on_device(
+                        copy_activations[step_idx], primary_device
+                    )
+                    copy_activations[step_idx] = current_activation
+                    copy_activations[step_idx + 1] = self.downsampling_layers[
+                        step_idx
+                    ](current_activation)
+                    copy_activations[step_idx] = self._maybe_offload_skip(
+                        copy_activations[step_idx], step_idx, primary_device
+                    )
+            else:
+                # Exact legacy behavior: no-static models supplied all-zero
+                # decoder skips and did not execute the learned downsamplers.
+                current_skip = torch.zeros(
+                    (
+                        B,
+                        self.downscaling_embed_dim,
+                        x_shallow_feats.shape[-2],
+                        x_shallow_feats.shape[-1],
+                    ),
+                    device=primary_device,
+                    dtype=x_shallow_feats.dtype,
+                )
+                for step_idx in range(self.num_upsample):
+                    copy_activations[step_idx] = self._maybe_offload_skip(
+                        current_skip, step_idx, primary_device
+                    )
+                    current_skip = F.max_pool2d(current_skip, kernel_size=2)
+                copy_activations[self.num_upsample] = self._maybe_offload_skip(
+                    current_skip, self.num_upsample, primary_device
+                )
+
+            deepest_skip = self._ensure_on_device(
+                copy_activations[self.num_upsample], x_shallow_feats.device
             )
-            for step_idx in range(self.num_upsample):
-                copy_activations[step_idx] = self._maybe_offload_skip(current_skip, step_idx, primary_device)
-                current_skip = F.max_pool2d(current_skip, kernel_size=2)
-            copy_activations[self.num_upsample] = self._maybe_offload_skip(
-                current_skip, self.num_upsample, primary_device
-            )
+            if deepest_skip.shape[-2:] != x_shallow_feats.shape[-2:]:
+                deepest_skip = F.interpolate(
+                    deepest_skip,
+                    size=x_shallow_feats.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
         x_shallow_feats = torch.cat([x_shallow_feats, deepest_skip], dim=1)
         x_shallow_feats = self.conv_before_backbone(x_shallow_feats)
@@ -846,9 +1122,17 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             )  # [batch, embed, lat//patch_size, lon//patch_size] -> [batch, global seq, local seq, embed]
 
             if self.backbone_gradient_checkpointing and self.training:
-                x_deep_feats = checkpoint(self.backbone, x_tokens, use_reentrant=False)
+                backbone_fn = (
+                    self.backbone
+                    if self.backbone_attention_scope == "legacy_global"
+                    else self._windowed_local_backbone
+                )
+                x_deep_feats = checkpoint(backbone_fn, x_tokens, use_reentrant=False)
             else:
-                x_deep_feats = self.backbone(x_tokens)  # [batch, global seq, local seq, embed]
+                if self.backbone_attention_scope == "legacy_global":
+                    x_deep_feats = self.backbone(x_tokens)
+                else:
+                    x_deep_feats = self._windowed_local_backbone(x_tokens)
     
             x_deep_feats = x_deep_feats.reshape(
                 B,
@@ -864,14 +1148,20 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         else:
             x_deep_feats = x_shallow_feats
 
-        # residual connection
-        if self.residual_connection:
+        # ``legacy_ignored`` deliberately preserves the historical checkpoint
+        # behavior: the shallow/deep sum used to be computed and then discarded
+        # before ``conv_after_backbone``. Corrected runs opt into the contracted
+        # ``pre_conv_add`` behavior explicitly.
+        if (
+            self.residual_connection
+            and self.backbone_residual_mode == "pre_conv_add"
+        ):
             x = x_deep_feats + x_shallow_feats
         else:
             x = x_deep_feats
 
         # convolution after backbone
-        x_deep_feats = self.conv_after_backbone(x_deep_feats)
+        x_deep_feats = self.conv_after_backbone(x)
 
         # Upscaling
         out = x_deep_feats
@@ -903,58 +1193,21 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             wet_logits = self.precip_wet_head(out)
 
         raw_out = x
-        scaler_offset = batch.get("__scaler_offset")
+        expected_hw = batch["y"].shape[-2:]
+        raw_out, wet_logits = _prepare_normalized_outputs(
+            raw_out,
+            wet_logits,
+            expected_hw,
+            output_crop=batch.get("__output_crop"),
+        )
+        output_scaler_offset = batch.get(
+            "__output_scaler_offset", legacy_scaler_offset
+        )
         x_out, x_pre_inverse = self._decode_outputs(
             raw_out,
-            scaler_offset=scaler_offset,
+            scaler_offset=output_scaler_offset,
             wet_logits=wet_logits,
         )
-        expected_hw = batch["y"].shape[-2:]
-        if x_out.shape[-2:] != expected_hw:
-            x_out = F.interpolate(
-                x_out,
-                size=expected_hw,
-                mode="bilinear",
-                align_corners=False,
-            )
-            x_pre_inverse = F.interpolate(
-                x_pre_inverse,
-                size=expected_hw,
-                mode="bilinear",
-                align_corners=False,
-            )
-            raw_out = F.interpolate(
-                raw_out,
-                size=expected_hw,
-                mode="bilinear",
-                align_corners=False,
-            )
-            if self._last_precip_hurdle_aux is not None:
-                self._last_precip_hurdle_aux["wet_logits"] = F.interpolate(
-                    self._last_precip_hurdle_aux["wet_logits"],
-                    size=expected_hw,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                self._last_precip_hurdle_aux["p_wet"] = torch.sigmoid(
-                    self._last_precip_hurdle_aux["wet_logits"]
-                )
-                self._last_precip_hurdle_aux["amount_pred_norm"] = F.interpolate(
-                    self._last_precip_hurdle_aux["amount_pred_norm"],
-                    size=expected_hw,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                self._last_precip_hurdle_aux["q95"] = F.interpolate(
-                    self._last_precip_hurdle_aux["q95"],
-                    size=expected_hw,
-                    mode="nearest",
-                )
-                amount_pred = (
-                    self._last_precip_hurdle_aux["amount_pred_norm"]
-                    * self._last_precip_hurdle_aux["q95"]
-                )
-                self._last_precip_hurdle_aux["amount_pred"] = amount_pred
 
         if self._last_precip_hurdle_aux is not None:
             batch["__precip_hurdle_aux"] = self._last_precip_hurdle_aux
@@ -974,6 +1227,32 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
     def clear_last_precip_hurdle_aux(self) -> None:
         self._last_precip_hurdle_aux = None
+
+    def _windowed_local_backbone(self, x_tokens: torch.Tensor) -> torch.Tensor:
+        """Run every pretrained transformer inside fixed local mask units.
+
+        The upstream Prithvi block alternates local attention with attention
+        across *all* mask units in the current tensor. That makes a pixel depend
+        on which other tiles happened to share its inference crop, so no finite
+        halo can make tiled and full-frame inference agree. This mode retains
+        the pretrained transformer parameters but applies each block along the
+        bounded local-token axis. Mask units are anchored by globally aligned
+        tile origins, giving a finite receptive field suitable for halo/core
+        inference.
+        """
+        lgl_block = getattr(self.backbone, "lgl_block", None)
+        transformers = getattr(lgl_block, "transformers", None)
+        evaluators = getattr(lgl_block, "evaluator", None)
+        if transformers is None:
+            raise TypeError(
+                "windowed_local attention requires a Prithvi backbone with "
+                "lgl_block.transformers"
+            )
+        if evaluators is None:
+            evaluators = [lambda module, value: module(value)] * len(transformers)
+        for evaluator, transformer in zip(evaluators, transformers):
+            x_tokens = evaluator(transformer, (x_tokens, None))
+        return x_tokens
 
     # ----------------------
     # Utility helpers
@@ -1115,10 +1394,12 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
 
         # Input shape [batch, time x parameter, lat, lon]
         self.input_scalers_mu = torch.nn.Parameter(
-            input_scalers_mu.reshape(1, -1, 1, 1), requires_grad=False
+            _reshape_output_scaler_tensor("input_scalers_mu", input_scalers_mu),
+            requires_grad=False,
         )
         self.input_scalers_sigma = torch.nn.Parameter(
-            input_scalers_sigma.reshape(1, -1, 1, 1), requires_grad=False
+            _reshape_output_scaler_tensor("input_scalers_sigma", input_scalers_sigma),
+            requires_grad=False,
         )
         self.input_scalers_epsilon = input_scalers_epsilon
 
@@ -1245,7 +1526,7 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
     def _resolve_output_scalers(
         self,
         constrained: torch.Tensor,
-        scaler_offset: tuple[int, int] | None = None,
+        scaler_offset: object | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         sigma_full = self.output_scalers_sigma.to(device=constrained.device, dtype=constrained.dtype)
         if hasattr(self, "output_scalers_mu"):
@@ -1282,7 +1563,7 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
     def _decode_outputs(
         self,
         raw_out: torch.Tensor,
-        scaler_offset: tuple[int, int] | None = None,
+        scaler_offset: object | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         constrained = self._apply_output_constraints(raw_out)
         mu, sigma = self._resolve_output_scalers(constrained, scaler_offset=scaler_offset)
@@ -1345,10 +1626,13 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
         B, _, H, W = batch['x'].shape
         # Scale inputs
         x_sep_time = batch['x'].view(B, self.n_input_timestamps, -1, H, W) # [batch, time x parameter, lat, lon] -> [batch, time, parameter, lat, lon]
-        scaler_offset = batch.get("__scaler_offset")
+        legacy_scaler_offset = batch.get("__scaler_offset")
+        input_scaler_offset = batch.get(
+            "__input_scaler_offset", legacy_scaler_offset
+        )
         input_mu, input_sigma = self._resolve_input_scalers(
             batch["x"],
-            scaler_offset=scaler_offset,
+            scaler_offset=input_scaler_offset,
         )
         x_scale = (x_sep_time - input_mu.unsqueeze(1)) / (
                 input_sigma.unsqueeze(1) + self.input_scalers_epsilon)
@@ -1442,15 +1726,31 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
 
         x = self.head(x)  # [batch, out_channels, lat*scale[0]*scale[1], lon*scale[0]*scale[1]]
         raw_out = x
+        raw_out, _ = _prepare_normalized_outputs(
+            raw_out,
+            None,
+            batch["y"].shape[-2:],
+            output_crop=batch.get("__output_crop"),
+        )
+        output_scaler_offset = batch.get(
+            "__output_scaler_offset", legacy_scaler_offset
+        )
 
         if self.return_logits:
-            x_out = self.to_logits(x)
+            x_out = self.to_logits(raw_out)
             x_pre_inverse = x_out
         elif self.residual == 'climate':
-            x_out = self.output_scalers_sigma * x + batch['climate_y']
-            x_pre_inverse = x
+            _, output_sigma = self._resolve_output_scalers(
+                raw_out,
+                scaler_offset=output_scaler_offset,
+            )
+            x_out = output_sigma * raw_out + batch['climate_y']
+            x_pre_inverse = raw_out
         else:
-            x_out, x_pre_inverse = self._decode_outputs(raw_out, scaler_offset=scaler_offset)
+            x_out, x_pre_inverse = self._decode_outputs(
+                raw_out,
+                scaler_offset=output_scaler_offset,
+            )
 
         if return_pre_inverse and return_raw_output:
             return x_out, x_pre_inverse, raw_out
