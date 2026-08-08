@@ -53,3 +53,29 @@ The fine-tuned model for MERRA-2 2m temperature data is available via [Hugging F
 The fine-tuned model for ECCC v10 and u10 wind component data is available via [Hugging Face](https://huggingface.co/ibm-granite/granite-geospatial-wxc-downscaling/tree/main/ECCC).
 
 For applications to CORDEX regional climate data, please refer to the [CORDEX ML example](examples/CORDEX_ML/README.md), which demonstrates fine-tuning on the [CORDEX Machine Learning Task Force benchmark](https://github.com/WCRP-CORDEX/ml-benchmark) for multiple regional domains.
+
+## Two-phase Prithvi-UNet with stochastic residual refinement
+
+The CORDEX_ML, MERRA_PRISM and NARR_PRISM workflows share an optional second
+phase that refines the deterministic Prithvi-UNet prediction with a stochastic
+*residual* model, selected through `model.refinement.type`:
+
+- `none` — deterministic Prithvi-UNet (default, unchanged behaviour)
+- `diffusion_unet` — conditional convolutional UNet, DDPM training / DDIM sampling
+- `flow_matching_unet` — conditional convolutional UNet, rectified flow matching
+- `diffusion_transformer` — spatial-token Transformer, DDPM / DDIM
+- `flow_matching_transformer` — spatial-token Transformer, rectified flow matching
+
+The residual is defined, predicted and added in the Phase-1 normalized target
+space; inverse normalization, precipitation constraints and masking are then
+applied exactly once. Existing YAML files without a `refinement` section keep
+running as deterministic Prithvi-UNet models, and existing deterministic
+checkpoints load unchanged (verified bitwise against the NARR_PRISM checkpoint).
+
+This is a spatial downscaling / bias-correction problem: predictors and targets
+always share the same timestamp, there is no forecast lead time, and Transformer
+attention operates over two-dimensional spatial tokens only.
+
+See [docs/STOCHASTIC_REFINEMENT.md](docs/STOCHASTIC_REFINEMENT.md) for the full
+description, configuration schema, example YAMLs, commands, checkpoint
+compatibility notes and benchmarks.

@@ -439,6 +439,11 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
         super().__init__(backbone, None)
         self.skip_activation_devices: list[torch.device] = []
+        # Opt-in Phase-1 spatial-feature capture for the two-phase stochastic
+        # refinement wrapper. Empty by default, so the deterministic forward pass
+        # is byte-for-byte unchanged and no extra activations are retained.
+        self._capture_features: tuple[str, ...] = ()
+        self._last_phase1_features: dict[str, torch.Tensor] = {}
 
         #----------- From Config
 
@@ -952,6 +957,9 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         # otherwise the previous autograd graph can remain alive and raise peak VRAM.
         self._last_precip_hurdle_aux = None
         batch.pop("__precip_hurdle_aux", None)
+        capture = getattr(self, "_capture_features", ())
+        if capture:
+            self._last_phase1_features = {}
 
         B, _, H, W = batch['x'].shape
         # Scale inputs
@@ -1162,6 +1170,8 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
         # convolution after backbone
         x_deep_feats = self.conv_after_backbone(x)
+        if capture and "prithvi" in capture:
+            self._last_phase1_features["prithvi"] = x_deep_feats
 
         # Upscaling
         out = x_deep_feats
@@ -1184,6 +1194,9 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                     align_corners=False,
                 )
             out = torch.cat((upsampled, skip), dim=1)
+
+        if capture and "unet" in capture:
+            self._last_phase1_features["unet"] = out
 
         x = self.output_conv_block(out)
         wet_logits = None
@@ -1227,6 +1240,39 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
     def clear_last_precip_hurdle_aux(self) -> None:
         self._last_precip_hurdle_aux = None
+
+    # ------------------------------------------------------------------
+    # Optional Phase-1 spatial-feature capture (two-phase refinement)
+    # ------------------------------------------------------------------
+    #: Feature names that :meth:`set_feature_capture` accepts.
+    SUPPORTED_FEATURE_CAPTURES = ("prithvi", "unet")
+
+    def set_feature_capture(self, names: Sequence[str] | None) -> None:
+        """Select which Phase-1 spatial feature maps ``forward`` should retain.
+
+        ``prithvi`` is the post-backbone convolution output (coarse Prithvi
+        feature grid); ``unet`` is the final decoder activation on the target
+        grid. Passing ``None`` or an empty sequence restores the default, in
+        which no extra activation is retained and the forward pass is unchanged.
+        """
+        if not names:
+            self._capture_features = ()
+            self._last_phase1_features = {}
+            return
+        requested = tuple(dict.fromkeys(str(n).lower() for n in names))
+        unknown = [n for n in requested if n not in self.SUPPORTED_FEATURE_CAPTURES]
+        if unknown:
+            raise ValueError(
+                f"Unsupported Phase-1 feature capture {unknown}; expected a subset of "
+                f"{list(self.SUPPORTED_FEATURE_CAPTURES)}."
+            )
+        self._capture_features = requested
+
+    def get_last_phase1_features(self) -> dict[str, torch.Tensor]:
+        return dict(getattr(self, "_last_phase1_features", {}) or {})
+
+    def clear_last_phase1_features(self) -> None:
+        self._last_phase1_features = {}
 
     def _windowed_local_backbone(self, x_tokens: torch.Tensor) -> torch.Tensor:
         """Run every pretrained transformer inside fixed local mask units.

@@ -1,0 +1,299 @@
+{
+  "environment": {
+    "python": "3.14.4",
+    "torch": "2.12.0+cu130",
+    "cuda": "13.0",
+    "device": "cuda:0",
+    "device_name": "NVIDIA A100 80GB PCIe",
+    "precision": "fp32",
+    "tf32": false,
+    "domain": [
+      256,
+      256
+    ],
+    "batch_size": 1,
+    "ensemble_size": 8,
+    "stochastic_steps": 20,
+    "repeats": 5
+  },
+  "results": [
+    {
+      "optimization": "batched ensemble generation",
+      "bottleneck": "serial per-member sampling loop",
+      "files": [
+        "granitewxc/refinement/two_phase.py",
+        "granitewxc/refinement/base.py"
+      ],
+      "refiner": "diffusion_unet",
+      "ensemble_size": 8,
+      "stochastic_steps": 20,
+      "baseline": {
+        "median_s": 1.314795654034242,
+        "min_s": 1.314172359998338,
+        "max_s": 1.3193644860293716,
+        "peak_mem_mib": 651.08642578125
+      },
+      "optimized": {
+        "median_s": 0.8400951080257073,
+        "min_s": 0.8383853849954903,
+        "max_s": 0.8406934360973537,
+        "peak_mem_mib": 5021.69921875
+      },
+      "speedup_pct": 36.10451133999351,
+      "parity": {
+        "bitwise_identical": true,
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "max_rel_diff": 0.0
+      },
+      "tolerance": "bitwise"
+    },
+    {
+      "optimization": "batched ensemble generation",
+      "bottleneck": "serial per-member sampling loop",
+      "files": [
+        "granitewxc/refinement/two_phase.py",
+        "granitewxc/refinement/base.py"
+      ],
+      "refiner": "flow_matching_unet",
+      "ensemble_size": 8,
+      "stochastic_steps": 20,
+      "baseline": {
+        "median_s": 1.2209837079280987,
+        "min_s": 1.220963740022853,
+        "max_s": 1.2211964649613947,
+        "peak_mem_mib": 662.2578125
+      },
+      "optimized": {
+        "median_s": 0.8313630219781771,
+        "min_s": 0.8308744090609252,
+        "max_s": 0.8322287480114028,
+        "peak_mem_mib": 5022.37060546875
+      },
+      "speedup_pct": 31.91039187665111,
+      "parity": {
+        "bitwise_identical": true,
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "max_rel_diff": 0.0
+      },
+      "tolerance": "bitwise"
+    },
+    {
+      "optimization": "batched ensemble generation",
+      "bottleneck": "serial per-member sampling loop",
+      "files": [
+        "granitewxc/refinement/two_phase.py",
+        "granitewxc/refinement/base.py"
+      ],
+      "refiner": "diffusion_transformer",
+      "ensemble_size": 8,
+      "stochastic_steps": 20,
+      "baseline": {
+        "median_s": 2.2622718330239877,
+        "min_s": 2.2589362340513617,
+        "max_s": 2.268994956975803,
+        "peak_mem_mib": 111.1884765625
+      },
+      "optimized": {
+        "median_s": 1.929049839032814,
+        "min_s": 1.9265488979872316,
+        "max_s": 1.929802778060548,
+        "peak_mem_mib": 472.486328125
+      },
+      "speedup_pct": 14.729529366316452,
+      "parity": {
+        "bitwise_identical": true,
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "max_rel_diff": 0.0
+      },
+      "tolerance": "bitwise"
+    },
+    {
+      "optimization": "batched ensemble generation",
+      "bottleneck": "serial per-member sampling loop",
+      "files": [
+        "granitewxc/refinement/two_phase.py",
+        "granitewxc/refinement/base.py"
+      ],
+      "refiner": "flow_matching_transformer",
+      "ensemble_size": 8,
+      "stochastic_steps": 20,
+      "baseline": {
+        "median_s": 2.1962017699843273,
+        "min_s": 2.1940337050473318,
+        "max_s": 2.196417782921344,
+        "peak_mem_mib": 109.2890625
+      },
+      "optimized": {
+        "median_s": 1.9316754929022864,
+        "min_s": 1.9294878860237077,
+        "max_s": 1.9330054159509018,
+        "peak_mem_mib": 459.84521484375
+      },
+      "speedup_pct": 12.04471650543878,
+      "parity": {
+        "bitwise_identical": true,
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "max_rel_diff": 0.0
+      },
+      "tolerance": "bitwise"
+    },
+    {
+      "optimization": "fused scaled-dot-product attention",
+      "bottleneck": "explicit softmax(QK^T)V materialises the full attention matrix",
+      "files": [
+        "granitewxc/refinement/backbones.py"
+      ],
+      "refiner": "diffusion_transformer",
+      "stochastic_steps": 20,
+      "baseline": {
+        "median_s": 0.6217752050142735,
+        "min_s": 0.6214296199614182,
+        "max_s": 0.6225679159397259,
+        "peak_mem_mib": 1101.3134765625
+      },
+      "optimized": {
+        "median_s": 0.285519101889804,
+        "min_s": 0.28499519394245,
+        "max_s": 0.28601728193461895,
+        "peak_mem_mib": 94.0634765625
+      },
+      "speedup_pct": 54.08001162039751,
+      "parity": {
+        "bitwise_identical": true,
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "max_rel_diff": 0.0
+      },
+      "tolerance": "atol=1e-5, rtol=1e-5 (fp32)"
+    },
+    {
+      "optimization": "fused scaled-dot-product attention",
+      "bottleneck": "explicit softmax(QK^T)V materialises the full attention matrix",
+      "files": [
+        "granitewxc/refinement/backbones.py"
+      ],
+      "refiner": "flow_matching_transformer",
+      "stochastic_steps": 20,
+      "baseline": {
+        "median_s": 0.6089928660076112,
+        "min_s": 0.6047562230378389,
+        "max_s": 0.6092961620306596,
+        "peak_mem_mib": 1102.04736328125
+      },
+      "optimized": {
+        "median_s": 0.27429108205251396,
+        "min_s": 0.27349517692346126,
+        "max_s": 0.27468272508122027,
+        "peak_mem_mib": 94.04736328125
+      },
+      "speedup_pct": 54.95988584387032,
+      "parity": {
+        "bitwise_identical": true,
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "max_rel_diff": 0.0
+      },
+      "tolerance": "atol=1e-5, rtol=1e-5 (fp32)"
+    },
+    {
+      "optimization": "precomputed frozen Phase-1 conditioning cache",
+      "bottleneck": "re-running an unchanging frozen Phase 1 every epoch",
+      "files": [
+        "granitewxc/refinement/cache.py",
+        "granitewxc/refinement/two_phase.py"
+      ],
+      "domain": [
+        256,
+        256
+      ],
+      "baseline": {
+        "median_s": 0.009896631934680045,
+        "min_s": 0.009894427959807217,
+        "max_s": 0.009923311998136342,
+        "peak_mem_mib": 914.16748046875
+      },
+      "optimized": {
+        "median_s": 0.009638941031880677,
+        "min_s": 0.00962474406696856,
+        "max_s": 0.009652365930378437,
+        "peak_mem_mib": 913.41748046875
+      },
+      "speedup_pct": 2.603824255566789,
+      "parity": {
+        "bitwise_identical": true,
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "max_rel_diff": 0.0
+      },
+      "tolerance": "bitwise (same frozen Phase 1)",
+      "note": "Speed-up scales with the Phase-1 cost; measured here against the lightweight test double, so the real gain is much larger."
+    },
+    {
+      "optimization": "frozen Phase-1 conditioning (eval + no_grad)",
+      "bottleneck": "Phase-1 autograd graph retained during Phase-2 training",
+      "files": [
+        "granitewxc/refinement/two_phase.py"
+      ],
+      "domain": [
+        256,
+        256
+      ],
+      "baseline": {
+        "median_s": 1.7552976029692218,
+        "min_s": 1.753208428970538,
+        "max_s": 1.7629795970860869,
+        "peak_mem_mib": 5708.3447265625
+      },
+      "optimized": {
+        "median_s": 1.7555542609188706,
+        "min_s": 1.7540930249961093,
+        "max_s": 1.7565765689359978,
+        "peak_mem_mib": 4882.265625
+      },
+      "speedup_pct": -0.014621905095446586,
+      "parity": {
+        "bitwise_identical": true,
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "max_rel_diff": 0.0
+      },
+      "tolerance": "bitwise"
+    },
+    {
+      "optimization": "precomputed frozen Phase-1 cache (real Prithvi-UNet)",
+      "bottleneck": "frozen Prithvi-UNet forward pass repeated every Phase-2 step",
+      "files": [
+        "granitewxc/refinement/cache.py",
+        "granitewxc/refinement/two_phase.py"
+      ],
+      "domain": [
+        256,
+        256
+      ],
+      "baseline": {
+        "median_s": 1.7631044279551134,
+        "min_s": 1.7603737929603085,
+        "max_s": 1.768060532049276,
+        "peak_mem_mib": 4884.515625
+      },
+      "optimized": {
+        "median_s": 0.010037685045972466,
+        "min_s": 0.009761999943293631,
+        "max_s": 0.010397345991805196,
+        "peak_mem_mib": 1901.73828125
+      },
+      "speedup_pct": 99.43068119580334,
+      "parity": {
+        "bitwise_identical": true,
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "max_rel_diff": 0.0
+      },
+      "tolerance": "bitwise (same frozen Phase 1)"
+    }
+  ]
+}

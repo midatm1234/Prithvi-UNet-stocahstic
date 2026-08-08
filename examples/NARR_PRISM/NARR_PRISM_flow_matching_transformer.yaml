@@ -1,0 +1,484 @@
+# Phase-2 residual refinement with a spatial-token Transformer flow model.
+# Attention runs over 2-D spatial patches of one sample at one timestamp.
+#
+# Spatial downscaling / bias correction: predictors and targets share the
+# same date. There is no forecast lead time anywhere in this file. The
+# diffusion timestep and the flow interpolation time below are mathematical
+# process variables, not physical timestamps.
+#
+# Generated from examples/NARR_PRISM/NARR_PRISM_subdomain.yaml; the source file is unchanged.
+
+data:
+  type: narr_prism
+  predictor_dir: /data2/NARR/data/subset
+  target_dir: /data/PRISM/prism_daily_800m_an
+  target_variables:
+  - ppt
+  - tmax
+  - tmin
+  predictor_variables:
+    shum:
+    - 500
+    - 700
+    - 850
+    uwnd:
+    - 500
+    - 700
+    - 850
+    vwnd:
+    - 500
+    - 700
+    - 850
+    air:
+    - 500
+    - 700
+    - 850
+    hgt:
+    - 500
+    - 700
+    - 850
+  static_elevation_file: ./examples/NARR_PRISM/prism_elevation.nc
+  static_elevation_var: null
+  input_vars:
+  - shum_500
+  - shum_700
+  - shum_850
+  - uwnd_500
+  - uwnd_700
+  - uwnd_850
+  - vwnd_500
+  - vwnd_700
+  - vwnd_850
+  - air_500
+  - air_700
+  - air_850
+  - hgt_500
+  - hgt_700
+  - hgt_850
+  - elev
+  - mask_shum_500
+  - mask_shum_700
+  - mask_shum_850
+  - mask_uwnd_500
+  - mask_uwnd_700
+  - mask_uwnd_850
+  - mask_vwnd_500
+  - mask_vwnd_700
+  - mask_vwnd_850
+  - mask_air_500
+  - mask_air_700
+  - mask_air_850
+  - mask_hgt_500
+  - mask_hgt_700
+  - mask_hgt_850
+  - mask_elev
+  input_levels:
+  - 1
+  input_surface_vars: []
+  vertical_pres_vars:
+  - shum_500
+  - shum_700
+  - shum_850
+  - uwnd_500
+  - uwnd_700
+  - uwnd_850
+  - vwnd_500
+  - vwnd_700
+  - vwnd_850
+  - air_500
+  - air_700
+  - air_850
+  - hgt_500
+  - hgt_700
+  - hgt_850
+  - elev
+  - mask_shum_500
+  - mask_shum_700
+  - mask_shum_850
+  - mask_uwnd_500
+  - mask_uwnd_700
+  - mask_uwnd_850
+  - mask_vwnd_500
+  - mask_vwnd_700
+  - mask_vwnd_850
+  - mask_air_500
+  - mask_air_700
+  - mask_air_850
+  - mask_hgt_500
+  - mask_hgt_700
+  - mask_hgt_850
+  - mask_elev
+  input_level_pres:
+  - 1
+  vertical_level1_vars: []
+  input_level1: []
+  vertical_level2_vars: []
+  input_level2: []
+  other: []
+  output_vars:
+  - ppt
+  - tmax
+  - tmin
+  use_static: false
+  use_preprocessed: true
+  preprocessed_dir: ./examples/NARR_PRISM/preprocessed
+  scalar_dir: ./examples/NARR_PRISM/scalars_with_H
+  scalers:
+    inputs_mean: ./examples/NARR_PRISM/scalars_with_H/inputs_mean.npy
+    inputs_std: ./examples/NARR_PRISM/scalars_with_H/inputs_std.npy
+    targets_mean: ./examples/NARR_PRISM/scalars_with_H/targets_mean.npy
+    targets_std: ./examples/NARR_PRISM/scalars_with_H/targets_std.npy
+  train_crop_size_lat: 256
+  train_crop_size_lon: 256
+  training_spatial_sampling: tiled
+  training_tile_stride_lat: 192
+  training_tile_stride_lon: 192
+  training_halo_lat: 32
+  training_halo_lon: 32
+  min_valid_target_fraction: 0.0001
+  max_crop_retries: 32
+  skip_empty_target_tiles: true
+  n_input_timestamps: 1
+  regrid_method: linear
+  scalar_stride: 1
+  spatial_subset:
+    enabled: true
+    lat_min: 32.55
+    lat_max: 41.075
+    lon_min: -124.45
+    lon_max: -115.925
+dates:
+  training:
+    start: '1996-01-01'
+    end: '2013-12-31'
+  validation:
+    start: '2014-01-01'
+    end: '2015-12-31'
+  inference:
+    start: '2016-01-01'
+    end: '2025-12-31'
+normalization:
+  predictor_method: standardize
+  predictor_mode: global
+  target_method: per_variable
+predictands:
+  ppt:
+    name: ppt
+    allow_negative_value: false
+    nonnegativity:
+      enabled: true
+      method: softplus
+    scaling:
+      method: divide_only
+      scale_stat: p95
+      fixed_scale: null
+    normalization:
+      method: divide_only
+      mode: global
+      eps_std: 1.0e-06
+      allow_negative_value: false
+  tmax:
+    name: tmax
+    allow_negative_value: false
+    nonnegativity:
+      enabled: false
+      method: none
+    scaling:
+      method: zscore
+      scale_stat: mean
+      fixed_scale: null
+    normalization:
+      method: standardize
+      mode: gridpoint
+      eps_std: 1.0e-06
+  tmin:
+    name: tmin
+    allow_negative_value: false
+    nonnegativity:
+      enabled: false
+      method: none
+    scaling:
+      method: zscore
+      scale_stat: mean
+      fixed_scale: null
+    normalization:
+      method: standardize
+      mode: gridpoint
+      eps_std: 1.0e-06
+model:
+  input_mu: ./examples/NARR_PRISM/scalars_with_H/inputs_mean.npy
+  input_sigma: ./examples/NARR_PRISM/scalars_with_H/inputs_std.npy
+  target_mu: ./examples/NARR_PRISM/scalars_with_H/targets_mean.npy
+  target_sigma: ./examples/NARR_PRISM/scalars_with_H/targets_std.npy
+  embed_dim: 1024
+  n_blocks_encoder: 8
+  mlp_multiplier: 4
+  n_heads: 16
+  dropout_rate: 0.0
+  drop_path: 0.0
+  residual: none
+  num_static_channels: 0
+  downscaling_patch_size:
+  - 2
+  - 2
+  downscaling_embed_dim: 512
+  encoder_decoder_type: conv
+  encoder_decoder_upsampling_mode: bilinear
+  encoder_decoder_kernel_size_per_stage:
+  - - 3
+  - - 3
+  encoder_decoder_scale_per_stage:
+  - - 2
+  - - 3
+  encoder_decoder_conv_channels: 128
+  residual_connection: true
+  backbone_residual_mode: pre_conv_add
+  encoder_shift: false
+  unet: true
+  decoder_skip_source: dynamic
+  backbone_attention_scope: windowed_local
+  decoder_upsampling_mode: bilinear
+  output_scaler_resize_mode: bilinear
+  output_scaler_align_corners: false
+  unet_upsample_scales:
+  - 2
+  - 2
+  - 2
+  unet_decoder_kernel_size:
+  - 3
+  - 3
+  - 3
+  phase1:
+    checkpoint: ./examples/NARR_PRISM/experiments/checkpoints/narr_prism_California/last.ckpt
+    freeze: true
+    return_prithvi_features: false
+    return_unet_features: false
+  refinement:
+    enabled: true
+    type: flow_matching_transformer
+    checkpoint: null
+    freeze_phase1: true
+    joint_finetuning: false
+    train_on_residual: true
+    conditioning:
+      deterministic_output: true
+      input_predictors: true
+      prithvi_features: false
+      unet_features: false
+      static_fields: true
+      masks: true
+    ensemble_size: 10
+    loss: mse
+    seed: 1234
+    flow_matching:
+      integration_steps: 50
+      solver: heun
+      source_distribution: gaussian
+      stochastic_initialization: true
+      time_sampling: logit_normal
+    transformer:
+      patch_size: 8
+      embedding_dim: 256
+      num_heads: 8
+      num_blocks: 6
+      mlp_ratio: 4.0
+      dropout: 0.0
+      positional_encoding: learned_2d
+      max_tokens_lat: 256
+      max_tokens_lon: 256
+      gradient_checkpointing: true
+      optimized_attention: auto
+job_id: NARR_PRISM_flow_matching_transformer
+case_name: narr_prism_California
+type_training: full_dataset
+batch_size: 1
+num_epochs: 10
+dl_num_workers: 2
+dl_prefetch_size: 1
+learning_rate: 0.0001
+max_grad_norm: 1.0
+limit_steps_train: 100000
+limit_steps_valid: 100
+min_lr: 1.0e-06
+max_lr: 0.0001
+warm_up_steps: 0
+mask_unit_size:
+- 16
+- 16
+mask_ratio_inputs: 0.0
+mask_ratio_targets: 0.0
+max_batch_size: 4
+path_experiment: ./examples/NARR_PRISM/experiments
+checkpoint_dir: ./examples/NARR_PRISM/experiments/refinement_checkpoints/flow_matching_transformer
+run_dir: ./examples/NARR_PRISM/experiments/runs
+path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET.pt
+backbone_use: true
+backbone_freeze: false
+backbone_prefix: encoder.
+finetune_w_static: false
+strict_matching: false
+device_target: cuda
+distributed_strategy: null
+fsdp_precision: bf16
+fsdp_min_num_params: 5000000
+backbone_gradient_checkpointing: true
+skip_activation_offload: true
+training:
+  distributed: null
+  num_gpus: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 32
+  auto_resume_if_checkpoint_exists: false
+gradient_accumulation_steps: 32
+loss:
+  base: rmse
+  predictands:
+    ppt:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: true
+        bins: 100
+    tmax:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: false
+        bins: 100
+    tmin:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: false
+        bins: 100
+  spatial_gradient:
+    enabled: true
+    weight: 0.03
+    predictands:
+      tmax: 1.0
+      tmin: 1.0
+      ppt: 0.25
+    precipitation_wet_only: true
+    precipitation_wet_threshold: 0.1
+  use_gradient_loss: true
+  gradient_loss_weight: 0.03
+  use_tv_loss: false
+  tv_loss_weight: 0.0005
+  use_multiscale_loss: true
+  multiscale_loss_weight: 0.015
+  tv:
+    enabled: false
+    weight: 0.0005
+    predictands:
+      ppt: 0.1
+      tmax: 0.3
+      tmin: 0.3
+  multiscale:
+    enabled: true
+    weight: 0.015
+    scales:
+    - 2
+    - 4
+    loss_type: l1
+  boundary_continuity:
+    enabled: true
+    weight: 0.01
+    predictands:
+      ppt: 0.2
+      tmax: 1.0
+      tmin: 1.0
+    stride_lat: 16
+    stride_lon: 16
+    match_target: true
+inference:
+  checkpoint_path: null
+  output_dir: ./examples/NARR_PRISM/experiments/inference_output
+  mixed_precision: true
+  mixed_precision_dtype: bfloat16
+  boundary_mitigation:
+    enabled: true
+    tile_size:
+    - 256
+    - 256
+    overlap:
+    - 64
+    - 64
+    halo:
+    - 32
+    - 32
+    blend_mode: hann
+    deblock:
+      enabled: false
+      boundary_width: 2
+      strength: 0.1
+      kernel_size: 3
+    force_full_frame: false
+    blend_window: hann
+    blend_sigma: 0.35
+    use_seam_deblocking: false
+    seam_deblocking_strength: 0.1
+  inference_tile_size:
+  - 256
+  - 256
+  inference_overlap:
+  - 64
+  - 64
+  inference_halo:
+  - 32
+  - 32
+  inference_blend_window: hann
+  inference_blend_sigma: 0.35
+  diagnostics:
+    enabled: true
+    max_days: 1
+    predictor_channels:
+    - 0
+  force_full_frame: false
+  use_seam_deblocking: false
+  seam_deblocking_strength: 0.1
+precip_model: hurdle
+precip_wet_threshold: 0.01
+precip_occurrence_prob_threshold: 0.5
+precip_lambda_occurrence: 1.0
+precip_lambda_amount: 1.0
+precip_amount_loss_type: smoothl1
+resume_training: false
+auto_resume_if_checkpoint_exists: false
+performance:
+  profile: false
+  dataloader:
+    num_workers: auto
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    non_blocking_transfer: true
+  precision:
+    mode: fp32
+    allow_tf32: false
+  compile:
+    enabled: false
+    phase1: false
+    refinement: false
+  phase1_cache:
+    enabled: false
+    path: null
+    include_deterministic_output: true
+    include_prithvi_features: false
+    include_unet_features: false
+    validate_cache: true
+  ensemble:
+    batch_members: true
+    chunk_size: auto
+  io:
+    atomic_checkpoints: true
+    netcdf_compression: true
+    netcdf_compression_level: 4

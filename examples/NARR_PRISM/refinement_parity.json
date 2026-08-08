@@ -1,0 +1,34 @@
+{
+  "config": "/data/granite-wxc-stochastic/examples/NARR_PRISM/NARR_PRISM_subdomain.yaml",
+  "checkpoint": "/data/granite-wxc-stochastic/examples/NARR_PRISM/experiments/checkpoints/narr_prism_California/last.ckpt",
+  "phase1_fingerprint": "4f9c5eb7911b1b0d777fed11d30fd64bea199f19c20612edf23e42b98d165ee3",
+  "device": "cuda:0",
+  "input_shape": [
+    1,
+    32,
+    256,
+    256
+  ],
+  "output_shape": [
+    1,
+    3,
+    256,
+    256
+  ],
+  "key_renames": 208,
+  "loaded_tensors": 208,
+  "missing_keys_phase2_only": 0,
+  "normalized_space": {
+    "max_abs_diff": 0.0,
+    "mean_abs_diff": 0.0,
+    "max_rel_diff": 0.0,
+    "bitwise_identical": true
+  },
+  "physical_space": {
+    "max_abs_diff": 0.0,
+    "mean_abs_diff": 0.0,
+    "max_rel_diff": 0.0,
+    "bitwise_identical": true
+  },
+  "tolerance": 0.0
+}
