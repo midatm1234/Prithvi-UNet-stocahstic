@@ -109,7 +109,7 @@ data:
   - ppt
   - tmax
   - tmin
-  use_static: false
+  use_static: true
   preprocessed_dir: ./examples/NARR_PRISM/preprocessed
   scalar_dir: ./examples/NARR_PRISM/scalars_with_H
   scalers:

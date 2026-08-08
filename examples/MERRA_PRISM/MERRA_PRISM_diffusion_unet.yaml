@@ -118,7 +118,7 @@ data:
   - ppt
   - tmax
   - tmin
-  use_static: false
+  use_static: true
   use_preprocessed: true
   preprocessed_dir: ./examples/MERRA_PRISM/preprocessed
   scalar_dir: ./examples/MERRA_PRISM/scalars_with_H

@@ -109,7 +109,7 @@ data:
   - ppt
   - tmax
   - tmin
-  use_static: false
+  use_static: true
   # Single source of truth: training/scalars/inference consume only the daily
   # products generated under preprocessed/<case_name>/<mode>.
   use_preprocessed: true
