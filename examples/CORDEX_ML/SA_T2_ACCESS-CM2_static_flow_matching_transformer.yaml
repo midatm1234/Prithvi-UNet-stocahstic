@@ -1,0 +1,348 @@
+# Phase-2 'flow_matching_transformer' residual refinement for the cordex workflow.
+#
+# Spatial downscaling / bias correction: predictors and targets share the
+# same date. No forecast lead time is used anywhere. The flow interpolation
+# time is a mathematical process variable, not a physical timestamp.
+#
+# Set model.phase1.checkpoint to the deterministic checkpoint of your case.
+# Generated from examples/CORDEX_ML/SA_T2_ACCESS-CM2_static_v6.yaml; the source file is unchanged.
+
+data:
+  type: cordex
+  training_predictor_paths:
+  - ./granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099_regridded.nc
+  training_target_paths:
+  - ./granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc
+  validation_predictor_paths:
+  - ./granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099_regridded.nc
+  validation_target_paths:
+  - ./granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc
+  test_predictor_paths: []
+  test_target_paths: []
+  static_path: ./granite-geospatial-wxc-downscaling/CORDEX/SA_domain/train/Emulator_hist_future/predictors/Static_fields.nc
+  use_static: true
+  input_vars:
+  - u
+  - v
+  - q
+  - t
+  - z
+  input_levels:
+  - 850.0
+  - 700.0
+  - 500.0
+  input_surface_vars: []
+  input_static_surface_vars:
+  - orog
+  vertical_pres_vars:
+  - u
+  - v
+  - q
+  - t
+  - z
+  vertical_level1_vars: []
+  vertical_level2_vars: []
+  other: []
+  output_vars:
+  - pr
+  - tasmax
+  input_level_pres:
+  - 850.0
+  - 700.0
+  - 500.0
+  input_level1: []
+  input_level2: []
+  n_input_timestamps: 1
+  n_random_windows: 1
+  input_size_lat: 16
+  input_size_lon: 16
+  target_size_lat: 128
+  target_size_lon: 128
+  train_crop_size_lat: 128
+  train_crop_size_lon: 128
+  crop_factor: 128
+  downsample_factor: 8
+  scalers:
+    inputs_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_v6_scalars/inputs_mean.npy
+    inputs_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_v6_scalars/inputs_std.npy
+    targets_mean: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_v6_scalars/targets_mean.npy
+    targets_std: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_v6_scalars/targets_std.npy
+  train_random_crop_offset:
+  - 8
+  - 8
+predictands:
+  pr:
+    name: pr
+    allow_negative_value: false
+    nonnegativity:
+      enabled: true
+      method: softplus
+    scaling:
+      method: divide_only
+      scale_stat: p95
+      fixed_scale: null
+    normalization:
+      method: divide_only
+      mode: global
+      eps_std: 1.0e-06
+      allow_negative_value: false
+  tasmax:
+    name: tasmax
+    allow_negative_value: false
+    nonnegativity:
+      enabled: false
+      method: none
+    scaling:
+      method: zscore
+      scale_stat: mean
+      fixed_scale: null
+    normalization:
+      method: standardize
+      mode: gridpoint
+      eps_std: 1.0e-06
+model:
+  input_mu: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_v6_scalars/inputs_mean.npy
+  input_sigma: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_v6_scalars/inputs_std.npy
+  target_mu: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_v6_scalars/targets_mean.npy
+  target_sigma: /mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_v6_scalars/targets_std.npy
+  embed_dim: 1024
+  n_blocks_encoder: 8
+  mlp_multiplier: 4
+  n_heads: 16
+  dropout_rate: 0.0
+  drop_path: 0.0
+  residual: none
+  num_static_channels: 1
+  downscaling_patch_size:
+  - 2
+  - 2
+  downscaling_embed_dim: 512
+  encoder_decoder_type: conv
+  encoder_decoder_upsampling_mode: pixel_shuffle
+  encoder_decoder_kernel_size_per_stage:
+  - - 3
+  - - 3
+  encoder_decoder_scale_per_stage:
+  - - 2
+  - - 3
+  encoder_decoder_conv_channels: 128
+  residual_connection: true
+  encoder_shift: false
+  unet: true
+  static_embedding_scale: 1.0
+  static_skip_scale: 1
+  static_dropout_p: 0
+  decoder_upsampling_mode: bilinear
+  output_scaler_resize_mode: bilinear
+  output_scaler_align_corners: false
+  unet_upsample_scales:
+  - 2
+  - 2
+  - 2
+  unet_decoder_kernel_size:
+  - 3
+  - 3
+  - 3
+  phase1:
+    checkpoint: ./examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/phase1_unet/best.ckpt
+    freeze: true
+    return_prithvi_features: false
+    return_unet_features: false
+  refinement:
+    enabled: true
+    type: flow_matching_transformer
+    checkpoint: null
+    freeze_phase1: true
+    joint_finetuning: false
+    train_on_residual: true
+    conditioning:
+      deterministic_output: true
+      input_predictors: true
+      prithvi_features: false
+      unet_features: false
+      static_fields: true
+      masks: true
+    ensemble_size: 10
+    loss: mse
+    seed: 1234
+    flow_matching:
+      integration_steps: 50
+      solver: heun
+      source_distribution: gaussian
+      stochastic_initialization: true
+      time_sampling: logit_normal
+    transformer:
+      patch_size: 8
+      embedding_dim: 256
+      num_heads: 8
+      num_blocks: 6
+      mlp_ratio: 4.0
+      dropout: 0.0
+      positional_encoding: learned_2d
+      max_tokens_lat: 128
+      max_tokens_lon: 128
+      gradient_checkpointing: true
+      optimized_attention: auto
+job_id: SA_T2_ACCESS-CM2_static_flow_matching_transformer
+type_training: full_dataset
+batch_size: 64
+num_epochs: 10
+dl_num_workers: 2
+dl_prefetch_size: 1
+learning_rate: 5.0e-05
+limit_steps_train: 100000
+limit_steps_valid: 100
+min_lr: 1.0e-06
+max_lr: 0.0001
+warm_up_steps: 0
+mask_unit_size:
+- 16
+- 16
+mask_ratio_inputs: 0.0
+mask_ratio_targets: 0.0
+max_batch_size: 4
+path_experiment: ./examples/CORDEX_ML/experiments
+path_model_weights: /mnt/data2/kyo/granite-wxc/granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET_small.pt
+backbone_use: true
+backbone_freeze: false
+backbone_prefix: encoder.
+finetune_w_static: true
+strict_matching: false
+device_target: cuda
+distributed_strategy: fsdp
+fsdp_precision: bf16
+fsdp_min_num_params: 5000000
+backbone_gradient_checkpointing: true
+skip_activation_offload: true
+inference:
+  boundary_mitigation:
+    enabled: true
+    tile_size:
+    - 96
+    - 96
+    overlap:
+    - 32
+    - 32
+    blend_mode: hann
+    deblock:
+      enabled: false
+      boundary_width: 2
+      strength: 0.1
+      kernel_size: 3
+    force_full_frame: false
+    blend_window: hann
+    blend_sigma: 0.35
+    use_seam_deblocking: false
+    seam_deblocking_strength: 0.1
+  inference_tile_size:
+  - 96
+  - 96
+  inference_overlap:
+  - 32
+  - 32
+  inference_blend_window: hann
+  inference_blend_sigma: 0.35
+  force_full_frame: false
+  use_seam_deblocking: false
+  seam_deblocking_strength: 0.1
+training:
+  distributed: fsdp
+  num_gpus: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 32
+  auto_resume_if_checkpoint_exists: false
+gradient_accumulation_steps: 32
+resume_training: false
+resume_checkpoint_path: null
+precip_model: hurdle
+precip_wet_threshold: 0.01
+precip_occurrence_prob_threshold: 0.5
+precip_lambda_occurrence: 1.0
+precip_lambda_amount: 1.0
+precip_amount_loss_type: smoothl1
+auto_resume_if_checkpoint_exists: false
+loss:
+  base: rmse
+  predictands:
+    pr:
+      distribution_loss:
+        enabled: false
+        weight: 0.0
+        method: cdf
+        bins: 100
+    tasmax:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: false
+        bins: 100
+  spatial_gradient:
+    enabled: true
+    weight: 0.03
+    predictands:
+      tasmax: 1.0
+      pr: 0.25
+    precipitation_wet_only: true
+    precipitation_wet_threshold: 0.1
+  use_gradient_loss: true
+  gradient_loss_weight: 0.03
+  use_tv_loss: false
+  tv_loss_weight: 0.0005
+  use_multiscale_loss: true
+  multiscale_loss_weight: 0.015
+  tv:
+    enabled: false
+    weight: 0.0005
+    predictands:
+      pr: 0.1
+      tasmax: 0.3
+  multiscale:
+    enabled: true
+    weight: 0.015
+    scales:
+    - 2
+    - 4
+    loss_type: l1
+  boundary_continuity:
+    enabled: true
+    weight: 0.01
+    predictands:
+      pr: 0.2
+      tasmax: 1.0
+    stride_lat: 16
+    stride_lon: 16
+    match_target: true
+performance:
+  profile: false
+  dataloader:
+    num_workers: auto
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    non_blocking_transfer: true
+  precision:
+    mode: fp32
+    allow_tf32: false
+  compile:
+    enabled: false
+    phase1: false
+    refinement: false
+  phase1_cache:
+    enabled: false
+    path: null
+    include_deterministic_output: true
+    include_prithvi_features: false
+    include_unet_features: false
+    validate_cache: true
+  ensemble:
+    batch_members: true
+    chunk_size: auto
+  io:
+    atomic_checkpoints: true
+    netcdf_compression: true
+    netcdf_compression_level: 4
+checkpoint_dir: ./examples/CORDEX_ML/experiments/refinement_checkpoints/SA_T2_ACCESS-CM2_static/flow_matching_transformer
+case_name: cordex_sa_t2_access_cm2_static
