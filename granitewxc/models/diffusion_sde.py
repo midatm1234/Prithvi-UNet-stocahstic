@@ -43,7 +43,14 @@ class SDE(abc.ABC):
         """Mean and std of the perturbation kernel ``p_t(x)``."""
 
     @abc.abstractmethod
-    def prior_sampling(self, shape) -> torch.Tensor:
+    def prior_sampling(
+        self,
+        shape,
+        *,
+        generator: torch.Generator | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         """Draw a sample from the prior ``p_T``."""
 
     def discretize(self, x: torch.Tensor, t: torch.Tensor):
@@ -122,8 +129,13 @@ class VPSDE(SDE):
         std = torch.sqrt(1.0 - torch.exp(2.0 * log_mean_coeff))
         return mean, std
 
-    def prior_sampling(self, shape):
-        return torch.randn(*shape)
+    def prior_sampling(self, shape, *, generator=None, device=None, dtype=None):
+        return torch.randn(
+            *shape,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
 
     def discretize(self, x, t):
         timestep = (t * (self.N - 1) / self.T).long()
@@ -160,8 +172,13 @@ class subVPSDE(SDE):
         std = 1 - torch.exp(2.0 * log_mean_coeff)
         return mean, std
 
-    def prior_sampling(self, shape):
-        return torch.randn(*shape)
+    def prior_sampling(self, shape, *, generator=None, device=None, dtype=None):
+        return torch.randn(
+            *shape,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
 
 
 class VESDE(SDE):
@@ -196,8 +213,13 @@ class VESDE(SDE):
         mean = x
         return mean, std
 
-    def prior_sampling(self, shape):
-        return torch.randn(*shape) * self.sigma_max
+    def prior_sampling(self, shape, *, generator=None, device=None, dtype=None):
+        return torch.randn(
+            *shape,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        ) * self.sigma_max
 
     def discretize(self, x, t):
         timestep = (t * (self.N - 1) / self.T).long()

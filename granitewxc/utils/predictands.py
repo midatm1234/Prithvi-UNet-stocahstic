@@ -29,6 +29,10 @@ ALLOWED_PRECIP_MODELS = {
     "bernoulli_plus_positive",
     "bernoulli_positive_amount",
     "bernoulli-plus-positive-amount",
+    "bernoulli_gamma",
+    "bernoulli-gamma",
+    "bg",
+    "zero_inflated_gamma",
 }
 
 
@@ -107,6 +111,10 @@ def canonicalize_precip_model(value: Any) -> str:
         "bernoulli_plus_positive": "hurdle",
         "bernoulli_positive_amount": "hurdle",
         "bernoulli-plus-positive-amount": "hurdle",
+        "bernoulli_gamma": "bernoulli_gamma",
+        "bernoulli-gamma": "bernoulli_gamma",
+        "bg": "bernoulli_gamma",
+        "zero_inflated_gamma": "bernoulli_gamma",
     }
     return aliases[model]
 

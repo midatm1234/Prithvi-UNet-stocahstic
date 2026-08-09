@@ -1,0 +1,170 @@
+{
+  "status": "PASS",
+  "device": "cuda",
+  "torch_version": "2.11.0+cu128",
+  "elapsed_seconds": 77.04416140000103,
+  "source_config": "D:\\granite-wxc\\examples\\CORDEX_ML\\SA_T2_ACCESS-CM2_static_residual_diffusion.yaml",
+  "diffusion_config": {
+    "sde": "vpsde",
+    "beta_min": 0.1,
+    "beta_max": 20.0,
+    "num_scales": 1000,
+    "prediction_type": "epsilon",
+    "noise_conditioning_scale": 1.0,
+    "fourier_scale": 4.0,
+    "sampling_method": "ddim",
+    "sampling_eps": 0.001,
+    "eta": 0.2,
+    "num_sampling_steps": 256
+  },
+  "objective": {
+    "epsilon_weight": 1.0,
+    "clean_x0_reconstruction_weight": 1.0,
+    "clean_x0_inverse_snr_cap": 100.0
+  },
+  "thresholds": {
+    "minimum_epsilon_loss_reduction": 8.0,
+    "maximum_final_epsilon_mse": 0.08,
+    "maximum_mean_corrected_rmse": 0.055,
+    "maximum_worst_seed_corrected_rmse": 0.09,
+    "minimum_correction_improvement_fraction": 0.65
+  },
+  "gates": [
+    {
+      "examples": 1,
+      "steps": 1000,
+      "initial_epsilon_mse": 1.1341255903244019,
+      "final_epsilon_mse": 0.0007319146534428,
+      "loss_reduction": 1549.532565019256,
+      "baseline_mae": 0.09484288096427917,
+      "baseline_rmse": 0.11833696067333221,
+      "residual_mae_mean": 0.010965437395498157,
+      "residual_rmse_mean": 0.014415422687307,
+      "residual_rmse_worst_seed": 0.018701042979955673,
+      "corrected_mae_mean": 0.010965438093990088,
+      "corrected_rmse_mean": 0.014415423851460218,
+      "corrected_rmse_worst_seed": 0.018701042979955673,
+      "correction_improvement_fraction": 0.8781832508673784,
+      "sample_seeds": [
+        101,
+        202,
+        303,
+        404
+      ],
+      "loss_history": [
+        [
+          1,
+          1.1341255903244019,
+          47.13774871826172,
+          48.271873474121094
+        ],
+        [
+          126,
+          0.03596299886703491,
+          0.18144455552101135,
+          0.21740755438804626
+        ],
+        [
+          251,
+          0.013748707249760628,
+          0.13485756516456604,
+          0.14860627055168152
+        ],
+        [
+          501,
+          0.035671982914209366,
+          0.03389175981283188,
+          0.06956374645233154
+        ],
+        [
+          751,
+          0.0011098040267825127,
+          0.020423835143446922,
+          0.02153363823890686
+        ],
+        [
+          1000,
+          0.0007319146534428,
+          0.011184084229171276,
+          0.01191599853336811
+        ]
+      ]
+    },
+    {
+      "examples": 4,
+      "steps": 1400,
+      "initial_epsilon_mse": 1.097132921218872,
+      "final_epsilon_mse": 0.010465152561664581,
+      "loss_reduction": 104.83678233586714,
+      "baseline_mae": 0.09260128438472748,
+      "baseline_rmse": 0.1157815083861351,
+      "residual_mae_mean": 0.009692687541246414,
+      "residual_rmse_mean": 0.012562841875478625,
+      "residual_rmse_worst_seed": 0.014834078960120678,
+      "corrected_mae_mean": 0.009692687541246414,
+      "corrected_rmse_mean": 0.012562841875478625,
+      "corrected_rmse_worst_seed": 0.014834078960120678,
+      "correction_improvement_fraction": 0.8914952650851539,
+      "sample_seeds": [
+        101,
+        202,
+        303,
+        404
+      ],
+      "loss_history": [
+        [
+          1,
+          1.097132921218872,
+          49.73637390136719,
+          50.8335075378418
+        ],
+        [
+          176,
+          0.024525444954633713,
+          0.41644036769866943,
+          0.44096580147743225
+        ],
+        [
+          351,
+          0.005804317072033882,
+          0.07181479781866074,
+          0.07761911302804947
+        ],
+        [
+          701,
+          0.01444277074187994,
+          0.025928936898708344,
+          0.04037170857191086
+        ],
+        [
+          1051,
+          0.0012150723487138748,
+          0.00912344828248024,
+          0.010338520631194115
+        ],
+        [
+          1400,
+          0.010465152561664581,
+          0.012042751535773277,
+          0.02250790409743786
+        ]
+      ]
+    }
+  ],
+  "failures": [],
+  "artifacts": {
+    "report_json": "D:\\granite-wxc\\examples\\CORDEX_ML\\experiments\\SA_T2_ACCESS-CM2_static_residual_diffusion\\diagnostics\\tiny_overfit_gate\\residual_diffusion_overfit_gate.json",
+    "one_case_npz": "D:\\granite-wxc\\examples\\CORDEX_ML\\experiments\\SA_T2_ACCESS-CM2_static_residual_diffusion\\diagnostics\\tiny_overfit_gate\\one_case_residual_overfit_stages.npz",
+    "space": "normalized_target_space",
+    "npz_fields": [
+      "baseline",
+      "corrected_prediction",
+      "loss_history",
+      "predicted_residual",
+      "residual_error",
+      "sample_seeds",
+      "target",
+      "true_residual"
+    ]
+  }
+}

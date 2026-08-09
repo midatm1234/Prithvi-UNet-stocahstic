@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Callable
 
 import numpy as np
@@ -11,6 +11,156 @@ import xarray as xr
 
 
 DIFFUSION_HEAD_ALIASES = {"diffusion", "diffusion_head", "sde", "score", "score_sde"}
+_ENSEMBLE_GENERATORS_ATTR = "_diffusion_ensemble_generators"
+
+
+class PersistentEnsembleGenerators:
+    """Independent, reproducible RNG streams for diffusion ensemble members.
+
+    The current samplers can draw the initial prior on CPU and later noise on
+    the inference device.  Each member therefore owns both streams. Activating
+    a member temporarily installs its saved states as the global torch/NumPy
+    states (which keeps compatibility with model code that does not accept an
+    explicit ``generator``), then stores the advanced states after inference.
+    The caller's ambient RNG state is restored on exit.
+    """
+
+    def __init__(
+        self,
+        *,
+        ensemble_size: int,
+        base_seed: int,
+        device: torch.device,
+    ) -> None:
+        self.ensemble_size = int(ensemble_size)
+        self.base_seed = int(base_seed)
+        self.device = torch.device(device)
+        if self.device.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA ensemble generators requested but CUDA is unavailable.")
+            if self.device.index is None:
+                self.device = torch.device("cuda", torch.cuda.current_device())
+
+        self._cpu_generators: list[torch.Generator] = []
+        self._device_generators: list[torch.Generator] = []
+        self._numpy_generators: list[np.random.RandomState] = []
+        for member_idx in range(self.ensemble_size):
+            seed = self.base_seed + member_idx
+            self._cpu_generators.append(torch.Generator(device="cpu").manual_seed(seed))
+            if self.device.type == "cuda":
+                self._device_generators.append(
+                    torch.Generator(device=self.device).manual_seed(seed)
+                )
+            self._numpy_generators.append(
+                np.random.RandomState(seed % (2**32 - 1))
+            )
+
+    def matches(
+        self,
+        *,
+        ensemble_size: int,
+        base_seed: int,
+        device: torch.device,
+    ) -> bool:
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None and torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        return (
+            self.ensemble_size == int(ensemble_size)
+            and self.base_seed == int(base_seed)
+            and self.device == device
+        )
+
+    @contextmanager
+    def activate(self, member_idx: int):
+        """Activate one member's RNG stream and save its advanced state."""
+        if not 0 <= int(member_idx) < self.ensemble_size:
+            raise IndexError(
+                f"member_idx must be in [0, {self.ensemble_size}), got {member_idx}."
+            )
+        member_idx = int(member_idx)
+
+        outer_cpu_state = torch.random.get_rng_state()
+        outer_numpy_state = np.random.get_state()
+        outer_device_state = None
+        if self.device.type == "cuda":
+            outer_device_state = torch.cuda.get_rng_state(self.device)
+
+        torch.random.set_rng_state(self._cpu_generators[member_idx].get_state())
+        if self.device.type == "cuda":
+            torch.cuda.set_rng_state(
+                self._device_generators[member_idx].get_state(), self.device
+            )
+        np.random.set_state(self._numpy_generators[member_idx].get_state())
+
+        try:
+            yield
+        finally:
+            self._cpu_generators[member_idx].set_state(torch.random.get_rng_state())
+            if self.device.type == "cuda":
+                self._device_generators[member_idx].set_state(
+                    torch.cuda.get_rng_state(self.device)
+                )
+            self._numpy_generators[member_idx].set_state(np.random.get_state())
+
+            torch.random.set_rng_state(outer_cpu_state)
+            if outer_device_state is not None:
+                torch.cuda.set_rng_state(outer_device_state, self.device)
+            np.random.set_state(outer_numpy_state)
+
+
+def _resolve_ensemble_generators(
+    *,
+    model: torch.nn.Module,
+    ensemble_size: int,
+    base_seed: int,
+    device: torch.device,
+) -> PersistentEnsembleGenerators:
+    """Reuse a model-local generator pool so streams advance across batches."""
+    generators = getattr(model, _ENSEMBLE_GENERATORS_ATTR, None)
+    if not isinstance(generators, PersistentEnsembleGenerators) or not generators.matches(
+        ensemble_size=ensemble_size,
+        base_seed=base_seed,
+        device=device,
+    ):
+        generators = PersistentEnsembleGenerators(
+            ensemble_size=ensemble_size,
+            base_seed=base_seed,
+            device=device,
+        )
+        setattr(model, _ENSEMBLE_GENERATORS_ATTR, generators)
+    return generators
+
+
+def reset_ensemble_generators(model: torch.nn.Module) -> bool:
+    """Reset model-local diffusion RNG streams before a new scenario run.
+
+    Diffusion member streams deliberately persist across batches within one
+    scenario so consecutive dates do not replay the same noise.  They must not
+    persist across independent scenarios, however, because run ordering would
+    then change the output for a fixed scenario.  Clear the cache on the model
+    and on common wrappers so the next batch restarts from ``base_seed``.
+
+    Returns ``True`` when at least one cached pool was removed.
+    """
+
+    removed = False
+    pending: list[torch.nn.Module] = [model]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if hasattr(current, _ENSEMBLE_GENERATORS_ATTR):
+            delattr(current, _ENSEMBLE_GENERATORS_ATTR)
+            removed = True
+        for attribute in ("module", "_orig_mod"):
+            candidate = getattr(current, attribute, None)
+            if isinstance(candidate, torch.nn.Module):
+                pending.append(candidate)
+    return removed
 
 
 def _get_nested(obj: Any, *keys: str) -> Any:
@@ -162,21 +312,42 @@ def infer_batch_ensemble(
     """Run one deterministic pass or multiple independent diffusion samples.
 
     Deterministic outputs keep shape ``[B, V, H, W]``. Diffusion ensemble outputs
-    use shape ``[B, E, V, H, W]``.
+    use shape ``[B, E, V, H, W]``. Each diffusion member owns a persistent RNG
+    stream cached on ``model``: repeated batch calls advance the stream instead
+    of replaying the same spatial noise. Call ``reset_ensemble_generators`` at
+    each scenario boundary to reproduce that scenario independently of run
+    ordering. Exact stochastic replay currently also requires the same batch
+    partitioning because one sampler call consumes one batched RNG sequence.
     """
     is_diffusion = canonical_head_type(head_type) == "diffusion"
     n_members = resolve_ensemble_size(head_type=head_type, requested=ensemble_size) if is_diffusion else 1
     autocast_context = autocast_context or nullcontext
+    ensemble_generators = (
+        _resolve_ensemble_generators(
+            model=model,
+            ensemble_size=n_members,
+            base_seed=base_seed,
+            device=device,
+        )
+        if is_diffusion
+        else None
+    )
 
     outs: list[torch.Tensor] = []
     pre_inverse_outs: list[torch.Tensor] = []
     raw_outs: list[torch.Tensor] = []
 
     for member_idx in range(n_members):
-        if is_diffusion:
-            seed_everything(base_seed + member_idx, device=device)
-        with autocast_context():
-            out, pre_inverse, raw = infer_batch(model=model, batch=batch, cfg=boundary_cfg)
+        rng_context = (
+            ensemble_generators.activate(member_idx)
+            if ensemble_generators is not None
+            else nullcontext()
+        )
+        with rng_context:
+            with autocast_context():
+                out, pre_inverse, raw = infer_batch(
+                    model=model, batch=batch, cfg=boundary_cfg
+                )
         if force_float32:
             out = out.float()
             pre_inverse = pre_inverse.float()
@@ -194,6 +365,199 @@ def infer_batch_ensemble(
             torch.stack(raw_outs, dim=1),
         )
     return outs[0], pre_inverse_outs[0], raw_outs[0]
+
+
+def residual_transformation_stages(
+    *,
+    model: torch.nn.Module,
+    truth_physical: torch.Tensor,
+    final_physical: torch.Tensor,
+    full_standardized: torch.Tensor,
+    generated_residual_standardized: torch.Tensor,
+    baseline_standardized: torch.Tensor,
+    baseline_physical: torch.Tensor | None = None,
+    residual_application_scale: float | None = None,
+) -> dict[str, torch.Tensor]:
+    """Reconstruct and validate every additive-residual inference stage.
+
+    The residual model returns the complete standardized prediction and the
+    raw generated standardized correction separately. The deployed full field
+    is ``baseline + alpha * raw_residual``. The baseline must be supplied
+    directly by the model; recovering it as ``full - residual`` in float32 is
+    numerically fragile when terms nearly cancel. Decoding that baseline
+    (rather than decoding a residual by itself) is valid for all configured
+    target transforms and final precipitation constraints.
+
+    ``final_physical`` may be ``[B,C,H,W]`` or the diffusion-ensemble shape
+    ``[B,E,C,H,W]``. Truth and deterministic baseline stages intentionally do
+    not acquire a redundant ensemble dimension; generated stages retain it.
+    """
+    if truth_physical.ndim != 4:
+        raise ValueError(
+            "truth_physical must have shape [B,C,H,W], got "
+            f"{tuple(truth_physical.shape)}"
+        )
+    if final_physical.shape != full_standardized.shape:
+        raise ValueError(
+            "final physical and standardized predictions must share a shape; "
+            f"got {tuple(final_physical.shape)} and {tuple(full_standardized.shape)}"
+        )
+    if full_standardized.shape != generated_residual_standardized.shape:
+        raise ValueError(
+            "full and residual standardized predictions must share a shape; "
+            f"got {tuple(full_standardized.shape)} and "
+            f"{tuple(generated_residual_standardized.shape)}"
+        )
+    if final_physical.ndim not in (4, 5):
+        raise ValueError(
+            "residual predictions must have shape [B,C,H,W] or [B,E,C,H,W], "
+            f"got {tuple(final_physical.shape)}"
+        )
+    if baseline_standardized.ndim != 4:
+        raise ValueError(
+            "baseline_standardized must have shape [B,C,H,W], got "
+            f"{tuple(baseline_standardized.shape)}"
+        )
+    if tuple(baseline_standardized.shape) != tuple(truth_physical.shape):
+        raise ValueError(
+            "baseline/truth dimensions are incompatible: "
+            f"{tuple(baseline_standardized.shape)} vs {tuple(truth_physical.shape)}"
+        )
+
+    # DDP and torch.compile wrap the methods/config that own target transforms.
+    transform_model: Any = model
+    for attribute in ("module", "_orig_mod"):
+        candidate = getattr(transform_model, attribute, None)
+        if candidate is not None:
+            transform_model = candidate
+    if residual_application_scale is None:
+        head = getattr(transform_model, "diffusion_head", None)
+        cfg = getattr(head, "cfg", None)
+        residual_application_scale = float(
+            getattr(cfg, "residual_application_scale", 1.0)
+        )
+    application_scale = float(residual_application_scale)
+    if not np.isfinite(application_scale) or not 0.0 <= application_scale <= 1.0:
+        raise ValueError(
+            "residual_application_scale must be finite and in [0, 1], got "
+            f"{application_scale!r}."
+        )
+
+    applied_residual_standardized = (
+        generated_residual_standardized * application_scale
+    )
+    if final_physical.ndim == 5:
+        if final_physical.shape[0] != truth_physical.shape[0] or tuple(
+            final_physical.shape[2:]
+        ) != tuple(truth_physical.shape[1:]):
+            raise ValueError(
+                "ensemble prediction/truth dimensions are incompatible: "
+                f"{tuple(final_physical.shape)} vs {tuple(truth_physical.shape)}"
+            )
+        baseline_for_final = baseline_standardized[:, None]
+    else:
+        if tuple(final_physical.shape) != tuple(truth_physical.shape):
+            raise ValueError(
+                "prediction/truth dimensions are incompatible: "
+                f"{tuple(final_physical.shape)} vs {tuple(truth_physical.shape)}"
+            )
+        baseline_for_final = baseline_standardized
+
+    expected_full_standardized = (
+        baseline_for_final + applied_residual_standardized
+    )
+    try:
+        torch.testing.assert_close(
+            full_standardized,
+            expected_full_standardized,
+            rtol=2e-5,
+            atol=2e-6,
+        )
+    except AssertionError as exc:
+        max_error = float(
+            (full_standardized - expected_full_standardized).abs().max().item()
+        )
+        raise RuntimeError(
+            "The full standardized prediction is incompatible with the direct "
+            "deterministic U-Net baseline and applied diffusion residual "
+            f"(max standardized difference={max_error:.6g}); the baseline changed "
+            "across ensemble members or the residual/full outputs are inconsistent."
+        ) from exc
+
+    encode = getattr(transform_model, "_encode_targets_std", None)
+    decode = getattr(transform_model, "_decode_targets_std", None)
+    if not callable(encode) or not callable(decode):
+        raise TypeError(
+            "Residual stage diagnostics require model._encode_targets_std and "
+            "model._decode_targets_std."
+        )
+
+    truth_standardized = encode(truth_physical)
+    if baseline_physical is None:
+        baseline_physical = decode(baseline_standardized)
+    elif tuple(baseline_physical.shape) != tuple(truth_physical.shape):
+        raise ValueError(
+            "physical baseline/truth dimensions are incompatible: "
+            f"{tuple(baseline_physical.shape)} vs {tuple(truth_physical.shape)}"
+        )
+    true_residual_physical = truth_physical - baseline_physical
+    true_residual_standardized = truth_standardized - baseline_standardized
+    baseline_physical_for_final = (
+        baseline_physical[:, None]
+        if final_physical.ndim == 5
+        else baseline_physical
+    )
+    applied_residual_physical = final_physical - baseline_physical_for_final
+
+    # A nonlinear target transform cannot decode a residual in isolation. Decode
+    # the counterfactual baseline + raw residual, then subtract the same baseline.
+    raw_full_standardized = baseline_for_final + generated_residual_standardized
+    if raw_full_standardized.ndim == 5:
+        batch_size, ensemble_size = raw_full_standardized.shape[:2]
+        raw_full_physical = decode(raw_full_standardized.flatten(0, 1)).unflatten(
+            0, (batch_size, ensemble_size)
+        )
+    else:
+        raw_full_physical = decode(raw_full_standardized)
+    raw_residual_physical = raw_full_physical - baseline_physical_for_final
+
+    stages = {
+        "physical_unet_prediction": baseline_physical,
+        "physical_ground_truth": truth_physical,
+        "physical_true_residual": true_residual_physical,
+        "normalized_true_residual": true_residual_standardized,
+        "raw_predicted_normalized_residual": generated_residual_standardized,
+        "predicted_normalized_residual": generated_residual_standardized,
+        "applied_normalized_residual": applied_residual_standardized,
+        "raw_denormalized_predicted_residual": raw_residual_physical,
+        "denormalized_predicted_residual": raw_residual_physical,
+        "applied_denormalized_residual": applied_residual_physical,
+        "final_physical_prediction": final_physical,
+    }
+    for name, value in stages.items():
+        if not bool(torch.isfinite(value).all().item()):
+            raise RuntimeError(
+                f"Residual transformation stage {name!r} contains NaN or infinity."
+            )
+
+    # Keep the additive bookkeeping checks as hard failures. These expressions
+    # subtract and then re-add float32 values; near-zero precipitation can
+    # therefore lose a few ULPs when larger baseline/residual terms cancel.
+    # PyTorch's standard float32 absolute tolerance is 1e-5. The independent
+    # ensemble-baseline consistency check above intentionally remains tighter.
+    torch.testing.assert_close(
+        truth_physical,
+        baseline_physical + true_residual_physical,
+        rtol=2e-5,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        final_physical,
+        baseline_physical_for_final + applied_residual_physical,
+        rtol=2e-5,
+        atol=1e-5,
+    )
+    return stages
 
 
 def variable_array_map(var_names: list[str], values: np.ndarray) -> dict[str, np.ndarray]:
@@ -256,6 +620,13 @@ def add_predictions_to_dataset(
 def as_ensemble_mean(values: np.ndarray, *, ensemble_axis: int = 1) -> np.ndarray:
     """Default evaluation policy for diffusion outputs: evaluate ensemble mean."""
     arr = np.asarray(values)
-    if arr.ndim > ensemble_axis and arr.shape[ensemble_axis] > 1:
-        return arr.mean(axis=ensemble_axis)
-    return arr
+    axis = int(ensemble_axis)
+    if axis < 0:
+        axis += arr.ndim
+    if axis < 0 or axis >= arr.ndim:
+        return arr
+    if arr.shape[axis] < 1:
+        raise ValueError("Cannot compute an ensemble mean over an empty dimension.")
+    # Mean even a singleton ensemble so downstream evaluation always receives
+    # the same [T,V,H,W] contract for E=1 and E>1 diffusion output.
+    return arr.mean(axis=axis)

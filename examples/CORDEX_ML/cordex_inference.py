@@ -67,6 +67,13 @@ def build_inference_dataset(
     crop_size: tuple[int, int] | None = None,
     allow_time_mismatch: bool = True,
 ) -> CordexDownscaleDataset:
+    """Build an inference dataset with strict calendar-date target pairing.
+
+    ``allow_time_mismatch`` retains its historical API name, but when enabled
+    it permits only a length/calendar difference: every predictor timestamp is
+    mapped to one unique target timestamp by its full civil date and time.
+    """
+
     predictor_files = _coerce_paths(predictor_paths)
     target_files = _coerce_paths(target_paths)
     if not predictor_files:

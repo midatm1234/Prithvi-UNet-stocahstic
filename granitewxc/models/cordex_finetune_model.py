@@ -22,6 +22,16 @@ DIFFUSION_HEAD_ALIASES = {"diffusion", "diffusion_head", "sde", "score", "score_
 BERNOULLI_GAMMA_ALIASES = {"bernoulli_gamma", "bernoulli-gamma", "bg", "zero_inflated_gamma"}
 
 
+def _residual_diffusion_enabled(config) -> bool:
+    """Return whether the configured diffusion head models a U-Net residual."""
+    if resolve_head_type(config) != "diffusion":
+        return False
+    diffusion_cfg = getattr(getattr(config, "model", None), "diffusion", None)
+    if isinstance(diffusion_cfg, dict):
+        return bool(diffusion_cfg.get("residual_diffusion", False))
+    return bool(getattr(diffusion_cfg, "residual_diffusion", False))
+
+
 def resolve_head_type(config) -> str:
     """Return ``'diffusion'`` when the config selects the diffusion head.
 
@@ -202,37 +212,96 @@ class ClimateECCCFinetuneWrapper(FinetuneWrapper):
         """
         return bool(return_pre_inverse or return_raw_output)
 
-    def _get_deterministic_baseline_std(
+    def _get_deterministic_baseline(
         self,
         cond: torch.Tensor,
         batch: dict[str, torch.Tensor],
-    ) -> torch.Tensor | None:
-        """Return deterministic baseline in standardized space for residual diffusion.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the real deterministic decoder used by the joint residual model.
 
-        If the model has a ``baseline_head`` (a deterministic conv head trained
-        jointly), its standardized output is used. Otherwise returns None and
-        the caller should pass None to the diffusion head.
+        Returns ``(physical_prediction, standardized_prediction, raw_output)``.
+        The deterministic branch remains differentiable so the existing v6
+        supervised loss can update the backbone and U-Net.  Callers must detach
+        its standardized prediction when constructing the diffusion target.
 
-        The baseline_head is a lightweight conv decoder that can optionally be
-        added to the model when ``residual_diffusion=True`` in the diffusion
-        config. When absent the residual diffusion head uses pure cond features
-        and the diffusion generates the full target from scratch (same as
-        non-residual mode).
+        A previous implementation used a separately initialized ``baseline_head``
+        under ``no_grad()`` and then standardized its already-standardized output
+        a second time.  That was neither the deployed U-Net nor a trainable
+        baseline and produced order-40 tasmax residuals in standardized space.
         """
-        if not getattr(self, "baseline_head", None):
-            return None
-        with torch.no_grad():
-            raw = self.baseline_head(cond)
+        raw: torch.Tensor
+        output_head = getattr(self, "output_conv_block", None)
+        if output_head is not None:
+            raw = output_head(cond)
+        else:
+            output_head = getattr(self, "head", None)
+            if output_head is None:
+                raise RuntimeError(
+                    "residual_diffusion=True requires the model's deterministic "
+                    "U-Net output head; no output_conv_block/head is available."
+                )
+            raw = output_head(cond)
+
         scaler_offset = batch.get("__scaler_offset")
-        constrained = self._apply_output_constraints(raw)
-        mu, sigma = self._resolve_output_scalers(constrained, scaler_offset=scaler_offset)
-        method_codes = self.predictand_scaling_method_codes.to(device=constrained.device)
-        code = method_codes.view(1, -1, 1, 1)
-        denom = sigma + 1e-12
-        zscore = (constrained - mu) / denom
-        divide = constrained / denom
-        log1p = (torch.log1p(torch.clamp(constrained, min=0.0)) - mu) / denom
-        return torch.where(code == 1, divide, torch.where(code == 2, log1p, zscore))
+        wet_logits = None
+        if bool(getattr(self, "precip_hurdle_enabled", False)):
+            wet_head = getattr(self, "precip_wet_head", None)
+            if wet_head is None:
+                raise RuntimeError(
+                    "Joint residual diffusion with precip_model='hurdle' requires "
+                    "the deterministic precip_wet_head."
+                )
+            wet_logits = wet_head(cond)
+
+        if wet_logits is None:
+            physical, _ = self._decode_outputs(raw, scaler_offset=scaler_offset)
+        else:
+            physical, _ = self._decode_outputs(
+                raw,
+                scaler_offset=scaler_offset,
+                wet_logits=wet_logits,
+            )
+        if self._last_precip_hurdle_aux is not None:
+            # CompositePredictandLoss reads the same auxiliary tensors in both
+            # deterministic v6 and joint residual-diffusion training.  The
+            # diffusion forward returns earlier than the ordinary deterministic
+            # forward, so publish them here rather than relying on that later
+            # code path.
+            batch["__precip_hurdle_aux"] = self._last_precip_hurdle_aux
+        else:
+            batch.pop("__precip_hurdle_aux", None)
+
+        self._last_bg_aux = None
+        if bool(getattr(self, "precip_bg_enabled", False)):
+            bg_head = getattr(self, "precip_bg_head", None)
+            if bg_head is None:
+                raise RuntimeError(
+                    "Joint residual diffusion with precip_model='bernoulli_gamma' "
+                    "requires precip_bg_head."
+                )
+            bg_out = bg_head.predict(cond, stochastic=False)
+            pr_idx = int(self.precip_channel_index)
+            physical_channels = list(physical.split(1, dim=1))
+            physical_channels[pr_idx] = bg_out["pr_expected"]
+            physical = torch.cat(physical_channels, dim=1)
+            self._last_bg_aux = {
+                "logit_wet": bg_out["logit_wet"],
+                "log_mu": bg_out["log_mu"],
+                "log_phi": bg_out["log_phi"],
+                "p_wet": bg_out["p_wet"],
+                "mu_pos": bg_out["mu_pos"],
+                "phi": bg_out["phi"],
+                "pr_expected": bg_out["pr_expected"],
+            }
+            batch["__bernoulli_gamma_aux"] = self._last_bg_aux
+        else:
+            batch.pop("__bernoulli_gamma_aux", None)
+
+        # Encode the *physical deterministic prediction* exactly once.  This is
+        # important for the hurdle precipitation branch, where dry-day zeros are
+        # part of the deployed baseline but are not represented by amount logits.
+        baseline_std = self._encode_targets_std(physical, scaler_offset=scaler_offset)
+        return physical, baseline_std, raw
 
     def _diffusion_forward(
         self,
@@ -240,6 +309,8 @@ class ClimateECCCFinetuneWrapper(FinetuneWrapper):
         batch: dict[str, torch.Tensor],
         return_pre_inverse: bool = False,
         return_raw_output: bool = False,
+        diffusion_generator: torch.Generator | None = None,
+        diffusion_application_scale: float | None = None,
     ):
         """Shared diffusion-head forward for both CORDEX model variants.
 
@@ -248,13 +319,18 @@ class ClimateECCCFinetuneWrapper(FinetuneWrapper):
         diffusion sampler and decodes the standardized sample to physical
         ``pr``/``tasmax`` (preserving precipitation non-negativity).
 
-        Residual diffusion mode: when ``diffusion_head.cfg.residual_diffusion``
-        is True and a ``baseline_head`` module is present, the diffusion head
-        generates a residual correction around the deterministic baseline
-        prediction. The baseline is computed in standardized space and passed
-        to the diffusion head as ``baseline_std``.
+        Residual diffusion mode trains the deterministic U-Net with the
+        configured supervised loss.  When ``residual_mean_enabled`` is active,
+        it also exposes ``baseline + predicted_residual_mean`` in physical units
+        so the *same YAML-built loss* can directly supervise the correction.
+        Score matching then models only the detached stochastic innovation.
         """
         self._last_precip_hurdle_aux = None
+        self._last_bg_aux = None
+        # Sampling diagnostics consume the deterministic baseline directly.
+        # Clear the prior call first so a failed/non-residual forward can never
+        # expose stale tensors from another batch.
+        self._last_diffusion_baseline = None
         scaler_offset = batch.get("__scaler_offset")
 
         # Optionally compute deterministic baseline in std space for residual diffusion.
@@ -262,24 +338,96 @@ class ClimateECCCFinetuneWrapper(FinetuneWrapper):
             getattr(self.diffusion_head, "cfg", None) is not None
             and getattr(self.diffusion_head.cfg, "residual_diffusion", False)
         )
+        baseline_physical: torch.Tensor | None = None
         baseline_std: torch.Tensor | None = None
         if residual_mode:
-            baseline_std = self._get_deterministic_baseline_std(cond, batch)
+            baseline_physical, baseline_std, _ = self._get_deterministic_baseline(cond, batch)
 
         if not self._diffusion_wants_sample(return_pre_inverse, return_raw_output):
             target_std = self._encode_targets_std(batch["y"], scaler_offset=scaler_offset)
-            return self.diffusion_head.training_loss(cond, target_std, baseline_std=baseline_std)
+            diffusion_loss = self.diffusion_head.training_loss(
+                cond.detach() if residual_mode else cond,
+                target_std,
+                baseline_std=baseline_std.detach() if baseline_std is not None else None,
+            )
+            if residual_mode:
+                if baseline_physical is None:
+                    raise RuntimeError("Residual diffusion did not produce a deterministic baseline.")
+                result = {
+                    "diffusion_loss": diffusion_loss,
+                    "diffusion_loss_terms": (
+                        self.diffusion_head.get_last_training_loss_term_tensors()
+                    ),
+                    "baseline_prediction": baseline_physical,
+                }
+                residual_mean_std = self.diffusion_head.get_last_residual_mean()
+                if residual_mean_std is not None:
+                    if baseline_std is None:
+                        raise RuntimeError(
+                            "Residual-mean diffusion did not produce a standardized baseline."
+                        )
+                    baseline_for_mean = baseline_std.detach()
+                    if baseline_for_mean.shape[-2:] != residual_mean_std.shape[-2:]:
+                        baseline_for_mean = F.interpolate(
+                            baseline_for_mean,
+                            size=residual_mean_std.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    if baseline_for_mean.shape != residual_mean_std.shape:
+                        raise RuntimeError(
+                            "Residual mean and standardized baseline shapes differ: "
+                            f"{tuple(residual_mean_std.shape)} vs "
+                            f"{tuple(baseline_for_mean.shape)}."
+                        )
+                    corrected_mean_std = baseline_for_mean + residual_mean_std
+                    result["corrected_mean_prediction"] = self._decode_targets_std(
+                        corrected_mean_std,
+                        scaler_offset=scaler_offset,
+                    )
+                return result
+            return diffusion_loss
 
         expected_hw = batch["y"].shape[-2:] if "y" in batch else cond.shape[-2:]
-        std_sample = self.diffusion_head.sample(
+        std_sample, generated_residual_std = self.diffusion_head.sample_components(
             cond,
             int(expected_hw[0]),
             int(expected_hw[1]),
+            generator=diffusion_generator,
             baseline_std=baseline_std,
+            application_scale=diffusion_application_scale,
         )
+        if baseline_std is not None and baseline_physical is not None:
+            baseline_std_for_output = baseline_std
+            if tuple(baseline_std_for_output.shape[-2:]) != tuple(expected_hw):
+                baseline_std_for_output = F.interpolate(
+                    baseline_std_for_output,
+                    size=expected_hw,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                # The sampler combines in standardized target space, so decode
+                # that exact resized baseline rather than interpolating a
+                # nonlinear physical-space transform independently.
+            # Sampling returns standardized baseline + correction and the model
+            # decodes that full tensor. Publish the baseline through the same
+            # decode path so alpha=0 has an exactly zero applied physical delta,
+            # even when encode/decode incurs a few floating-point ULPs relative
+            # to the pre-encoding deterministic tensor.
+            baseline_physical_for_output = self._decode_targets_std(
+                baseline_std_for_output,
+                scaler_offset=scaler_offset,
+            )
+            self._last_diffusion_baseline = (
+                baseline_physical_for_output.detach(),
+                baseline_std_for_output.detach(),
+            )
         x_out = self._decode_targets_std(std_sample, scaler_offset=scaler_offset)
         x_pre_inverse = std_sample
-        raw_out = std_sample
+        # The raw inference tensor is the generated correction in residual mode;
+        # this makes transformation-stage diagnostics unambiguous. Full-field
+        # diffusion keeps its historical behavior because both tensors match.
+        raw_out = generated_residual_std
 
         if tuple(x_out.shape[-2:]) != tuple(expected_hw):
             x_out = F.interpolate(x_out, size=expected_hw, mode="bilinear", align_corners=False)
@@ -295,6 +443,13 @@ class ClimateECCCFinetuneWrapper(FinetuneWrapper):
         if return_raw_output:
             return x_out, raw_out
         return x_out
+
+    def get_last_diffusion_baseline(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return the last sampled batch's direct physical/std baseline pair."""
+
+        return getattr(self, "_last_diffusion_baseline", None)
 
 
 #-----------------------------------------------------
@@ -517,15 +672,17 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         self._decoder_output_channels = current_ch
         self.head_type = resolve_head_type(config)
         self.diffusion_enabled = self.head_type == "diffusion"
-        if self.diffusion_enabled:
-            # The deterministic conv head is replaced by the diffusion head,
-            # which is built after predictand decoding is configured.
-            self.output_conv_block = None
-        else:
+        self.residual_diffusion_enabled = _residual_diffusion_enabled(config)
+        if not self.diffusion_enabled or self.residual_diffusion_enabled:
+            # Residual mode keeps the exact deterministic U-Net decoder.  It is
+            # supervised by the normal v6 objective and supplies the baseline
+            # used to define the detached diffusion target.
             self.output_conv_block = nn.Sequential(nn.Conv2d(current_ch, current_ch, kernel_size=3, stride=1, padding='same', padding_mode='replicate'),
                                                    nn.LeakyReLU(),
                                                    nn.Conv2d(current_ch, out_channels, kernel_size=3, stride=1, padding='same', padding_mode='replicate'),
                                                   )
+        else:
+            self.output_conv_block = None
         self.precip_wet_head: nn.Module | None = None
 
         self.apply(self._init_weights)
@@ -543,47 +700,23 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             )
         self._configure_predictand_decoding(config)
         if self.diffusion_enabled:
-            if self.precip_hurdle_enabled:
+            if (self.precip_hurdle_enabled or self.precip_bg_enabled) and not self.residual_diffusion_enabled:
                 raise ValueError(
-                    "head_type='diffusion' is incompatible with precip_model='hurdle'. "
-                    "Use the single-head precipitation model (precip_model: single_head) "
-                    "with the diffusion head."
+                    "A full-field diffusion head is incompatible with a separate "
+                    "probabilistic precipitation decoder. Use precip_model='single_head', "
+                    "or enable residual_diffusion so the probabilistic decoder is the "
+                    "supervised deterministic baseline."
                 )
             self.diffusion_head = build_diffusion_head(
                 config,
                 cond_channels=self._decoder_output_channels,
                 output_channels=int(self.output_scalers_sigma.shape[1]),
             )
-            # Optional lightweight deterministic head for residual diffusion mode.
-            # When residual_diffusion=True the diffusion score network generates a
-            # correction around this baseline rather than the full target from noise.
-            _diff_cfg = getattr(self.diffusion_head, "cfg", None)
-            if _diff_cfg is not None and getattr(_diff_cfg, "residual_diffusion", False):
-                n_out = int(self.output_scalers_sigma.shape[1])
-                self.baseline_head: nn.Module | None = nn.Sequential(
-                    nn.Conv2d(
-                        self._decoder_output_channels,
-                        self._decoder_output_channels,
-                        kernel_size=3,
-                        stride=1,
-                        padding=1,
-                    ),
-                    nn.LeakyReLU(),
-                    nn.Conv2d(
-                        self._decoder_output_channels,
-                        n_out,
-                        kernel_size=3,
-                        stride=1,
-                        padding=1,
-                    ),
-                )
-                self._init_weights(self.baseline_head[0])
-                self._init_weights(self.baseline_head[2])
-            else:
-                self.baseline_head = None
         else:
             self.diffusion_head = None
-            self.baseline_head = None
+        # Kept as a non-module compatibility marker.  Residual mode must never
+        # silently fall back to the obsolete random two-convolution baseline.
+        self.baseline_head = None
         if self.precip_hurdle_enabled:
             self.precip_wet_head = nn.Conv2d(
                 in_channels=self._decoder_output_channels,
@@ -887,6 +1020,8 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         batch: dict[str, torch.tensor],
         return_pre_inverse: bool = False,
         return_raw_output: bool = False,
+        diffusion_generator: torch.Generator | None = None,
+        diffusion_application_scale: float | None = None,
     ):
         """
         Args:
@@ -903,7 +1038,9 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         # stale reference from the previous step before allocating new activations,
         # otherwise the previous autograd graph can remain alive and raise peak VRAM.
         self._last_precip_hurdle_aux = None
+        self._last_bg_aux = None
         batch.pop("__precip_hurdle_aux", None)
+        batch.pop("__bernoulli_gamma_aux", None)
 
         B, _, H, W = batch['x'].shape
         # Scale inputs
@@ -1071,6 +1208,8 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 batch,
                 return_pre_inverse=return_pre_inverse,
                 return_raw_output=return_raw_output,
+                diffusion_generator=diffusion_generator,
+                diffusion_application_scale=diffusion_application_scale,
             )
 
         x = self.output_conv_block(out)
@@ -1362,6 +1501,7 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
 
         self.head_type = resolve_head_type(config)
         self.diffusion_enabled = self.head_type == "diffusion"
+        self.residual_diffusion_enabled = _residual_diffusion_enabled(config)
         if self.diffusion_enabled:
             if getattr(self, "precip_hurdle_enabled", False):
                 raise ValueError(
@@ -1373,31 +1513,9 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
                 cond_channels=self.embed_dim_backbone,
                 output_channels=int(self.output_scalers_sigma.shape[1]),
             )
-            _diff_cfg = getattr(self.diffusion_head, "cfg", None)
-            if _diff_cfg is not None and getattr(_diff_cfg, "residual_diffusion", False):
-                n_out = int(self.output_scalers_sigma.shape[1])
-                self.baseline_head: nn.Module | None = nn.Sequential(
-                    nn.Conv2d(
-                        self.embed_dim_backbone,
-                        self.embed_dim_backbone,
-                        kernel_size=3,
-                        stride=1,
-                        padding=1,
-                    ),
-                    nn.LeakyReLU(),
-                    nn.Conv2d(
-                        self.embed_dim_backbone,
-                        n_out,
-                        kernel_size=3,
-                        stride=1,
-                        padding=1,
-                    ),
-                )
-            else:
-                self.baseline_head = None
         else:
             self.diffusion_head = None
-            self.baseline_head = None
+        self.baseline_head = None
 
     def _configure_predictand_decoding(self, config: ExperimentConfig | None) -> None:
         n_outputs = int(self.output_scalers_sigma.shape[1])
@@ -1581,6 +1699,8 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
         batch: dict[str, torch.tensor],
         return_pre_inverse: bool = False,
         return_raw_output: bool = False,
+        diffusion_generator: torch.Generator | None = None,
+        diffusion_application_scale: float | None = None,
     ):
         """
         Args:
@@ -1693,6 +1813,8 @@ class ClimateDownscaleFinetuneModel(ClimateECCCFinetuneWrapper):
                 batch,
                 return_pre_inverse=return_pre_inverse,
                 return_raw_output=return_raw_output,
+                diffusion_generator=diffusion_generator,
+                diffusion_application_scale=diffusion_application_scale,
             )
 
         x = self.head(x)  # [batch, out_channels, lat*scale[0]*scale[1], lon*scale[0]*scale[1]]

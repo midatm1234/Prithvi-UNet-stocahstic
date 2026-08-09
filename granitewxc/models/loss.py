@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -188,6 +186,8 @@ class CompositePredictandLoss:
                 wet_threshold=float(cfg.get("precip_wet_threshold", 0.1)),
                 lambda_occurrence=float(cfg.get("precip_lambda_occurrence", 1.0)),
                 lambda_positive_amount=float(cfg.get("precip_lambda_amount", 1.0)),
+                min_mu=float(cfg.get("precip_bg_min_mu", 1e-4)),
+                min_phi=float(cfg.get("precip_bg_min_phi", 1e-4)),
             )
             self._bg_loss = BernoulliGammaLoss(config=_bg_cfg, output_vars=self.output_vars)
 
@@ -775,6 +775,21 @@ class CompositePredictandLoss:
             }
         else:
             payload["precip_hurdle"] = {"enabled": False}
+        if self._bg_loss is not None:
+            bg_cfg = self._bg_loss.cfg
+            payload["bernoulli_gamma"] = {
+                "enabled": True,
+                "precip_index": self._bg_precip_index,
+                # Physical mm/day: batch['y'] and the BG mean use the same
+                # units, so this value must never be divided by target p95.
+                "wet_threshold": bg_cfg.wet_threshold,
+                "lambda_occurrence": bg_cfg.lambda_occurrence,
+                "lambda_positive_amount": bg_cfg.lambda_positive_amount,
+                "min_mu": bg_cfg.min_mu,
+                "min_phi": bg_cfg.min_phi,
+            }
+        else:
+            payload["bernoulli_gamma"] = {"enabled": False}
         return payload
 
 
@@ -796,6 +811,21 @@ def _head_type_is_diffusion(config: Any) -> bool:
     }
 
 
+def _residual_diffusion_enabled(config: Any) -> bool:
+    model_cfg = getattr(config, "model", None)
+    if isinstance(model_cfg, Mapping):
+        diffusion_cfg = model_cfg.get("diffusion")
+    else:
+        diffusion_cfg = (
+            getattr(model_cfg, "diffusion", None)
+            if model_cfg is not None
+            else None
+        )
+    return bool(
+        _coerce_mapping(diffusion_cfg).get("residual_diffusion", False)
+    )
+
+
 def _precip_model_is_bernoulli_gamma(config: Any) -> bool:
     raw = _canonicalize_precip_model(
         getattr(config, "precip_model", getattr(config, "precip_head_type", "single_head"))
@@ -804,72 +834,22 @@ def _precip_model_is_bernoulli_gamma(config: Any) -> bool:
 
 
 def _resolve_precip_wet_threshold(config: Any, merged_cfg: dict[str, Any], output_vars: list[str]) -> dict[str, Any]:
-    """Convert precip_wet_threshold from mm/day (physical) to normalised units.
+    """Keep wet/dry thresholds in physical precipitation units.
 
-    Only applies when ``precip_model='bernoulli_gamma'``.  For legacy hurdle
-    configs the threshold is already stored in normalised space and must not
-    be divided again.
-
-    ``precip_wet_threshold`` is expressed in mm/day in the YAML.  The model
-    operates on precipitation that has been divided by its p95 scalar, so the
-    threshold must be divided by the same value before being compared against
-    ``batch["y"]``.  The p95 is taken from ``targets_std.npy`` at the
-    precipitation variable index.
-
-    If the scaler file cannot be found the threshold is passed through
-    unchanged with a warning.
+    Both the hurdle and Bernoulli-Gamma losses compare the threshold directly
+    with ``batch['y']``, whose precipitation channel is in mm/day.  Dividing a
+    Bernoulli-Gamma threshold by the p95 target scaler therefore mixes spaces
+    and incorrectly labels trace precipitation as wet.
     """
-    precip_model = _canonicalize_precip_model(
-        merged_cfg.get("precip_model", merged_cfg.get("precip_head_type", "single_head"))
-    )
-    if precip_model != "bernoulli_gamma":
-        return merged_cfg
-
-    raw_threshold = float(merged_cfg.get("precip_wet_threshold", 0.1))
-
-    pr_idx = next(
-        (i for i, name in enumerate(output_vars) if str(name).lower() in PRECIP_VAR_NAMES),
-        -1,
-    )
-    if pr_idx < 0:
-        return merged_cfg
-
-    # Locate targets_std.npy via model config or data.scalers
-    p95 = None
-    model_cfg = getattr(config, "model", None)
-    target_sigma_path = getattr(model_cfg, "target_sigma", None) if model_cfg is not None else None
-    if target_sigma_path is None:
-        data_cfg = getattr(config, "data", None)
-        scalers = getattr(data_cfg, "scalers", None) if data_cfg is not None else None
-        if isinstance(scalers, Mapping):
-            target_sigma_path = scalers.get("targets_std")
-        elif hasattr(scalers, "targets_std"):
-            target_sigma_path = getattr(scalers, "targets_std")
-
-    if target_sigma_path is not None:
-        try:
-            arr = np.load(str(target_sigma_path))
-            p95 = float(np.ravel(arr)[pr_idx])
-        except Exception:
-            pass
-
-    if p95 is None or p95 <= 0.0:
-        import warnings
-        warnings.warn(
-            f"precip_wet_threshold: could not load p95 scaler to convert {raw_threshold} mm/day "
-            "to normalised units — using the raw value as-is.",
-            stacklevel=4,
-        )
-        return merged_cfg
-
-    normalised = raw_threshold / p95
-    updated = dict(merged_cfg)
-    updated["precip_wet_threshold"] = normalised
-    return updated
+    return merged_cfg
 
 
 def build_loss_fn(config: Any, output_vars: list[str]):
-    if _head_type_is_diffusion(config):
+    is_diffusion = _head_type_is_diffusion(config)
+    is_residual_diffusion = (
+        is_diffusion and _residual_diffusion_enabled(config)
+    )
+    if is_diffusion and not is_residual_diffusion:
         from granitewxc.models.diffusion_loss import DiffusionLossPassthrough
 
         return DiffusionLossPassthrough(output_vars=output_vars)
@@ -895,10 +875,79 @@ def build_loss_fn(config: Any, output_vars: list[str]):
     if "mask_unit_size" not in merged_cfg and hasattr(config, "mask_unit_size"):
         merged_cfg["mask_unit_size"] = getattr(config, "mask_unit_size")
 
+    # Bernoulli-Gamma exposes its numerical/distribution parameters under the
+    # model block because the decoder and loss must share them. Mirror the
+    # loss-relevant values into the composite-loss namespace unless an explicit
+    # top-level/loss override was supplied.
+    model_cfg = getattr(config, "model", None)
+    bg_cfg = _coerce_mapping(
+        getattr(model_cfg, "bernoulli_gamma", None) if model_cfg is not None else None
+    )
+    for loss_key, bg_key in (
+        ("precip_wet_threshold", "wet_threshold"),
+        ("precip_lambda_occurrence", "lambda_occurrence"),
+        ("precip_lambda_amount", "lambda_positive_amount"),
+        ("precip_bg_min_mu", "min_mu"),
+        ("precip_bg_min_phi", "min_phi"),
+    ):
+        if loss_key not in merged_cfg and bg_key in bg_cfg:
+            merged_cfg[loss_key] = bg_cfg[bg_key]
+
     precip_model = _canonicalize_precip_model(
         merged_cfg.get("precip_model", merged_cfg.get("precip_head_type", "single_head"))
     )
-    if not loss_cfg and precip_model not in {"hurdle", "bernoulli_gamma"}:
+    if (
+        not is_residual_diffusion
+        and not loss_cfg
+        and precip_model not in {"hurdle", "bernoulli_gamma"}
+    ):
         return rmse_loss
     merged_cfg = _resolve_precip_wet_threshold(config, merged_cfg, output_vars)
-    return CompositePredictandLoss(output_vars=output_vars, loss_cfg=merged_cfg)
+    deterministic_loss = CompositePredictandLoss(
+        output_vars=output_vars,
+        loss_cfg=merged_cfg,
+    )
+
+    if is_residual_diffusion:
+        from granitewxc.models.diffusion_loss import JointResidualDiffusionLoss
+
+        diffusion_loss_cfg = _coerce_mapping(loss_cfg.get("diffusion"))
+        joint_loss = JointResidualDiffusionLoss(
+            deterministic_loss=deterministic_loss,
+            output_vars=output_vars,
+            deterministic_weight=float(
+                loss_cfg.get("deterministic_weight", 1.0)
+            ),
+            diffusion_weight=float(diffusion_loss_cfg.get("weight", 1.0)),
+            corrected_mean_weight=diffusion_loss_cfg.get(
+                "corrected_mean_weight", 0.0
+            ),
+            improvement_penalty_weight=diffusion_loss_cfg.get(
+                "improvement_penalty_weight", 0.0
+            ),
+            minimum_relative_improvement=diffusion_loss_cfg.get(
+                "minimum_relative_improvement", 0.0
+            ),
+        )
+        correction_objective_enabled = (
+            joint_loss.corrected_mean_weight > 0.0
+            or joint_loss.improvement_penalty_weight > 0.0
+        )
+        has_precipitation = any(
+            str(name).lower() in PRECIP_VAR_NAMES for name in output_vars
+        )
+        if (
+            correction_objective_enabled
+            and has_precipitation
+            and precip_model != "single_head"
+        ):
+            raise ValueError(
+                "YAML-enabled corrected-mean supervision requires "
+                "precip_model='single_head' when precipitation is an output. "
+                "The hurdle/Bernoulli-Gamma likelihood auxiliaries describe only "
+                "the baseline head and cannot score a corrected precipitation "
+                "field with the same configured loss."
+            )
+        return joint_loss
+
+    return deterministic_loss

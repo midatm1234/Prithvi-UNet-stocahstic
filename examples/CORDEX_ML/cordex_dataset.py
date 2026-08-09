@@ -159,6 +159,12 @@ class CordexDownscaleDataset(Dataset):
             )
         self._rng = np.random.default_rng(seed)
 
+        # In inference mode, predictor and target calendars can legitimately
+        # have different lengths (for example, 7300 no-leap predictor days and
+        # 7305 Gregorian target days).  Store an exact date-based target index
+        # for each predictor file instead of assuming that equal integer
+        # positions refer to the same day.
+        self._target_time_indices: List[Optional[np.ndarray]] = []
         self._time_lengths, self._target_time_lengths = self._compute_time_lengths()
         self._cumulative_sizes = self._build_cumulative_sizes(self._time_lengths)
 
@@ -172,13 +178,15 @@ class CordexDownscaleDataset(Dataset):
         lat_slice, lon_slice = self._select_crop()
 
         x = self._load_predictors(self.predictor_paths[file_idx], time_idx, lat_slice, lon_slice)
-        target_lengths = getattr(self, "_target_time_lengths", self._time_lengths)
+        target_time_indices = getattr(self, "_target_time_indices", [])
+        target_time_idx = time_idx
+        if target_time_indices and target_time_indices[file_idx] is not None:
+            target_time_idx = int(target_time_indices[file_idx][time_idx])
         y = self._load_targets(
             self.target_paths[file_idx],
-            time_idx,
+            target_time_idx,
             lat_slice,
             lon_slice,
-            target_len=target_lengths[file_idx],
         )
 
         if self.random_crop_offset != (0, 0):
@@ -255,22 +263,69 @@ class CordexDownscaleDataset(Dataset):
             target_len = self._read_time_length(target_path)
             target_lengths.append(target_len)
 
-            if predictor_len != target_len:
-                if not self.allow_time_mismatch:
+            if self.allow_time_mismatch:
+                self._target_time_indices.append(
+                    self._build_exact_target_time_index(predictor_path, target_path)
+                )
+            else:
+                self._target_time_indices.append(None)
+                if predictor_len != target_len:
                     raise ValueError(
                         f"Time dimension mismatch between {predictor_path} and {target_path}"
                     )
-                warnings.warn(
-                    "Time dimension mismatch between "
-                    f"{predictor_path} (len={predictor_len}) and "
-                    f"{target_path} (len={target_len}); "
-                    "using predictor length for indexing targets.",
-                    RuntimeWarning,
-                )
 
             lengths.append(predictor_len)
 
         return lengths, target_lengths
+
+    def _build_exact_target_time_index(
+        self,
+        predictor_path: str,
+        target_path: str,
+    ) -> np.ndarray:
+        """Map every predictor timestamp to one unique target timestamp.
+
+        Calendar classes are intentionally ignored when comparing labels: a
+        ``cftime.DatetimeNoLeap(1984, 3, 1)`` must match Gregorian
+        ``1984-03-01``.  Calendar-only dates such as February 29 may therefore
+        exist in the target without a predictor counterpart, but every
+        predictor date must be present exactly once in both files.
+        """
+
+        if not self.time_dim:
+            raise ValueError(
+                "Exact inference time alignment requires a predictor time dimension"
+            )
+
+        predictor_values = self._read_time_coordinate(predictor_path, role="Predictor")
+        target_values = self._read_time_coordinate(target_path, role="Target")
+        return _exact_time_index(
+            predictor_values,
+            target_values,
+            predictor_path=predictor_path,
+            target_path=target_path,
+        )
+
+    def _read_time_coordinate(self, path: str, *, role: str) -> np.ndarray:
+        with xr.open_dataset(path) as ds:
+            if self.time_dim not in ds.dims:
+                raise ValueError(
+                    f"{role} file {path} is missing time dimension {self.time_dim!r}"
+                )
+            if self.time_dim not in ds.coords:
+                raise ValueError(
+                    f"{role} file {path} is missing time coordinate {self.time_dim!r}"
+                )
+            values = np.asarray(ds[self.time_dim].values)
+
+        if values.ndim != 1:
+            raise ValueError(
+                f"{role} time coordinate in {path} must be one-dimensional; "
+                f"got shape {values.shape}"
+            )
+        if values.size == 0:
+            raise ValueError(f"{role} file {path} has an empty time coordinate")
+        return values
 
     def _build_cumulative_sizes(self, lengths: Sequence[int]) -> List[int]:
         cumulative: List[int] = []
@@ -323,25 +378,27 @@ class CordexDownscaleDataset(Dataset):
         time_index: int,
         lat_slice: slice,
         lon_slice: slice,
-        *,
-        target_len: Optional[int] = None,
     ) -> torch.Tensor:
         tensors: List[np.ndarray] = []
         with xr.open_dataset(path) as ds:
-            resolved_index = time_index
-            if self.allow_time_mismatch and self.time_dim:
-                effective_len = target_len if target_len is not None else self._read_time_length(path)
-                if effective_len <= 0:
-                    raise ValueError(f"Target file {path} has no time dimension.")
-                if time_index >= effective_len:
-                    resolved_index = effective_len - 1
             for var in self.target_vars:
                 da = ds[var]
                 if self.time_dim and self.time_dim in da.dims:
-                    da = da.isel({self.time_dim: resolved_index}, drop=True)
-                arrays = np.nan_to_num(
-                    self._to_numpy(da), nan=0.0, posinf=0.0, neginf=0.0
-                )
+                    da = da.isel({self.time_dim: time_index}, drop=True)
+                arrays = self._to_numpy(da)
+                invalid = ~np.isfinite(arrays)
+                if bool(invalid.any()):
+                    # A zero-filled target is indistinguishable from a genuine
+                    # dry precipitation pixel and would therefore corrupt both
+                    # the deterministic objective and the signed residual seen
+                    # by diffusion.  There is no validity mask in the current
+                    # batch/loss contract, so fail before training instead of
+                    # silently replacing missing targets with physical zeros.
+                    raise ValueError(
+                        f"Target variable {var!r} in {path} contains "
+                        f"{int(invalid.sum())} non-finite value(s) at time index "
+                        f"{time_index}; masked targets are not supported."
+                    )
                 tensors.append(arrays)
 
         stacked = np.stack(tensors, axis=0)[..., lat_slice, lon_slice]
@@ -530,6 +587,118 @@ class CordexDownscaleDataset(Dataset):
         if array.dtype != np.float32:
             array = array.astype(np.float32, copy=False)
         return array
+
+
+def _time_coordinate_key(value: object) -> Tuple[int, int, int, int, int, int, int, int]:
+    """Return a calendar-independent, exact civil-time key."""
+
+    if isinstance(value, np.datetime64):
+        if np.isnat(value):
+            raise ValueError("time coordinate contains NaT")
+        text = np.datetime_as_string(value, unit="ns")
+        date_text, _, time_text = text.partition("T")
+        year_text, month_text, day_text = date_text.split("-")
+        hour = minute = second = nanosecond = 0
+        if time_text:
+            hour_text, minute_text, second_text = time_text.split(":")
+            hour = int(hour_text)
+            minute = int(minute_text)
+            if "." in second_text:
+                whole_seconds, fraction = second_text.split(".", 1)
+                second = int(whole_seconds)
+                nanosecond = int(fraction.ljust(9, "0")[:9])
+            else:
+                second = int(second_text)
+        return (
+            int(year_text),
+            int(month_text),
+            int(day_text),
+            hour,
+            minute,
+            second,
+            nanosecond // 1000,
+            nanosecond % 1000,
+        )
+
+    required = ("year", "month", "day", "hour", "minute", "second")
+    if not all(hasattr(value, field) for field in required):
+        raise ValueError(
+            "time coordinate values must decode to datetime-like objects; "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    microsecond = int(getattr(value, "microsecond", 0))
+    nanosecond = int(getattr(value, "nanosecond", 0))
+    return (
+        int(getattr(value, "year")),
+        int(getattr(value, "month")),
+        int(getattr(value, "day")),
+        int(getattr(value, "hour")),
+        int(getattr(value, "minute")),
+        int(getattr(value, "second")),
+        microsecond,
+        nanosecond,
+    )
+
+
+def _format_time_key(key: Tuple[int, int, int, int, int, int, int, int]) -> str:
+    year, month, day, hour, minute, second, microsecond, nanosecond = key
+    fraction = microsecond * 1000 + nanosecond
+    suffix = f".{fraction:09d}" if fraction else ""
+    return f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}{suffix}"
+
+
+def _exact_time_index(
+    predictor_values: Sequence[object],
+    target_values: Sequence[object],
+    *,
+    predictor_path: str = "<predictor>",
+    target_path: str = "<target>",
+) -> np.ndarray:
+    """Build a unique target index for every predictor civil timestamp."""
+
+    def _keys(values: Sequence[object], *, role: str, path: str):
+        keys = []
+        indices_by_key: dict[Tuple[int, int, int, int, int, int, int, int], List[int]] = {}
+        for index, value in enumerate(values):
+            try:
+                key = _time_coordinate_key(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{role} file {path} has an invalid time value at index {index}: {exc}"
+                ) from exc
+            keys.append(key)
+            indices_by_key.setdefault(key, []).append(index)
+
+        duplicates = {
+            key: indices for key, indices in indices_by_key.items() if len(indices) > 1
+        }
+        if duplicates:
+            examples = ", ".join(
+                f"{_format_time_key(key)} at indices {indices[:4]}"
+                for key, indices in list(duplicates.items())[:4]
+            )
+            raise ValueError(
+                f"{role} file {path} contains duplicate time coordinates: {examples}"
+            )
+        return keys, indices_by_key
+
+    predictor_keys, _ = _keys(
+        predictor_values, role="Predictor", path=predictor_path
+    )
+    _, target_index_by_key = _keys(target_values, role="Target", path=target_path)
+
+    missing = [key for key in predictor_keys if key not in target_index_by_key]
+    if missing:
+        examples = ", ".join(_format_time_key(key) for key in missing[:8])
+        raise ValueError(
+            "Target time coordinate does not contain every predictor date: "
+            f"{len(missing)} missing date(s) from {target_path}; examples: {examples}. "
+            f"Predictor file: {predictor_path}"
+        )
+
+    return np.asarray(
+        [target_index_by_key[key][0] for key in predictor_keys], dtype=np.int64
+    )
 
 
 class _XarrayRegridder:

@@ -346,9 +346,10 @@ def get_finetune_model(config: ExperimentConfig) -> torch.nn.Module:
     #########################################################
     # 4. Upscale after FM 
     #########################################################
-    if resolve_head_type(config) == "diffusion":
-        # The deterministic conv head is replaced by the diffusion head, which
-        # is constructed inside the model. Skip building an unused conv head.
+    if resolve_head_type(config) == "diffusion" and not _residual_diffusion_enabled(config):
+        # Full-field diffusion does not need a deterministic decoder. Residual
+        # diffusion does: it jointly supervises this exact head and defines
+        # target - stop_gradient(baseline) from its prediction.
         head = None
     elif config.model.encoder_decoder_type == 'conv':
         head = ConvEncoderDecoder(
@@ -397,3 +398,11 @@ def get_finetune_model(config: ExperimentConfig) -> torch.nn.Module:
         print(f"--> model has {total_params:,.0f} params.")
 
     return model
+
+
+def _residual_diffusion_enabled(config: ExperimentConfig) -> bool:
+    model_cfg = getattr(config, "model", None)
+    diffusion_cfg = getattr(model_cfg, "diffusion", None)
+    if isinstance(diffusion_cfg, dict):
+        return bool(diffusion_cfg.get("residual_diffusion", False))
+    return bool(getattr(diffusion_cfg, "residual_diffusion", False))

@@ -1,0 +1,269 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-07-16T04:19:40.612986+00:00",
+  "legacy_diffusion_semantics": "The diffusion file is a legacy full-field ensemble. Its ensemble-mean minus U-Net difference is an implied correction only; it was not trained as a residual correction.",
+  "inputs": {
+    "unet": {
+      "path": "F:\\CORDEX_ML_Task_Force\\Prithvi-UNet-v6\\Prithvi-UNet-v6\\SA_Domain\\Emulator_Hist_Future_NO_OROG\\historical\\perfect\\Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc",
+      "size_bytes": 956937465,
+      "modified_utc": "2026-04-16T22:19:06+00:00",
+      "head_type": null,
+      "ensemble_generation": null
+    },
+    "legacy_diffusion": {
+      "path": "D:\\granite-wxc\\examples\\CORDEX_ML\\runs\\SA_T2_ACCESS-CM2_static_train\\SA_T2_ACCESS-CM2_static_diffusion\\predictions\\historical\\perfect\\Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc",
+      "size_bytes": 2870591485,
+      "modified_utc": "2026-07-16T02:29:57.865380+00:00",
+      "head_type": "diffusion",
+      "ensemble_generation": "diffusion_sampling"
+    },
+    "ground_truth": {
+      "path": "D:\\CORDEX\\SA_domain\\test\\historical\\target\\pr_tasmax_ACCESS-CM2_1981-2000.nc",
+      "size_bytes": 958878626,
+      "modified_utc": "2026-07-08T05:19:07.676498+00:00",
+      "head_type": null,
+      "ensemble_generation": null
+    }
+  },
+  "alignment": {
+    "method": "exact coordinate-value intersection (no tolerance)",
+    "common": {
+      "time": 7300,
+      "lat": 128,
+      "lon": 128,
+      "sample_gridpoint_count": 119603200,
+      "time_first_raw": 720.0,
+      "time_last_raw": 10518480.0,
+      "lat_min": -34.70000076293945,
+      "lat_max": -22.0,
+      "lon_min": 20.5,
+      "lon_max": 33.20000076293945
+    },
+    "source_coordinate_counts": {
+      "unet": {
+        "time": 7300,
+        "lat": 128,
+        "lon": 128
+      },
+      "legacy_diffusion": {
+        "time": 7300,
+        "lat": 128,
+        "lon": 128
+      },
+      "ground_truth": {
+        "time": 7305,
+        "lat": 128,
+        "lon": 128
+      }
+    },
+    "dropped_coordinate_values": {
+      "unet": {
+        "time": 0,
+        "lat": 0,
+        "lon": 0
+      },
+      "legacy_diffusion": {
+        "time": 0,
+        "lat": 0,
+        "lon": 0
+      },
+      "ground_truth": {
+        "time": 5,
+        "lat": 0,
+        "lon": 0
+      }
+    }
+  },
+  "metric_definitions": {
+    "bias": "mean(prediction - ground_truth)",
+    "mae": "mean(abs(prediction - ground_truth))",
+    "rmse": "sqrt(mean((prediction - ground_truth)^2))",
+    "spatial_climatology_correlation": "Pearson correlation across grid cells between paired-time mean fields",
+    "mean_absolute_climatological_bias": "spatial mean of abs(prediction time mean - truth time mean)",
+    "true_residual": "ground_truth - U-Net",
+    "implied_legacy_correction": "legacy diffusion ensemble mean - U-Net",
+    "ensemble_spread": "sample standard deviation across members (ddof=1); RMS spread is sqrt(mean(sample variance))",
+    "spread_skill_ratio": "RMS ensemble spread / RMSE of ensemble mean",
+    "crps": "mean_m |x_m-y| - (1/(2 M^2)) sum_m sum_n |x_m-x_n|"
+  },
+  "variables": {
+    "pr": {
+      "canonical_unit": "mm/day",
+      "source_units": {
+        "unet": "mm/day",
+        "legacy_diffusion": "mm/day",
+        "ground_truth": "kg m-2 s-1"
+      },
+      "conversion_factors_to_canonical_unit": {
+        "unet": 1.0,
+        "legacy_diffusion": 1.0,
+        "ground_truth": 86400.0
+      },
+      "unet": {
+        "count": 119603200,
+        "bias": -1.0099847529943333,
+        "mae": 2.6608668800284914,
+        "rmse": 8.77075134017662,
+        "climatology": {
+          "valid_grid_cells": 16384,
+          "spatial_correlation": 0.8515840089333914,
+          "mean_absolute_bias": 1.0161160259902857
+        }
+      },
+      "legacy_diffusion_ensemble_mean": {
+        "count": 119603200,
+        "bias": -3.2118494324633953,
+        "mae": 3.294373689562228,
+        "rmse": 10.681987916356446,
+        "climatology": {
+          "valid_grid_cells": 16384,
+          "spatial_correlation": 0.007305252651555706,
+          "mean_absolute_bias": 3.211849432463394
+        }
+      },
+      "true_residual_ground_truth_minus_unet": {
+        "count": 119603200,
+        "mean": 1.0099847529943335,
+        "std_population": 8.712405515695934,
+        "min": -63.78803560882807,
+        "max": 1249.0491486787796,
+        "p01": -9.64515710327134,
+        "p05": -4.345301720150746,
+        "p50": 0.0,
+        "p95": 9.71279244767501,
+        "p99": 37.89237019911401,
+        "quantile_sample": {
+          "method": "deterministic systematic flat-index subsample",
+          "seed": 20260715,
+          "stride": 120,
+          "offset": 35,
+          "finite_sample_count": 996694,
+          "maximum_requested_samples": 1000000
+        },
+        "target_std_population_on_same_valid_cases": 10.189055127625485,
+        "std_to_target_std_ratio": 0.8550749217240051
+      },
+      "implied_legacy_correction_diffusion_mean_minus_unet": {
+        "count": 119603200,
+        "mean": -2.2018646794690597,
+        "std_population": 4.137421727804232,
+        "min": -75.64251132154216,
+        "max": 8.30050778388977,
+        "p01": -19.967324019372462,
+        "p05": -10.234832974026599,
+        "p50": -0.5650341312090557,
+        "p95": 0.16080083176493642,
+        "p99": 0.4291372806734093,
+        "quantile_sample": {
+          "method": "deterministic systematic flat-index subsample",
+          "seed": 20260716,
+          "stride": 120,
+          "offset": 36,
+          "finite_sample_count": 996694,
+          "maximum_requested_samples": 1000000
+        },
+        "target_std_population_on_same_valid_cases": 10.189055127625485,
+        "std_to_target_std_ratio": 0.4060653000675677,
+        "std_to_true_residual_std_ratio": 0.4748885621026721
+      },
+      "legacy_diffusion_ensemble": {
+        "count": 119603200,
+        "ensemble_size": 3,
+        "mean_spread_unbiased": 0.13120050226487334,
+        "rms_spread_unbiased": 0.2978677188378845,
+        "ensemble_mean_rmse_on_complete_cases": 10.681987916356446,
+        "spread_skill_ratio": 0.027885045477516805,
+        "crps_empirical_ensemble": 3.2534851693710136
+      }
+    },
+    "tasmax": {
+      "canonical_unit": "K",
+      "source_units": {
+        "unet": "K",
+        "legacy_diffusion": "K",
+        "ground_truth": "K"
+      },
+      "conversion_factors_to_canonical_unit": {
+        "unet": 1.0,
+        "legacy_diffusion": 1.0,
+        "ground_truth": 1.0
+      },
+      "unet": {
+        "count": 119603200,
+        "bias": -0.10323885094706123,
+        "mae": 1.111831455891314,
+        "rmse": 1.464031657348173,
+        "climatology": {
+          "valid_grid_cells": 16384,
+          "spatial_correlation": 0.9942722515645047,
+          "mean_absolute_bias": 0.27643516573212923
+        }
+      },
+      "legacy_diffusion_ensemble_mean": {
+        "count": 119603200,
+        "bias": 2.7103293928799976,
+        "mae": 5.569663739165282,
+        "rmse": 7.007576842221783,
+        "climatology": {
+          "valid_grid_cells": 16384,
+          "spatial_correlation": 0.4671195207708971,
+          "mean_absolute_bias": 3.3680139064317625
+        }
+      },
+      "true_residual_ground_truth_minus_unet": {
+        "count": 119603200,
+        "mean": 0.1032388509470612,
+        "std_population": 1.4603870834038377,
+        "min": -14.838836669921875,
+        "max": 13.20098876953125,
+        "p01": -3.682435607910156,
+        "p05": -2.25946044921875,
+        "p50": 0.0901031494140625,
+        "p95": 2.45465087890625,
+        "p99": 3.769908142089836,
+        "quantile_sample": {
+          "method": "deterministic systematic flat-index subsample",
+          "seed": 20260717,
+          "stride": 120,
+          "offset": 37,
+          "finite_sample_count": 996694,
+          "maximum_requested_samples": 1000000
+        },
+        "target_std_population_on_same_valid_cases": 6.597717639665674,
+        "std_to_target_std_ratio": 0.22134731480837364
+      },
+      "implied_legacy_correction_diffusion_mean_minus_unet": {
+        "count": 119603200,
+        "mean": 2.81356824382706,
+        "std_population": 6.409939422280063,
+        "min": -22.434051513671875,
+        "max": 33.14661661783856,
+        "p01": -10.82456298828125,
+        "p05": -7.459615071614564,
+        "p50": 2.5536295572916856,
+        "p95": 13.98790893554688,
+        "p99": 18.19283752441404,
+        "quantile_sample": {
+          "method": "deterministic systematic flat-index subsample",
+          "seed": 20260718,
+          "stride": 120,
+          "offset": 38,
+          "finite_sample_count": 996694,
+          "maximum_requested_samples": 1000000
+        },
+        "target_std_population_on_same_valid_cases": 6.597717639665674,
+        "std_to_target_std_ratio": 0.9715389127511789,
+        "std_to_true_residual_std_ratio": 4.389205776416427
+      },
+      "legacy_diffusion_ensemble": {
+        "count": 119603200,
+        "ensemble_size": 3,
+        "mean_spread_unbiased": 0.48983014251452023,
+        "rms_spread_unbiased": 0.5807112972208119,
+        "ensemble_mean_rmse_on_complete_cases": 7.007576842221783,
+        "spread_skill_ratio": 0.08286905877677038,
+        "crps_empirical_ensemble": 5.373656337736189
+      }
+    }
+  }
+}

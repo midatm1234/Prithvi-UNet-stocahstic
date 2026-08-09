@@ -9,7 +9,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Sequence, Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -423,6 +423,138 @@ def _resolve_config_and_predictands(
     return config, target_vars, target_specs
 
 
+def _canonical_path_list(values: Any) -> list[str]:
+    """Resolve config/CLI paths exactly as the CORDEX training loader does."""
+
+    if values in (None, ""):
+        return []
+    if isinstance(values, (str, Path)):
+        values = [values]
+
+    resolved: list[str] = []
+    for value in values:
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        # ``normcase`` makes the identity check reliable on Windows while
+        # ``resolve(strict=False)`` also normalizes ``..`` components without
+        # requiring every test fixture path to exist.
+        resolved.append(os.path.normcase(str(path.resolve(strict=False))))
+    return resolved
+
+
+def _select_scalar_training_partition(
+    dataset: torch.utils.data.Dataset,
+    *,
+    config: object,
+    predictor_files: Sequence[str],
+    target_files: Sequence[str],
+) -> tuple[torch.utils.data.Dataset, dict[str, Any]]:
+    """Exclude a configured contiguous validation tail from scalar fitting.
+
+    ``cordex_training.get_dataloaders`` creates a leading training partition and
+    trailing validation partition when the configured train/validation files are
+    identical. Target and predictor normalization must use that same leading
+    partition; otherwise validation targets leak into gridpoint means/stds and
+    precipitation quantiles before model selection.
+    """
+
+    source_count = len(dataset)
+    data_cfg = getattr(config, "data", None)
+    train_predictors = _canonical_path_list(
+        getattr(data_cfg, "training_predictor_paths", None)
+        if data_cfg is not None
+        else None
+    )
+    train_targets = _canonical_path_list(
+        getattr(data_cfg, "training_target_paths", None)
+        if data_cfg is not None
+        else None
+    )
+    validation_predictors = _canonical_path_list(
+        getattr(data_cfg, "validation_predictor_paths", None)
+        if data_cfg is not None
+        else None
+    )
+    validation_targets = _canonical_path_list(
+        getattr(data_cfg, "validation_target_paths", None)
+        if data_cfg is not None
+        else None
+    )
+    sources_identical = bool(
+        train_predictors
+        and train_targets
+        and train_predictors == validation_predictors
+        and train_targets == validation_targets
+    )
+
+    selection: dict[str, Any] = {
+        "policy": "all_supplied_samples",
+        "source_sample_count": int(source_count),
+        "used_sample_count": int(source_count),
+        "used_index_start": 0,
+        "used_index_stop_exclusive": int(source_count),
+        "excluded_index_start": None,
+        "excluded_index_stop_exclusive": None,
+        "config_training_validation_sources_identical": sources_identical,
+        "validation_holdout_fraction": None,
+        "validation_holdout_strategy": None,
+    }
+
+    raw_fraction = (
+        getattr(data_cfg, "validation_holdout_fraction", None)
+        if data_cfg is not None
+        else None
+    )
+    if not sources_identical or raw_fraction in (None, "", 0, 0.0):
+        return dataset, selection
+
+    fraction = float(raw_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(
+            "data.validation_holdout_fraction must lie in (0, 1) when "
+            f"training and validation sources are identical, got {fraction}."
+        )
+    strategy = str(
+        getattr(data_cfg, "validation_holdout_strategy", "contiguous_tail")
+    ).strip().lower()
+    if strategy != "contiguous_tail":
+        raise ValueError(
+            "Scalar fitting only supports "
+            "data.validation_holdout_strategy='contiguous_tail', got "
+            f"{strategy!r}."
+        )
+
+    cli_predictors = _canonical_path_list(predictor_files)
+    cli_targets = _canonical_path_list(target_files)
+    if cli_predictors != train_predictors or cli_targets != train_targets:
+        raise ValueError(
+            "The config defines a train/validation holdout on identical files, "
+            "but the --predictor-files/--target-files supplied to scalar fitting "
+            "do not match config.data.training_*_paths. Refusing to apply the "
+            "holdout indices to a different dataset."
+        )
+    if source_count < 2:
+        raise ValueError("A train/validation scalar holdout requires at least two samples.")
+
+    validation_count = max(1, int(round(source_count * fraction)))
+    validation_count = min(validation_count, source_count - 1)
+    split = source_count - validation_count
+    subset = torch.utils.data.Subset(dataset, range(0, split))
+    selection.update(
+        {
+            "policy": "leading_training_partition_excluding_contiguous_validation_tail",
+            "used_sample_count": int(split),
+            "used_index_stop_exclusive": int(split),
+            "excluded_index_start": int(split),
+            "excluded_index_stop_exclusive": int(source_count),
+            "validation_holdout_fraction": fraction,
+            "validation_holdout_strategy": strategy,
+        }
+    )
+    return subset, selection
+
+
 def _resolve_output_dir(args: argparse.Namespace, config: object) -> str:
     """Determine where scalars are written.
 
@@ -491,7 +623,7 @@ def main() -> None:
     if use_static and not orography_file:
         raise SystemExit("--orography-file is required when static predictors are enabled")
 
-    dataset = CordexDownscaleDataset(
+    source_dataset = CordexDownscaleDataset(
         predictor_files=args.predictor_files,
         target_files=args.target_files,
         orography_file=orography_file if use_static else None,
@@ -504,7 +636,24 @@ def main() -> None:
         use_static=use_static,
     )
 
-    print(f"Loaded {len(dataset)} samples from {len(args.predictor_files)} predictor files")
+    dataset, sample_selection = _select_scalar_training_partition(
+        source_dataset,
+        config=config,
+        predictor_files=args.predictor_files,
+        target_files=args.target_files,
+    )
+    print(
+        f"Loaded {len(source_dataset)} source samples from "
+        f"{len(args.predictor_files)} predictor files"
+    )
+    if len(dataset) != len(source_dataset):
+        print(
+            "[holdout] fitting scalars only on training indices "
+            f"[{sample_selection['used_index_start']}, "
+            f"{sample_selection['used_index_stop_exclusive']}); excluded "
+            f"[{sample_selection['excluded_index_start']}, "
+            f"{sample_selection['excluded_index_stop_exclusive']}) for validation."
+        )
     print("[predictands] resolved scaling:")
     for spec in target_specs:
         print(
@@ -550,7 +699,13 @@ def main() -> None:
             "target_scale_sample_size": args.target_scale_sample_size,
         },
         "predictands": {spec.name: spec.to_dict() for spec in target_specs},
+        # ``num_samples`` retains its historical meaning: the number actually
+        # used to fit scalars. The explicit source/used fields make holdout
+        # selection independently auditable.
         "num_samples": len(dataset),
+        "source_num_samples": len(source_dataset),
+        "used_num_samples": len(dataset),
+        "sample_selection": sample_selection,
         "input_channels": int(stats["inputs_mean"].shape[0]),
         "target_channels": int(stats["targets_mean"].shape[0]),
         "input_pixel_count": stats["input_pixel_count"],

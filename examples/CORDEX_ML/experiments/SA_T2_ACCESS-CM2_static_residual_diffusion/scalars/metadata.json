@@ -1,0 +1,158 @@
+{
+  "created_at": "2026-07-16T04:33:54.865578Z",
+  "args": {
+    "config": "SA_T2_ACCESS-CM2_static_residual_diffusion.yaml",
+    "predictor_files": [
+      "D:\\CORDEX\\SA_domain\\train\\Emulator_hist_future\\predictors\\ACCESS-CM2_1961-1980_2080-2099_regridded.nc"
+    ],
+    "target_files": [
+      "D:\\CORDEX\\SA_domain\\train\\Emulator_hist_future\\target\\pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc"
+    ],
+    "orography_file": "D:\\CORDEX\\SA_domain\\train\\Emulator_hist_future\\predictors\\Static_fields.nc",
+    "predictor_vars": null,
+    "target_vars": [
+      "pr",
+      "tasmax"
+    ],
+    "orography_var": "orog",
+    "time_dim": null,
+    "regrid_method": "bilinear",
+    "dtype": "float32",
+    "progress_interval": 2000,
+    "target_scale_sample_size": 2048
+  },
+  "predictands": {
+    "pr": {
+      "name": "pr",
+      "allow_negative_value": false,
+      "nonnegativity": {
+        "enabled": true,
+        "method": "softplus"
+      },
+      "scaling": {
+        "method": "divide_only",
+        "mode": "global",
+        "eps_std": 1e-06,
+        "scale_stat": "p95",
+        "fixed_scale": null
+      }
+    },
+    "tasmax": {
+      "name": "tasmax",
+      "allow_negative_value": false,
+      "nonnegativity": {
+        "enabled": false,
+        "method": "none"
+      },
+      "scaling": {
+        "method": "zscore",
+        "mode": "gridpoint",
+        "eps_std": 1e-06,
+        "scale_stat": "mean",
+        "fixed_scale": null
+      }
+    }
+  },
+  "num_samples": 14600,
+  "input_channels": 16,
+  "target_channels": 2,
+  "input_pixel_count": 239206400,
+  "target_pixel_count": 239206400,
+  "target_grid_sample_count": 14600,
+  "summary": {
+    "targets_mean_raw": [
+      3.197072744369507,
+      298.7344055175781
+    ],
+    "targets_std_raw": [
+      11.15704345703125,
+      7.496180057525635
+    ],
+    "targets_log_mean": [
+      0.0,
+      0.0
+    ],
+    "targets_log_std": [
+      0.0,
+      0.0
+    ],
+    "targets_grid_mean_raw": {
+      "shape": [
+        2,
+        128,
+        128
+      ],
+      "finite_count": 32768,
+      "min": 0.917888343334198,
+      "max": 306.6337585449219,
+      "mean": 150.9657440185547,
+      "std": 147.79232788085938
+    },
+    "targets_grid_std_raw": {
+      "shape": [
+        2,
+        128,
+        128
+      ],
+      "finite_count": 32768,
+      "min": 2.52713680267334,
+      "max": 31.113550186157227,
+      "mean": 8.528596878051758,
+      "std": 3.2573535442352295
+    },
+    "targets_grid_log_mean": {
+      "shape": [
+        2,
+        128,
+        128
+      ],
+      "finite_count": 32768,
+      "min": 0.0,
+      "max": 0.0,
+      "mean": 0.0,
+      "std": 0.0
+    },
+    "targets_grid_log_std": {
+      "shape": [
+        2,
+        128,
+        128
+      ],
+      "finite_count": 32768,
+      "min": 0.0,
+      "max": 0.0,
+      "mean": 0.0,
+      "std": 0.0
+    },
+    "targets_mean_saved": {
+      "shape": [
+        2,
+        128,
+        128
+      ],
+      "finite_count": 32768,
+      "min": 0.0,
+      "max": 306.6337585449219,
+      "mean": 149.36720275878906,
+      "std": 149.38833618164062
+    },
+    "targets_std_saved": {
+      "shape": [
+        2,
+        128,
+        128
+      ],
+      "finite_count": 32768,
+      "min": 2.52713680267334,
+      "max": 16.066402435302734,
+      "mean": 11.203226089477539,
+      "std": 5.033723831176758
+    }
+  },
+  "files": {
+    "inputs_mean": "D:\\granite-wxc\\examples\\CORDEX_ML\\experiments\\SA_T2_ACCESS-CM2_static_residual_diffusion\\scalars\\inputs_mean.npy",
+    "inputs_std": "D:\\granite-wxc\\examples\\CORDEX_ML\\experiments\\SA_T2_ACCESS-CM2_static_residual_diffusion\\scalars\\inputs_std.npy",
+    "targets_mean": "D:\\granite-wxc\\examples\\CORDEX_ML\\experiments\\SA_T2_ACCESS-CM2_static_residual_diffusion\\scalars\\targets_mean.npy",
+    "targets_std": "D:\\granite-wxc\\examples\\CORDEX_ML\\experiments\\SA_T2_ACCESS-CM2_static_residual_diffusion\\scalars\\targets_std.npy"
+  }
+}

@@ -7,6 +7,7 @@ import sys
 import subprocess
 import socket
 import math
+import json
 from pathlib import Path
 from typing import Iterable, Sequence, Tuple
 
@@ -333,6 +334,26 @@ def _coerce_mapping(value):
     if hasattr(value, "__dict__"):
         return dict(value.__dict__)
     return {}
+
+
+def _freeze_deterministic_baseline_enabled(config: ExperimentConfig) -> bool:
+    """Return whether residual training keeps the deterministic U-Net fixed."""
+    training_cfg = _coerce_mapping(getattr(config, "training", None))
+    raw = training_cfg.get("freeze_deterministic_baseline", False)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0"}:
+            return False
+    raise ValueError(
+        "training.freeze_deterministic_baseline must be boolean-like, got "
+        f"{raw!r}."
+    )
 
 
 def _set_training_distributed_mode(config: ExperimentConfig, mode: str) -> None:
@@ -997,6 +1018,172 @@ class CordexWrappedDataset(torch.utils.data.Dataset):
         return {"x": dynamic, "y": sample["y"], "static_x": static, "static_y": static}
 
 
+class CordexIndexSubset(torch.utils.data.Dataset):
+    """Index subset that preserves the ``base`` dataset audit interface."""
+
+    def __init__(self, dataset: CordexWrappedDataset, indices: range):
+        self.dataset = dataset
+        self.indices = indices
+        self.base = dataset.base
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int):
+        return self.dataset[self.indices[idx]]
+
+
+def _contiguous_holdout_indices(
+    total: int,
+    fraction: float,
+    role: str,
+) -> range:
+    """Return disjoint leading-train or trailing-validation sample indices."""
+
+    total = int(total)
+    fraction = float(fraction)
+    if total < 2:
+        raise ValueError("A train/validation holdout requires at least two samples.")
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(
+            f"data.validation_holdout_fraction must lie in (0, 1), got {fraction}."
+        )
+    validation_count = max(1, int(round(total * fraction)))
+    validation_count = min(validation_count, total - 1)
+    split = total - validation_count
+    if role == "train":
+        return range(0, split)
+    if role == "validation":
+        return range(split, total)
+    raise ValueError(f"Unknown holdout role {role!r}.")
+
+
+def _validate_train_validation_source_paths(
+    train_predictors: Sequence[str],
+    train_targets: Sequence[str],
+    validation_predictors: Sequence[str],
+    validation_targets: Sequence[str],
+) -> bool:
+    """Return whether paired sources match exactly, rejecting partial overlap."""
+
+    def path_identities(paths: Sequence[str]) -> list[str]:
+        return [os.path.normcase(os.path.normpath(os.fspath(path))) for path in paths]
+
+    train_predictor_ids = path_identities(train_predictors)
+    train_target_ids = path_identities(train_targets)
+    validation_predictor_ids = path_identities(validation_predictors)
+    validation_target_ids = path_identities(validation_targets)
+    sources_identical = (
+        train_predictor_ids == validation_predictor_ids
+        and train_target_ids == validation_target_ids
+    )
+    predictor_overlap = sorted(
+        set(train_predictor_ids).intersection(validation_predictor_ids)
+    )
+    target_overlap = sorted(set(train_target_ids).intersection(validation_target_ids))
+    if not sources_identical and (predictor_overlap or target_overlap):
+        raise ValueError(
+            "Training and validation source lists partially overlap. Source lists "
+            "must be either exactly identical paired lists (with a configured "
+            "contiguous-tail holdout) or fully disjoint. "
+            f"Shared predictor paths: {predictor_overlap or 'none'}; "
+            f"shared target paths: {target_overlap or 'none'}."
+        )
+    return sources_identical
+
+
+def _validate_scalar_holdout_metadata(
+    config: ExperimentConfig,
+    *,
+    source_sample_count: int,
+    training_sample_count: int,
+    holdout_fraction: float,
+    holdout_strategy: str,
+) -> dict:
+    """Fail closed when scalar files include the validation holdout.
+
+    The scalar calculator writes ``metadata.json`` beside the four ``.npy``
+    arrays. Identical train/validation sources require evidence that only the
+    leading training partition contributed to those arrays.
+    """
+
+    model_cfg = getattr(config, "model", None)
+    scalar_path = getattr(model_cfg, "target_sigma", None)
+    if scalar_path in (None, ""):
+        scalers = getattr(getattr(config, "data", None), "scalers", None)
+        if isinstance(scalers, dict):
+            scalar_path = scalers.get("targets_std")
+        else:
+            scalar_path = getattr(scalers, "targets_std", None)
+    if scalar_path in (None, ""):
+        raise ValueError(
+            "A validation holdout is configured, but no target scalar path is "
+            "available to verify training-only scalar fitting."
+        )
+
+    metadata_path = Path(_resolve_path(str(scalar_path))).parent / "metadata.json"
+    if not metadata_path.is_file():
+        raise ValueError(
+            "Validation-holdout training requires scalar selection metadata at "
+            f"{metadata_path}. Recompute scalars with compute_scalars_cordex.py."
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Scalar selection metadata is unreadable at {metadata_path}: {exc}."
+        ) from exc
+
+    selection = metadata.get("sample_selection")
+    if not isinstance(selection, dict):
+        raise ValueError(
+            "Scalar metadata predates training-only holdout selection (missing "
+            f"sample_selection in {metadata_path}). Recompute scalars; old "
+            f"metadata reports num_samples={metadata.get('num_samples')!r}, but "
+            f"the training partition contains {training_sample_count}."
+        )
+
+    expected = {
+        "policy": "leading_training_partition_excluding_contiguous_validation_tail",
+        "source_sample_count": int(source_sample_count),
+        "used_sample_count": int(training_sample_count),
+        "used_index_start": 0,
+        "used_index_stop_exclusive": int(training_sample_count),
+        "excluded_index_start": int(training_sample_count),
+        "excluded_index_stop_exclusive": int(source_sample_count),
+        "config_training_validation_sources_identical": True,
+        "validation_holdout_strategy": str(holdout_strategy),
+    }
+    mismatches = [
+        f"{key}: metadata={selection.get(key)!r}, expected={value!r}"
+        for key, value in expected.items()
+        if selection.get(key) != value
+    ]
+    try:
+        saved_fraction = float(selection.get("validation_holdout_fraction"))
+    except (TypeError, ValueError):
+        saved_fraction = float("nan")
+    if not math.isclose(saved_fraction, float(holdout_fraction), rel_tol=0.0, abs_tol=1e-12):
+        mismatches.append(
+            "validation_holdout_fraction: "
+            f"metadata={selection.get('validation_holdout_fraction')!r}, "
+            f"expected={holdout_fraction!r}"
+        )
+    if metadata.get("num_samples") != int(training_sample_count):
+        mismatches.append(
+            f"num_samples: metadata={metadata.get('num_samples')!r}, "
+            f"expected={training_sample_count!r}"
+        )
+    if mismatches:
+        raise ValueError(
+            "Scalar metadata is incompatible with the configured validation "
+            "holdout; refusing leaked normalization statistics:\n  - "
+            + "\n  - ".join(mismatches)
+            + "\nRecompute scalars with compute_scalars_cordex.py."
+        )
+    return metadata
+
+
 def build_dataloader(
     config: ExperimentConfig,
     predictor_paths: Sequence[str],
@@ -1010,6 +1197,8 @@ def build_dataloader(
     crop_size: Tuple[int, int],
     random_crop: bool,
     random_crop_offset: Tuple[int, int] = (0, 0),
+    holdout_fraction: float | None = None,
+    holdout_role: str | None = None,
 ) -> DataLoader:
     predictor_paths = _resolve_paths(predictor_paths)
     target_paths = _resolve_paths(target_paths)
@@ -1031,6 +1220,18 @@ def build_dataloader(
                 "Set data.train_crop_size_lat/lon smaller than the target grid to enable crop augmentation."
             )
     dataset = CordexWrappedDataset(base_dataset)
+    if holdout_role is not None:
+        if holdout_fraction is None:
+            raise ValueError("holdout_role requires holdout_fraction.")
+        indices = _contiguous_holdout_indices(
+            len(dataset), holdout_fraction, holdout_role
+        )
+        dataset = CordexIndexSubset(dataset, indices)
+        if rank == 0:
+            print(
+                f"[data] {holdout_role} uses disjoint contiguous indices "
+                f"[{indices.start}, {indices.stop}) of {len(base_dataset)} samples."
+            )
 
     sampler = None
     if distributed:
@@ -1067,7 +1268,7 @@ def build_dataloader(
 
 def get_dataloaders(
     config: ExperimentConfig, use_gpu: bool, rank: int = 0, world_size: int = 1
-) -> Tuple[DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader | None]:
     distributed = world_size > 1
     target_crop_size = (
         int(config.data.target_size_lat),
@@ -1077,10 +1278,6 @@ def get_dataloaders(
         int(getattr(config.data, "train_crop_size_lat", target_crop_size[0])),
         int(getattr(config.data, "train_crop_size_lon", target_crop_size[1])),
     )
-    val_crop_size = (
-        int(getattr(config.data, "val_crop_size_lat", target_crop_size[0])),
-        int(getattr(config.data, "val_crop_size_lon", target_crop_size[1])),
-    )
     offset_cfg = getattr(config.data, "train_random_crop_offset", (0, 0))
     if isinstance(offset_cfg, (int, float)):
         train_random_crop_offset = (max(0, int(offset_cfg)), max(0, int(offset_cfg)))
@@ -1088,6 +1285,69 @@ def get_dataloaders(
         train_random_crop_offset = (max(0, int(offset_cfg[0])), max(0, int(offset_cfg[1])))
     else:
         train_random_crop_offset = (0, 0)
+
+    validation_enabled = bool(getattr(config, "validation_enabled", True))
+    if not validation_enabled:
+        if rank == 0:
+            print(
+                "[data] validation disabled; using 100% of the configured "
+                "training sources with no validation loader or holdout."
+            )
+        train_loader = build_dataloader(
+            config,
+            config.data.training_predictor_paths,
+            config.data.training_target_paths,
+            shuffle=True,
+            use_gpu=use_gpu,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            crop_size=train_crop_size,
+            random_crop=True,
+            random_crop_offset=train_random_crop_offset,
+            holdout_fraction=None,
+            holdout_role=None,
+        )
+        return train_loader, None
+
+    val_crop_size = (
+        int(getattr(config.data, "val_crop_size_lat", target_crop_size[0])),
+        int(getattr(config.data, "val_crop_size_lon", target_crop_size[1])),
+    )
+
+    train_predictors = _resolve_paths(config.data.training_predictor_paths)
+    train_targets = _resolve_paths(config.data.training_target_paths)
+    validation_predictors = _resolve_paths(config.data.validation_predictor_paths)
+    validation_targets = _resolve_paths(config.data.validation_target_paths)
+    sources_overlap_exactly = _validate_train_validation_source_paths(
+        train_predictors,
+        train_targets,
+        validation_predictors,
+        validation_targets,
+    )
+    holdout_fraction = float(
+        getattr(config.data, "validation_holdout_fraction", 0.0) or 0.0
+    )
+    holdout_strategy = str(
+        getattr(config.data, "validation_holdout_strategy", "contiguous_tail")
+    ).strip().lower()
+    if holdout_strategy != "contiguous_tail":
+        raise ValueError(
+            "Only data.validation_holdout_strategy='contiguous_tail' is "
+            f"implemented, got {holdout_strategy!r}."
+        )
+    if sources_overlap_exactly and not 0.0 < holdout_fraction < 1.0:
+        raise ValueError(
+            "Training and validation paths are identical, but no disjoint holdout "
+            "is configured. Set data.validation_holdout_fraction in (0, 1), or "
+            "provide separate validation files."
+        )
+    if not sources_overlap_exactly and holdout_fraction != 0.0 and rank == 0:
+        print(
+            "[data] separate validation files are configured; "
+            "data.validation_holdout_fraction is ignored."
+        )
+    shared_holdout = holdout_fraction if sources_overlap_exactly else None
 
     train_loader = build_dataloader(
         config,
@@ -1101,7 +1361,17 @@ def get_dataloaders(
         crop_size=train_crop_size,
         random_crop=True,
         random_crop_offset=train_random_crop_offset,
+        holdout_fraction=shared_holdout,
+        holdout_role="train" if shared_holdout is not None else None,
     )
+    if shared_holdout is not None:
+        _validate_scalar_holdout_metadata(
+            config,
+            source_sample_count=len(train_loader.dataset.base),
+            training_sample_count=len(train_loader.dataset),
+            holdout_fraction=shared_holdout,
+            holdout_strategy=holdout_strategy,
+        )
     val_loader = build_dataloader(
         config,
         config.data.validation_predictor_paths,
@@ -1114,6 +1384,8 @@ def get_dataloaders(
         crop_size=val_crop_size,
         random_crop=False,
         random_crop_offset=(0, 0),
+        holdout_fraction=shared_holdout,
+        holdout_role="validation" if shared_holdout is not None else None,
     )
     return train_loader, val_loader
 
@@ -1141,6 +1413,15 @@ def load_pretrained_weights(model: torch.nn.Module, weights_path: str) -> Tuple[
 
     compatible = {}
     skipped = 0
+    skipped_by_reason = {
+        "run_specific_scaler": 0,
+        "diffusion_head": 0,
+        "missing_model_key": 0,
+        "shape_mismatch": 0,
+    }
+    skipped_examples: dict[str, list[str]] = {
+        name: [] for name in skipped_by_reason
+    }
     scaler_key_parts = (
         "input_scalers_",
         "output_scalers_",
@@ -1151,15 +1432,64 @@ def load_pretrained_weights(model: torch.nn.Module, weights_path: str) -> Tuple[
         # Keep run-specific normalization tensors from the current config/scaler files.
         if any(part in key for part in scaler_key_parts):
             skipped += 1
+            skipped_by_reason["run_specific_scaler"] += 1
+            if len(skipped_examples["run_specific_scaler"]) < 20:
+                skipped_examples["run_specific_scaler"].append(key)
+            continue
+        # Never load diffusion_head weights from a pretrained initializer checkpoint.
+        # The head is always zero-initialized from the current config; loading stale
+        # score-network weights (e.g. from an earlier Phase 2 run saved as the
+        # Phase 1 source) causes eps_mse to start at ~30 instead of ~1 because the
+        # corrupted weights yield model_out with RMS >> 0.
+        if "diffusion_head" in key:
+            skipped += 1
+            skipped_by_reason["diffusion_head"] += 1
+            if len(skipped_examples["diffusion_head"]) < 5:
+                skipped_examples["diffusion_head"].append(key)
             continue
         target = model_state.get(key)
-        if target is None or target.shape != value.shape:
+        if target is None:
             skipped += 1
+            skipped_by_reason["missing_model_key"] += 1
+            if len(skipped_examples["missing_model_key"]) < 20:
+                skipped_examples["missing_model_key"].append(key)
+            continue
+        if target.shape != value.shape:
+            skipped += 1
+            skipped_by_reason["shape_mismatch"] += 1
+            if len(skipped_examples["shape_mismatch"]) < 20:
+                skipped_examples["shape_mismatch"].append(
+                    f"{key}: checkpoint={tuple(value.shape)}, model={tuple(target.shape)}"
+                )
             continue
         compatible[key] = value
 
+    # ``model_state`` starts as the model's complete current state and only
+    # shape-compatible initializer tensors are overlaid above.  The resulting
+    # mapping must therefore restore exactly; keeping this strict catches any
+    # accidental key mutation in the compatibility filter itself.
     model_state.update(compatible)
-    model.load_state_dict(model_state, strict=False)
+    model.load_state_dict(model_state, strict=True)
+    counts_by_module: dict[str, int] = {}
+    for key in compatible:
+        module_name = key.split(".", 1)[0]
+        counts_by_module[module_name] = counts_by_module.get(module_name, 0) + 1
+    # Store names only (never tensor references), so integration diagnostics can
+    # prove what the initializer actually supplied without loading the 17 GB
+    # checkpoint a second time. This report is informational; trained/resume
+    # checkpoints still require exact strict restoration.
+    model._pretrained_initializer_report = {
+        "path": str(Path(weights_path).resolve()),
+        "loaded_count": len(compatible),
+        "skipped_count": skipped,
+        "loaded_tensor_names": sorted(compatible),
+        "loaded_counts_by_top_level_module": dict(sorted(counts_by_module.items())),
+        "skipped_counts_by_reason": skipped_by_reason,
+        "skipped_examples_by_reason": skipped_examples,
+        "selection_policy": (
+            "all non-scaler checkpoint keys with an exact model key and shape match"
+        ),
+    }
     return len(compatible), skipped
 
 
@@ -1182,6 +1512,65 @@ def create_finetune_model(config: ExperimentConfig, verbose: bool = True) -> tor
         torch.cuda.empty_cache()
     model = get_finetune_model_UNET(config)
     loaded, skipped = load_pretrained_weights(model, _resolve_path(config.path_model_weights))
+    freeze_deterministic_baseline = _freeze_deterministic_baseline_enabled(config)
+    residual_diffusion_enabled = bool(
+        getattr(model, "residual_diffusion_enabled", False)
+    )
+    if freeze_deterministic_baseline:
+        if not residual_diffusion_enabled:
+            raise ValueError(
+                "training.freeze_deterministic_baseline=true requires a residual "
+                "diffusion model."
+            )
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_("diffusion_head" in name)
+        trainable = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+        frozen = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if not parameter.requires_grad
+        )
+        if trainable == 0:
+            raise RuntimeError(
+                "Baseline freezing left no trainable diffusion-head parameters."
+            )
+        if verbose:
+            print(
+                "[training] froze deterministic baseline after loading its "
+                f"initializer; trainable diffusion-head parameters={trainable:,}, "
+                f"frozen baseline parameters={frozen:,}."
+            )
+    elif residual_diffusion_enabled:
+        trainable_baseline = sum(
+            parameter.numel()
+            for name, parameter in model.named_parameters()
+            if "diffusion_head" not in name and parameter.requires_grad
+        )
+        trainable_diffusion = sum(
+            parameter.numel()
+            for name, parameter in model.named_parameters()
+            if "diffusion_head" in name and parameter.requires_grad
+        )
+        if trainable_baseline == 0:
+            raise RuntimeError(
+                "Joint residual training was requested, but no deterministic "
+                "U-Net baseline parameters are trainable."
+            )
+        if trainable_diffusion == 0:
+            raise RuntimeError(
+                "Joint residual training was requested, but no diffusion-head "
+                "parameters are trainable."
+            )
+        if verbose:
+            print(
+                "[training] joint U-Net/residual-diffusion optimization enabled; "
+                f"trainable baseline parameters={trainable_baseline:,}, "
+                f"trainable diffusion-head parameters={trainable_diffusion:,}."
+            )
     if verbose:
         print(
             f"Loaded {loaded} tensors from {config.path_model_weights}. "
@@ -1207,7 +1596,12 @@ def _build_grad_scaler(enabled: bool):
 def build_optimizer_scheduler(
     config: ExperimentConfig, model: torch.nn.Module, train_loader_length: int, use_gpu: bool
 ):
-    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("No trainable parameters are available for the optimizer.")
+    optimizer = AdamW(trainable_parameters, lr=config.learning_rate)
     scaler = _build_grad_scaler(enabled=use_gpu and torch.cuda.is_available())
     accumulation_steps = max(1, int(getattr(config, "gradient_accumulation_steps", 1)))
     steps_per_epoch = max(1, min(train_loader_length, config.limit_steps_train))
@@ -1401,6 +1795,15 @@ def _run_distributed_from_env(config: ExperimentConfig, save_every: int):
 
 def run_training(config: ExperimentConfig, num_gpus: int | None = None, save_every: int = 5):
     _ensure_expandable_cuda_segments()
+
+    # Integrated two-phase path: detected when the YAML contains a
+    # two_phase_training block with phase1/phase2 sub-dicts.
+    if getattr(config, "two_phase_training", None):
+        two_phase = _coerce_mapping(config.two_phase_training)
+        if "phase1" in two_phase and "phase2" in two_phase:
+            print("[training] two_phase_training detected; running integrated U-Net → diffusion pipeline.")
+            return run_two_phase_training(config, num_gpus=num_gpus, save_every=save_every)
+
     use_gpu = _should_use_gpu(config)
     runtime = _resolve_training_runtime(config)
 
@@ -1791,3 +2194,383 @@ def _configure_skip_offload(model: torch.nn.Module, config: ExperimentConfig):
         return
     if hasattr(model, "set_skip_activation_devices"):
         model.set_skip_activation_devices([torch.device("cpu")])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Two-phase (integrated U-Net → diffusion) training
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apply_phase_overrides(
+    base_config: ExperimentConfig,
+    phase_cfg: dict,
+    *,
+    head_type: str,
+    freeze_baseline: bool,
+    checkpoint_dir: str,
+) -> ExperimentConfig:
+    """Return a shallow copy of *base_config* with phase-specific overrides applied.
+
+    A shallow copy is sufficient: primitive scalars are replaced in place, while
+    ``data`` / ``model`` sub-configs keep their shared references (they are not
+    mutated between phases).
+    """
+    import copy
+
+    cfg = copy.copy(base_config)
+    # Epoch / optimiser overrides from the phase block.
+    for attr in ("num_epochs", "learning_rate", "min_lr", "warm_up_steps",
+                 "gradient_accumulation_steps", "early_stopping_patience",
+                 "early_stopping_min_delta"):
+        if attr in phase_cfg:
+            setattr(cfg, attr, phase_cfg[attr])
+
+    # Model head type — must be set both at top level and on the model sub-config
+    # because get_finetune_model_UNET reads from config.model.head_type.
+    cfg.model = copy.copy(base_config.model)
+    cfg.model.head_type = head_type
+
+    # Freeze flag lives under config.training (a dict-like attribute).
+    training_raw = getattr(cfg, "training", None)
+    if training_raw is None:
+        training_raw = {}
+    if hasattr(training_raw, "__dict__"):
+        training_dict = dict(training_raw.__dict__)
+    elif isinstance(training_raw, dict):
+        training_dict = dict(training_raw)
+    else:
+        training_dict = {}
+    training_dict["freeze_deterministic_baseline"] = freeze_baseline
+    cfg.training = training_dict
+
+    # Per-phase loss overrides (e.g. disable improvement_penalty in Phase 2 so
+    # the score-matching signal is not overwhelmed by the correction objective).
+    if "loss" in phase_cfg:
+        import copy as _copy
+        base_loss = _coerce_mapping(getattr(cfg, "loss", {}))
+        phase_loss = _coerce_mapping(phase_cfg["loss"])
+        # Deep-merge: phase values win at every level they specify.
+        merged_loss = _copy.deepcopy(base_loss)
+        for k, v in phase_loss.items():
+            if isinstance(v, dict) and isinstance(merged_loss.get(k), dict):
+                merged_loss[k] = {**merged_loss[k], **v}
+            else:
+                merged_loss[k] = v
+        cfg.loss = merged_loss
+
+    # Phase 1 (deterministic) must save per-epoch checkpoints so that
+    # _best_checkpoint_path can scan them for the lowest training loss.
+    # Phase 2 (diffusion) only needs last.ckpt — epoch files waste disk.
+    cfg.save_epoch_checkpoints = (head_type == "deterministic")
+
+    # Redirect checkpoint output to the phase-specific sub-directory.
+    cfg.checkpoint_dir = checkpoint_dir
+    cfg.resume_training = False
+    cfg.resume_checkpoint_path = None
+    cfg.auto_resume_if_checkpoint_exists = False
+
+    return cfg
+
+
+def _prune_phase1_checkpoints(checkpoint_dir: str, train_losses: list) -> str | None:
+    """Keep only the best-epoch checkpoint; delete all others.
+
+    Uses the in-memory ``train_losses`` list (one value per epoch, 0-indexed)
+    to identify the best epoch without re-reading any checkpoint files.
+    Keeps:  epoch_XXX.ckpt matching the best epoch  (renamed to best.ckpt too)
+            last.ckpt  (always kept for resumability)
+    Deletes: all other epoch_*.ckpt files.
+
+    Returns the path of the retained epoch checkpoint, or last.ckpt if none.
+    """
+    d = Path(checkpoint_dir)
+    epoch_ckpts = sorted(d.glob("epoch_*.ckpt"), key=lambda p: p.stem)
+    if not epoch_ckpts:
+        last = d / "last.ckpt"
+        return str(last) if last.exists() else None
+
+    # Identify the best epoch from the in-memory loss list.
+    if train_losses:
+        best_idx = int(min(range(len(train_losses)), key=lambda i: train_losses[i]))
+        best_epoch_num = best_idx + 1          # trainer writes epoch_{epoch+1:03d}
+        best_loss_val = train_losses[best_idx]
+    else:
+        best_epoch_num = None
+        best_loss_val = None
+
+    best_ckpt_path = None
+    for ckpt_path in epoch_ckpts:
+        stem = ckpt_path.stem                  # "epoch_003"
+        epoch_str = stem[len("epoch_"):]
+        epoch_num = int(epoch_str) if epoch_str.isdigit() else None
+        if epoch_num is not None and epoch_num == best_epoch_num:
+            best_ckpt_path = ckpt_path
+        else:
+            try:
+                ckpt_path.unlink()
+            except Exception as exc:
+                print(f"[two-phase] warning: could not delete {ckpt_path.name}: {exc}")
+
+    if best_ckpt_path is not None:
+        # Also write best.ckpt as a copy so downstream tooling finds it.
+        import shutil
+        shutil.copy2(str(best_ckpt_path), str(d / "best.ckpt"))
+        loss_str = f" (train_loss={best_loss_val:.6g})" if best_loss_val is not None else ""
+        print(f"[two-phase] best Phase 1 checkpoint: {best_ckpt_path.name}{loss_str}")
+        return str(best_ckpt_path)
+
+    last = d / "last.ckpt"
+    return str(last) if last.exists() else None
+
+
+def _last_checkpoint_path(checkpoint_dir: str) -> str | None:
+    """Return path to last.ckpt inside *checkpoint_dir*, or None if absent."""
+    last = Path(checkpoint_dir) / "last.ckpt"
+    return str(last) if last.exists() else None
+
+
+def _run_two_phase_single_gpu_in_process(
+    config: ExperimentConfig,
+    phase1_cfg: dict,
+    phase2_cfg: dict,
+    save_every: int,
+) -> tuple[list, list, list, list]:
+    """Execute two-phase training in the current process (notebook-visible tqdm)."""
+    import copy
+
+    base_checkpoint_dir = config.checkpoint_dir
+    phase1_subdir = phase1_cfg.get("checkpoint_subdir", "phase1_unet")
+    phase2_subdir = phase2_cfg.get("checkpoint_subdir", "phase2_diffusion")
+    p1_ckpt_dir = str(Path(base_checkpoint_dir) / phase1_subdir)
+    p2_ckpt_dir = str(Path(base_checkpoint_dir) / phase2_subdir)
+    Path(p1_ckpt_dir).mkdir(parents=True, exist_ok=True)
+    Path(p2_ckpt_dir).mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+
+    # ── Phase 1: deterministic U-Net ────────────────────────────────────────
+    print("\n[two-phase] ═══ Phase 1: U-Net domain adaptation ═══")
+    p1_config = _apply_phase_overrides(
+        config,
+        phase1_cfg,
+        head_type="deterministic",
+        freeze_baseline=False,
+        checkpoint_dir=p1_ckpt_dir,
+    )
+    train_dl, val_dl = get_dataloaders(p1_config, use_gpu=True, rank=0, world_size=1)
+    p1_model = create_finetune_model(p1_config, verbose=True).to(device)
+    _configure_skip_offload(p1_model, p1_config)
+    p1_optimizer, p1_scaler, p1_scheduler = build_optimizer_scheduler(
+        p1_config, p1_model, len(train_dl), use_gpu=True
+    )
+    p1_loss_fn = build_loss_fn(p1_config, list(p1_config.data.output_vars))
+    if hasattr(p1_loss_fn, "describe"):
+        print(f"[loss] phase 1 active: {p1_loss_fn.describe()}")
+    p1_train_losses, p1_val_losses = train_model(
+        p1_config, p1_model, train_dl, val_dl,
+        p1_optimizer, p1_scheduler, p1_scaler,
+        local_rank=0, use_gpu=True, save_every=save_every, loss_func=p1_loss_fn,
+    )
+    print(f"[two-phase] Phase 1 complete. Checkpoint: {p1_ckpt_dir}")
+
+    # ── Phase 2: residual diffusion head (U-Net frozen) ──────────────────────
+    print("\n[two-phase] ═══ Phase 2: residual diffusion head ═══")
+    # Prune all epoch checkpoints except the best training-loss one, then
+    # initialise Phase 2 from that best checkpoint.
+    p1_best = _prune_phase1_checkpoints(p1_ckpt_dir, p1_train_losses)
+    if p1_best is None:
+        raise RuntimeError(
+            f"Phase 1 did not produce any checkpoint in {p1_ckpt_dir}. "
+            "Cannot initialise Phase 2."
+        )
+    print(f"[two-phase] Phase 2 will load U-Net weights from: {Path(p1_best).name}")
+    p2_config = _apply_phase_overrides(
+        config,
+        phase2_cfg,
+        head_type="diffusion",
+        freeze_baseline=True,
+        checkpoint_dir=p2_ckpt_dir,
+    )
+    # Point Phase 2 weight loading at the best Phase 1 checkpoint. The
+    # load_pretrained_weights routine already skips diffusion_head.* keys so
+    # the freshly-initialised score network is preserved.
+    p2_config.path_model_weights = p1_best
+
+    train_dl2, val_dl2 = get_dataloaders(p2_config, use_gpu=True, rank=0, world_size=1)
+    p2_model = create_finetune_model(p2_config, verbose=True).to(device)
+    _configure_skip_offload(p2_model, p2_config)
+    p2_optimizer, p2_scaler, p2_scheduler = build_optimizer_scheduler(
+        p2_config, p2_model, len(train_dl2), use_gpu=True
+    )
+    p2_loss_fn = build_loss_fn(p2_config, list(p2_config.data.output_vars))
+    if hasattr(p2_loss_fn, "describe"):
+        print(f"[loss] phase 2 active: {p2_loss_fn.describe()}")
+    p2_train_losses, p2_val_losses = train_model(
+        p2_config, p2_model, train_dl2, val_dl2,
+        p2_optimizer, p2_scheduler, p2_scaler,
+        local_rank=0, use_gpu=True, save_every=save_every, loss_func=p2_loss_fn,
+    )
+    print(f"[two-phase] Phase 2 complete. Checkpoint: {p2_ckpt_dir}")
+
+    # Copy final Phase 2 checkpoint up to the top-level checkpoint_dir so the
+    # notebook manifest / inference scripts can find best.ckpt / last.ckpt in
+    # the expected location without knowing the phase layout.
+    import shutil
+    for fname in ("best.ckpt", "last.ckpt"):
+        src = Path(p2_ckpt_dir) / fname
+        dst = Path(base_checkpoint_dir) / fname
+        if src.exists():
+            shutil.copy2(str(src), str(dst))
+            print(f"[two-phase] copied {fname} → {dst}")
+
+    return p1_train_losses, p1_val_losses, p2_train_losses, p2_val_losses
+
+
+def _run_two_phase_cpu(
+    config: ExperimentConfig,
+    phase1_cfg: dict,
+    phase2_cfg: dict,
+    save_every: int,
+) -> tuple[list, list, list, list]:
+    """Execute two-phase training on CPU (no CUDA)."""
+    import copy
+    import shutil
+
+    base_checkpoint_dir = config.checkpoint_dir
+    phase1_subdir = phase1_cfg.get("checkpoint_subdir", "phase1_unet")
+    phase2_subdir = phase2_cfg.get("checkpoint_subdir", "phase2_diffusion")
+    p1_ckpt_dir = str(Path(base_checkpoint_dir) / phase1_subdir)
+    p2_ckpt_dir = str(Path(base_checkpoint_dir) / phase2_subdir)
+    Path(p1_ckpt_dir).mkdir(parents=True, exist_ok=True)
+    Path(p2_ckpt_dir).mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cpu")
+
+    print("\n[two-phase] ═══ Phase 1: U-Net domain adaptation (CPU) ═══")
+    p1_config = _apply_phase_overrides(
+        config, phase1_cfg, head_type="deterministic",
+        freeze_baseline=False, checkpoint_dir=p1_ckpt_dir,
+    )
+    train_dl, val_dl = get_dataloaders(p1_config, use_gpu=False, rank=0, world_size=1)
+    p1_model = create_finetune_model(p1_config, verbose=True).to(device)
+    _configure_skip_offload(p1_model, p1_config)
+    p1_optimizer, p1_scaler, p1_scheduler = build_optimizer_scheduler(
+        p1_config, p1_model, len(train_dl), use_gpu=False
+    )
+    p1_loss_fn = build_loss_fn(p1_config, list(p1_config.data.output_vars))
+    p1_train_losses, p1_val_losses = train_model(
+        p1_config, p1_model, train_dl, val_dl,
+        p1_optimizer, p1_scheduler, p1_scaler,
+        local_rank=0, use_gpu=False, save_every=save_every, loss_func=p1_loss_fn,
+    )
+
+    print("\n[two-phase] ═══ Phase 2: residual diffusion head (CPU) ═══")
+    p1_best = _prune_phase1_checkpoints(p1_ckpt_dir, p1_train_losses)
+    if p1_best is None:
+        raise RuntimeError(f"Phase 1 did not produce any checkpoint in {p1_ckpt_dir}.")
+    p2_config = _apply_phase_overrides(
+        config, phase2_cfg, head_type="diffusion",
+        freeze_baseline=True, checkpoint_dir=p2_ckpt_dir,
+    )
+    p2_config.path_model_weights = p1_best
+    train_dl2, val_dl2 = get_dataloaders(p2_config, use_gpu=False, rank=0, world_size=1)
+    p2_model = create_finetune_model(p2_config, verbose=True).to(device)
+    _configure_skip_offload(p2_model, p2_config)
+    p2_optimizer, p2_scaler, p2_scheduler = build_optimizer_scheduler(
+        p2_config, p2_model, len(train_dl2), use_gpu=False
+    )
+    p2_loss_fn = build_loss_fn(p2_config, list(p2_config.data.output_vars))
+    p2_train_losses, p2_val_losses = train_model(
+        p2_config, p2_model, train_dl2, val_dl2,
+        p2_optimizer, p2_scheduler, p2_scaler,
+        local_rank=0, use_gpu=False, save_every=save_every, loss_func=p2_loss_fn,
+    )
+
+    for fname in ("best.ckpt", "last.ckpt"):
+        src = Path(p2_ckpt_dir) / fname
+        dst = Path(base_checkpoint_dir) / fname
+        if src.exists():
+            shutil.copy2(str(src), str(dst))
+
+    return p1_train_losses, p1_val_losses, p2_train_losses, p2_val_losses
+
+
+def run_two_phase_training(
+    config: ExperimentConfig,
+    num_gpus: int | None = None,
+    save_every: int = 5,
+) -> tuple[list, list, list, list]:
+    """Run integrated two-phase training: U-Net adaptation then diffusion head.
+
+    Returns ``(p1_train_losses, p1_val_losses, p2_train_losses, p2_val_losses)``.
+
+    The ``two_phase_training`` block in the config must have ``phase1`` and
+    ``phase2`` sub-dicts with per-phase overrides (num_epochs, learning_rate,
+    checkpoint_subdir, …).  All other model/data settings come from the shared
+    top-level config so only one YAML is needed.
+    """
+    _ensure_expandable_cuda_segments()
+    two_phase = _coerce_mapping(getattr(config, "two_phase_training", None))
+    phase1_cfg = _coerce_mapping(two_phase.get("phase1", {}))
+    phase2_cfg = _coerce_mapping(two_phase.get("phase2", {}))
+
+    use_gpu = _should_use_gpu(config)
+
+    if not use_gpu:
+        return _run_two_phase_cpu(config, phase1_cfg, phase2_cfg, save_every)
+
+    if bool(getattr(config, "run_single_gpu_in_process", False)):
+        print("[two-phase] running in-process (notebook mode).")
+        result = _run_two_phase_single_gpu_in_process(
+            config, phase1_cfg, phase2_cfg, save_every
+        )
+        p1_train, p1_val, p2_train, p2_val = result
+        return p1_train, p1_val, p2_train, p2_val
+
+    # Spawned single-GPU path (matches the normal single-GPU spawned worker).
+    mp.set_start_method("spawn", force=True)
+    manager = mp.Manager()
+    try:
+        return_dict = manager.dict()
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.ipc_collect()
+        mp.spawn(
+            _two_phase_single_gpu_worker,
+            args=(config, phase1_cfg, phase2_cfg, save_every, return_dict),
+            nprocs=1,
+            join=True,
+        )
+        return (
+            return_dict.get("p1_train_losses", []),
+            return_dict.get("p1_val_losses", []),
+            return_dict.get("p2_train_losses", []),
+            return_dict.get("p2_val_losses", []),
+        )
+    finally:
+        try:
+            manager.shutdown()
+        except Exception:
+            pass
+
+
+def _two_phase_single_gpu_worker(
+    rank: int,
+    config: ExperimentConfig,
+    phase1_cfg: dict,
+    phase2_cfg: dict,
+    save_every: int,
+    return_dict,
+) -> None:
+    """Spawned worker for two-phase single-GPU training."""
+    if rank != 0:
+        return
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+    p1_train, p1_val, p2_train, p2_val = _run_two_phase_single_gpu_in_process(
+        config, phase1_cfg, phase2_cfg, save_every
+    )
+    return_dict["p1_train_losses"] = p1_train
+    return_dict["p1_val_losses"] = p1_val
+    return_dict["p2_train_losses"] = p2_train
+    return_dict["p2_val_losses"] = p2_val
