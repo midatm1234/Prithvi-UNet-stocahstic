@@ -369,7 +369,7 @@ figures with shared comparison scales.
 
 ```bash
 mamba run -n Prithvi python -m pytest -q
-# 423 passed, 2 warnings in 444.86s
+# 430 passed, 2 warnings in 312.69s
 
 mamba run -n Prithvi python -m pytest -q \
   tests/test_refinement_evaluation.py \
@@ -378,13 +378,13 @@ mamba run -n Prithvi python -m pytest -q \
 
 mamba run -n Prithvi python -m pytest -q \
   tests/test_narr_prism_refinement_notebook.py
-# 19 passed in 48.25s
+# 22 passed in 42.79s
 
 mamba run -n Prithvi python -m pytest -q \
   tests/test_prism_source_rebind.py \
   tests/test_prism_checkpoint_contract.py \
   tests/test_narr_prism_refinement_notebook.py
-# 29 passed in 39.26s
+# 32 passed in 45.05s
 
 mamba run -n Prithvi python -m ruff check \
   granitewxc/refinement \
@@ -427,23 +427,26 @@ mamba run -n Prithvi python -m granitewxc.utils.prism_source_rebind \
   examples/NARR_PRISM/preprocessed/narr_prism_California/scalars/normalization_manifest.json \
   examples/NARR_PRISM/artifacts/recovery_provenance/2026-08-12/source_rebind_contract.json
 
-mamba run -n Prithvi jupyter nbconvert --to notebook --execute \
+NARR_PRISM_RUN_TRAINING=0 \
+  mamba run -n Prithvi jupyter nbconvert --to notebook --execute \
   examples/NARR_PRISM/notebooks/narr_prism_refinement.ipynb \
   --output /tmp/narr_prism_refinement_production_defaults.ipynb \
   --ExecutePreprocessor.timeout=1800
 ```
 
 The preprocessing command produced exactly 6,575 training, 730 validation,
-and 3,653 inference files. The last split is predictor-only. The notebook ran
-with its unmodified production defaults (`SMOKE_TEST=False`), resolved the
+and 3,653 inference files. The last split is predictor-only. For this bounded
+setup check, `NARR_PRISM_RUN_TRAINING=0` explicitly overrode the notebook's
+normal production default; a normal **Run All** now trains the selected
+residual-refinement head. The check kept `SMOKE_TEST=False`, resolved the
 external artifact portal, accepted only the signed device-number rebind, loaded
 all 208 Phase-1 tensors with no missing/unexpected/shape-mismatched keys, and
 confirmed the Phase-1 fingerprint `84c8509c…`. Its real first batch had input
 shape `[1, 32, 320, 320]`, target shape `[1, 3, 256, 256]`, and residual-valid
 fraction 0.651718. The selected diffusion Transformer initialized 8,200,128
 trainable refinement parameters while all 252,744,266 Phase-1 parameters
-remained frozen. Training/inference/evaluation switches were deliberately off;
-this was an executable production setup check, not a trained Phase-2 result.
+remained frozen. Inference/evaluation remained off; this was an executable
+production setup check, not a trained Phase-2 result.
 
 ### Per-method synthetic evidence
 

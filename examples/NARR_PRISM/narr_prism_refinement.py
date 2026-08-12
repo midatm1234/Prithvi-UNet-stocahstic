@@ -37,9 +37,11 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -189,6 +191,15 @@ def _to_device(batch, device):
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
 
+def _seed_training(seed: int) -> None:
+    """Seed every RNG used before the Phase-2 model and loaders are built."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -197,7 +208,12 @@ def _to_device(batch, device):
 def cmd_train(args) -> int:
     config = get_config(args.config)
     device = torch.device(args.device)
-    if not resolve_refinement_config(config).is_active:
+    refinement = resolve_refinement_config(config)
+    # This must precede model construction, DataLoader creation/iteration and
+    # lazy refiner initialization. The notebook runs this command in a child
+    # process, so its parent-kernel RNG state cannot provide reproducibility.
+    _seed_training(refinement.seed)
+    if not refinement.is_active:
         raise SystemExit(
             "This configuration has no active refinement section. Use the "
             "deterministic trainer (narr_prism_finetune.py) instead."

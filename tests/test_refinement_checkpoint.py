@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -498,3 +500,22 @@ def test_atomic_save_leaves_no_temporary_files(tmp_path):
     save_checkpoint_atomic({"a": torch.zeros(2)}, path, atomic=True)
     assert path.exists()
     assert [p.name for p in tmp_path.iterdir()] == ["ckpt.pt"]
+
+
+@pytest.mark.parametrize("invalid_loss", [float("nan"), float("inf")])
+def test_validation_rejects_nonfinite_loss(invalid_loss):
+    batch = make_batch(height=16, width=16)
+    model = build("diffusion_unet", batch)
+    model.training_step = lambda *_args, **_kwargs: SimpleNamespace(
+        losses={"loss": torch.tensor(invalid_loss)}
+    )
+    trainer = RefinementTrainer(
+        model,
+        torch.optim.AdamW(model.refiner.parameters(), lr=1.0e-3),
+        logger=lambda _message: None,
+    )
+
+    with pytest.raises(
+        RuntimeError, match="Non-finite refinement validation loss at step 0"
+    ):
+        trainer.validate([batch])

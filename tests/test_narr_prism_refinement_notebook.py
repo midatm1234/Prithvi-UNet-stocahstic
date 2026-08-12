@@ -179,11 +179,66 @@ def test_default_output_avoids_experiments_symlink(monkeypatch, tmp_path):
         / "examples"
         / "NARR_PRISM"
         / "refinement_outputs"
-        / "notebook"
+        / "NARR_PRISM_diffusion_transformer"
     )
     assert namespace["OUTPUT_PATH"] == expected
     assert expected.is_dir()
     assert "experiments" not in expected.relative_to(tmp_path).parts
+
+
+def test_production_defaults_train_diffusion_transformer_residual_head(
+    monkeypatch, tmp_path
+):
+    for name in (
+        "NARR_PRISM_REFINEMENT_CONFIG",
+        "NARR_PRISM_SMOKE_TEST",
+        "NARR_PRISM_RUN_TRAINING",
+        "NARR_PRISM_RUN_INFERENCE",
+        "NARR_PRISM_RUN_EVALUATION",
+        "NARR_PRISM_REFINEMENT_OUTPUT_DIR",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    namespace = _execute_parameter_cell(monkeypatch, tmp_path)
+    assert namespace["SMOKE_TEST"] is False
+    assert namespace["RUN_TRAINING"] is True
+    assert namespace["RUN_INFERENCE"] is False
+    assert namespace["RUN_EVALUATION"] is False
+    assert namespace["REFINEMENT_CONFIG"].endswith(
+        "NARR_PRISM_diffusion_transformer.yaml"
+    )
+
+    compatibility = _cell_source_containing(
+        "This notebook is configured for residual-refinement-head-only training"
+    )
+    assert "refinement.train_on_residual" in compatibility
+    assert "refinement.freeze_phase1" in compatibility
+    assert "not refinement.joint_finetuning" in compatibility
+    assert "not refinement.trainable_phase1_patterns" in compatibility
+
+
+def test_explicit_smoke_mode_disables_default_production_training(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("NARR_PRISM_SMOKE_TEST", "1")
+    monkeypatch.delenv("NARR_PRISM_RUN_TRAINING", raising=False)
+    monkeypatch.setenv(
+        "NARR_PRISM_REFINEMENT_OUTPUT_DIR", str(tmp_path / "smoke-output")
+    )
+    namespace = _execute_parameter_cell(monkeypatch, tmp_path)
+    assert namespace["SMOKE_TEST"] is True
+    assert namespace["RUN_TRAINING"] is False
+
+
+def test_explicit_training_override_is_honored(monkeypatch, tmp_path):
+    monkeypatch.setenv("NARR_PRISM_SMOKE_TEST", "0")
+    monkeypatch.setenv("NARR_PRISM_RUN_TRAINING", "0")
+    monkeypatch.setenv(
+        "NARR_PRISM_REFINEMENT_OUTPUT_DIR", str(tmp_path / "inspect-only")
+    )
+    namespace = _execute_parameter_cell(monkeypatch, tmp_path)
+    assert namespace["SMOKE_TEST"] is False
+    assert namespace["RUN_TRAINING"] is False
 
 
 def test_explicit_self_referential_output_has_actionable_error(
@@ -212,6 +267,7 @@ def test_notebook_has_one_parameter_cell_and_complete_workflow_sections():
         "REFINEMENT_CONFIG",
         "PHASE1_CHECKPOINT",
         "REFINEMENT_CHECKPOINT",
+        "REFINEMENT_CHECKPOINT_DIR",
         "RESUME_CHECKPOINT",
         "ENSEMBLE_SIZE",
         "SMOKE_TEST",
@@ -235,12 +291,19 @@ def test_notebook_has_one_parameter_cell_and_complete_workflow_sections():
     assert "pip install" not in text
     assert "NARR_PRISM_PREDICTION_SPLIT" in parameters
     assert "{'validation', 'inference'}" in parameters
-    assert "examples/NARR_PRISM/refinement_outputs/notebook" in parameters
+    assert "examples/NARR_PRISM/refinement_outputs" in parameters
+    assert "/ Path(REFINEMENT_CONFIG).stem" in parameters
     assert "NARR_PRISM_ENSEMBLE_SIZE', '10'" in parameters
+    assert (
+        "RUN_TRAINING = _env_flag('NARR_PRISM_RUN_TRAINING', not SMOKE_TEST)"
+        in parameters
+    )
     assert (
         "examples/NARR_PRISM/experiments/refinement_notebook" not in parameters
     )
     assert "'--checkpoint-dir', str(PHASE2_CHECKPOINT_DIR)" in text
+    assert "REFINEMENT_CHECKPOINT_DIR or raw_config['checkpoint_dir']" in text
+    assert "NARR_PRISM_REFINEMENT_CHECKPOINT_DIR" in text
     assert text.count("'--device', DEVICE") == 2
     assert "NARR_PRISM_PHASE1_CHECKPOINT" in text
     assert "must not point to itself" in text
@@ -307,7 +370,8 @@ def test_combined_training_and_inference_defers_checkpoint_requirement():
         "REFINEMENT_PATH = select_trained_refinement_checkpoint"
     )
     assert train_offset < selection_offset
-    assert "if RUN_INFERENCE and REFINEMENT_PATH is None:" in training_cell
+    assert "if RUN_INFERENCE and REFINEMENT_PATH is None:" not in training_cell
+    assert "Training completed; selected Phase-2 checkpoint" in training_cell
 
     inference_cell = _cell_source_containing(
         "subprocess.run(infer_command, cwd=REPO_ROOT, check=True)"

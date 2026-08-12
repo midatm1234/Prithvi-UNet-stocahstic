@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import sys
 from datetime import date
 from pathlib import Path
@@ -15,6 +16,7 @@ NARR_DIR = Path(__file__).resolve().parents[1] / "examples" / "NARR_PRISM"
 if str(NARR_DIR) not in sys.path:
     sys.path.insert(0, str(NARR_DIR))
 
+import narr_prism_refinement as refinement_cli
 from compute_scalars_narr_prism import _derive_joint_target_valid_mask
 from narr_prism_dataset import NarrPrismDataset
 from narr_prism_inference import (
@@ -29,6 +31,7 @@ from narr_prism_inference import (
 from narr_prism_refinement import (
     _refinement_checkpoint,
     _require_checkpoint_path,
+    _seed_training,
 )
 from narr_prism_refinement_inference import (
     CoordinateAlignedNoiseSource,
@@ -79,6 +82,62 @@ def test_checkpoint_guard_reports_recursive_symlink(tmp_path) -> None:
     recursive.symlink_to(recursive)
     with pytest.raises(FileNotFoundError, match="not accessible"):
         _require_checkpoint_path(str(recursive), label="Phase-1 deterministic")
+
+
+def test_phase2_training_seed_covers_python_numpy_and_torch() -> None:
+    def sample(seed: int) -> tuple[float, float, torch.Tensor]:
+        _seed_training(seed)
+        return random.random(), float(np.random.random()), torch.rand(4)
+
+    first = sample(173)
+    random.seed(9)
+    np.random.seed(9)
+    torch.manual_seed(9)
+    second = sample(173)
+
+    assert first[:2] == second[:2]
+    assert torch.equal(first[2], second[2])
+
+
+def test_training_command_seeds_before_model_construction(monkeypatch) -> None:
+    class ModelConstructionReached(Exception):
+        pass
+
+    samples = []
+
+    def stop_at_model_construction(*_args, **_kwargs):
+        samples.append(
+            (random.random(), float(np.random.random()), torch.rand(4))
+        )
+        raise ModelConstructionReached
+
+    refinement = SimpleNamespace(is_active=True, seed=2718)
+    monkeypatch.setattr(refinement_cli, "get_config", lambda _path: object())
+    monkeypatch.setattr(
+        refinement_cli, "resolve_refinement_config", lambda _config: refinement
+    )
+    monkeypatch.setattr(
+        refinement_cli, "_phase1_checkpoint", lambda *_args: "/phase1.ckpt"
+    )
+    monkeypatch.setattr(
+        refinement_cli, "_require_checkpoint_path", lambda path, **_kwargs: path
+    )
+    monkeypatch.setattr(
+        refinement_cli, "build_model", stop_at_model_construction
+    )
+    args = SimpleNamespace(
+        config="fixture.yaml", device="cpu", phase1_checkpoint=None
+    )
+
+    for perturbation in (11, 29):
+        random.seed(perturbation)
+        np.random.seed(perturbation)
+        torch.manual_seed(perturbation)
+        with pytest.raises(ModelConstructionReached):
+            refinement_cli.cmd_train(args)
+
+    assert samples[0][:2] == samples[1][:2]
+    assert torch.equal(samples[0][2], samples[1][2])
 
 
 class _RefinementConfig:

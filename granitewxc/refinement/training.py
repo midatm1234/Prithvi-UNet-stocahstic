@@ -490,7 +490,14 @@ class RefinementTrainer:
             batch = _move_batch(batch, self.device, self.non_blocking)
             with self._autocast():
                 output = self.model.training_step(batch, generator=self._generator)
-            total += float(output.losses["loss"].detach())
+                loss = output.losses["loss"]
+            if not torch.isfinite(loss):
+                bar.close()
+                raise RuntimeError(
+                    "Non-finite refinement validation loss at step "
+                    f"{step}: {loss.item()}"
+                )
+            total += float(loss.detach())
             count += 1
             bar.update(1)
             if count % self.log_every == 0:
