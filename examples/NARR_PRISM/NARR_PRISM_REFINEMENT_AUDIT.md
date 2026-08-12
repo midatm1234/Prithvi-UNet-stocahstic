@@ -19,26 +19,64 @@ configured refinement choices are:
 | Flow Matching Transformer | `NARR_PRISM_flow_matching_transformer.yaml` | `flow_matching_transformer` |
 
 All four YAMLs parse, instantiate, complete a finite forward/backward pass,
-sample or integrate, preserve the `[ppt, tmax, tmin]` output order, load the
-same synthetically prefixed Phase-1 state without missing deterministic keys,
-and pass a fixed-tiny-example overfit test. The final full-suite result is
-recorded in the test section below.
+sample or integrate, preserve the `[ppt, tmax, tmin]` output order, and pass a
+fixed-tiny-example overfit test. In addition, all four wrappers have now loaded
+the recovered *real* Phase-1 `last.ckpt`: 208/208 deterministic state entries,
+zero missing, unexpected, or shape-mismatched entries, and the same Phase-1
+tensor fingerprint `84c8509ce161f049d8999e5d44b43b83d36cc316a579d052df1bd0f6173a31c7`.
+Phase 1 is completely frozen in every default Phase-2 wrapper. The final
+full-suite result is recorded in the test section below.
 
-There is one material external blocker. In this checkout,
-`examples/NARR_PRISM/experiments`, `preprocessed`, and `scalars_with_H` are
-self-referential absolute symlinks. Opening any of them returns `ELOOP`, and no
-accessible `last.ckpt` was found under `/data` or `/data2`. Consequently:
+### Artifact-loss incident and recovery
 
-1. the currently requested `last.ckpt` could not be inspected or loaded;
-2. real NARR–PRISM training and 2016–2025 inference could not be run here;
-3. no Phase-2 scientific improvement is claimed; and
-4. no refinement method can yet be recommended on independent-validation
-   skill.
+Commit `c538165` had mistakenly tracked `experiments`, `preprocessed`, and
+`scalars_with_H` as absolute links back to the same paths in the primary
+worktree. At 2026-08-12 17:40 UTC, checking out that branch replaced the real,
+ignored artifact directories with those self-referential links. Reflog times,
+link inode birth times, and earlier directory listings establish this sequence;
+it was not an external-mount failure.
 
-Production commands now fail immediately on this condition instead of running
-a random Phase-1 or an untrained Phase-2 model. Restoring the artifacts at a
-non-self-referential path is the only prerequisite for the commands later in
-this report.
+`/data/granite-wxc-stochastic` is a small, clean, detached secondary Git
+worktree at the older `NARR_PRISM` commit; it contains no experiment artifacts
+and was not used for this recovery. The former `granite-wxc` GitHub URL and the
+current `Prithvi-UNet-stocahstic` URL identify the same repository after an
+in-place rename, not two repositories. The working checkout remains
+`/data/granite-wxc`, and publication targets lowercase `origin/narr_prism`.
+
+The deleted Phase-1 inode and extent tree were recovered read-only from the
+ext4 journal. The reconstructed checkpoint is 2,982,857,829 bytes with SHA-256
+`1d352491ab32a4069696673f504edcd9c67d48325e83dcf3b042fe3d3eb80efa`.
+All 814 ZIP members pass CRC validation, `torch.load(..., mmap=True)` succeeds,
+and its metadata reports epoch index 19 (20 completed epochs), 208 model state
+entries, the expected NARR–PRISM case/channel/grid/normalization contract, and
+ordered outputs `[ppt, tmax, tmin]`. Its saved final training loss is
+1.6487374, final validation loss 2.5783734, and best validation loss 2.3550687;
+these are checkpoint training objectives, not physical-unit skill metrics.
+
+The four normalization arrays were recovered byte-for-byte from the checkpoint
+buffers, including the exact `.npy` container bytes; all four SHA-256 values
+match the checkpoint contract. The original normalization manifest and scalar
+metadata were also recovered from the journal. Independently recovered 1996,
+2005, and 2013 daily training products were compared with their deterministic
+regenerations: all 15 predictors, three targets, elevation, latitude,
+longitude, and NaN payloads/masks are bitwise equal (maximum absolute
+difference 0.0). The apparent raw-source signature
+change was traced across all 6,575 training dates solely to Linux device
+renumbering from 2097 to 2065; paths, inodes, sizes, and nanosecond mtimes are
+unchanged. A strict attestation verifies all 52,600 source entries and permits
+only this one schema-4 source-split relocation; all other contract differences
+still fail.
+
+The durable local artifact root is now outside the Git worktree at
+`/data2/granite-wxc-artifacts/NARR_PRISM`. Tracked compatibility links route
+through the ignored per-clone `examples/NARR_PRISM/artifacts` portal rather
+than pointing at themselves. `narr_prism_artifacts.py` validates/configures the
+portal and rejects cycles or source-tree targets. The intact raw NARR, PRISM,
+and elevation inputs were used to regenerate the complete corpus under that
+external root: 6,575 training days, 730 target-bearing validation days, and
+3,653 predictor-only inference days, with no missing or extra configured
+dates. No Phase-2 scientific improvement is claimed until the four real
+refinement runs and paired validation evaluation are complete.
 
 ## Acceptance matrix
 
@@ -46,22 +84,23 @@ this report.
 | --- | --- | --- |
 | Four YAMLs parse | Pass | CLI `describe` on all four files |
 | Same configured Phase-1 checkpoint | Pass (configuration) | All point to the same `last.ckpt` |
-| Current real `last.ckpt` loads in all four | Blocked | Artifact is absent/inaccessible in this checkout |
-| No unexplained deterministic keys | Pass in automated prefix/shape tests; real artifact blocked | Controlled loader tests include `model.`, `module.`, and `_orig_mod.` roots |
-| Semantic checkpoint compatibility | Pass in code/tests; real artifact blocked | PRISM checkpoint contract is validated before tensor loading |
+| Current real `last.ckpt` loads in all four | Pass | Recovered checkpoint; each wrapper loads 208/208 keys and fingerprint `84c8509c…` |
+| No unexplained deterministic keys | Pass | Real load has zero missing/unexpected/shape mismatches; prefix tests also cover `model.`, `module.`, and `_orig_mod.` roots |
+| Semantic checkpoint compatibility | Pass | Real schema-4 PRISM contract is validated before tensor loading; source relocation requires a narrow audited rebind |
 | Phase 1 frozen by default | Pass | `eval`, `requires_grad=False`, `no_grad`, detached baseline/features |
 | Selected unfreezing remains configurable | Pass for training/resume | `trainable_phase1_patterns`; mutually exclusive with joint fine-tuning and fitted residual normalization |
 | Residual sign/reconstruction | Pass | Synthetic exact residual and hurdle-precipitation no-op tests |
-| Finite training backward for every head | Pass | Parameterized four-head test and notebook smoke tests |
-| Sampling/integration for every head | Pass | Diffusion oracle and all flow-solver direction tests |
+| Finite training backward for every head | Pass | Parameterized tests plus one regenerated real-data batch for all four heads |
+| Sampling/integration for every head | Pass | Diffusion/flow tests plus two-step real-data sampling/integration for all four heads |
 | Transformer patch round trip | Pass | Rectangular, non-divisible padding/cropping tests |
 | Tiny-subset overfit | Pass | All four reduce a fixed stochastic objective by more than 50% |
 | Phase-2 save/resume | Pass | Model/refiner/optimizer/scheduler/scaler/RNG tests |
 | Residual-semantics migration | Pass | Schema 2 marker required; schema-1 inference/resume rejected before state loading |
+| Complete preprocessed corpus | Pass | 6,575/730/3,653 exact training/validation/inference dates; inference products contain no targets |
 | Production daily inference contract | Pass synthetically | Exact dates, canonical coordinates, mask, units, filenames, and provenance tests |
-| Generic notebook smoke execution | Pass | Headless `nbconvert` plus all four helper runs |
+| Generic notebook execution | Pass | All four synthetic helpers, headless smoke, and real production setup against `last.ckpt` and a real batch |
 | Existing Phase-1 behavior/regressions | Pass automated suite | Final full-suite command in the test section |
-| Full 2016–2025 Phase-2 evaluation | Not run | Requires restored Phase-1, scalers/products, and trained Phase-2 checkpoints |
+| Full 2016–2025 Phase-2 evaluation | Not run | Complete data products are ready; four trained Phase-2 checkpoints are not yet available |
 
 ## Audited data and model contract
 
@@ -101,6 +140,16 @@ channel counts, case name, train/validation dates, grid and crop/halo contract,
 scaler/source signatures, preprocessing semantics, precipitation settings, and
 model topology before any weight is applied.
 
+The recovered schema-4 checkpoint records the same Phase-1 topology as the
+authoritative YAML: embedding width 1024, eight backbone blocks, MLP ratio 4,
+16 attention heads, 2 x 2 patches, 512 downscaling embedding channels, 128
+convolution channels, convolutional encoder/decoder, UNet depths `[2, 2, 2]`,
+dynamic decoder skips, pre-convolution backbone residuals, windowed-local
+attention, and bilinear decoder/output scaling with `align_corners: false`.
+The observed training tensors are `[B, 32, 320, 320]` predictors (32-pixel
+halo) and `[B, 3, 256, 256]` targets. Precipitation uses the hurdle head with a
+0.01 wet threshold and 0.5 occurrence threshold; temperatures are degrees C.
+
 ### Grid, crop, masks, and alignment
 
 The canonical California grid is 1024 x 1024 with ascending latitude and
@@ -133,6 +182,21 @@ whose unsupported cells are deliberately neutral-filled with mean 0/std 1.
 | `tmax` | degrees C | per-grid-cell training mean/std z-score |
 | `tmin` | degrees C | per-grid-cell training mean/std z-score |
 
+The authenticated 1996–2013 scalar artifacts are `inputs_mean`/`inputs_std`
+with shape `[32]` and SHA-256 prefixes `27ffd1e2d9c7`/`aef98b46969e`, plus
+`targets_mean`/`targets_std` with shape `[3, 1024, 1024]` and prefixes
+`dd1d2f1eed9d`/`53498f61544f`. The precipitation p95 scale is 7.42578125
+mm/day. The canonical-grid fingerprint begins `f062e76bd115`; all are bound by
+the recovered checkpoint and active scalar manifest. The regenerated manifest
+SHA-256 is `dd4a51d631d37601fad3c4f528036c5a34722a534469c1d5129d6b1522e46f12`.
+The signed boolean support mask has SHA-256
+`8ecc8b537827db900961f5c66e128ffe7e86d1acfeaed3fec0e23cc30e937ee7`
+and marks 714,742 of 1,048,576 cells valid. The schema-4 relocation
+attestation's signed digest is
+`ffef6674e51c3cfadbea79f86b4a7771fbf83c8165e1a0639551a39e9f3b171f`;
+it binds the historical `5588ce4c…` source split to the regenerated
+`3e41bdcc…` split and cannot authorize any other checkpoint-contract change.
+
 NARR air predictors remain Kelvin before predictor standardization. No target
 unit conversion is performed by preprocessing. The raw PRISM GDAL files do not
 carry a reliable `units` attribute. All five YAMLs therefore state the exact
@@ -152,6 +216,8 @@ and 2016–2025 observations are never used to fit them.
 
 | Root cause | Why it produced incorrect/noisy results | Repair |
 | --- | --- | --- |
+| Artifact directories were committed as absolute links to themselves | A branch checkout replaced ignored checkpoints/products with cyclic links and removed the local artifacts | Recover the exact checkpoint/scalars, regenerate daily products, and route tracked relative links through an ignored external portal |
+| `data.use_static` contradicted the recovered Phase-1 contract | Elevation was already input channel 16; claiming a separate static tensor made the YAML semantically incompatible | Set `use_static: false` in Phase 1 and all four refiners while retaining `elev` and `mask_elev` in the ordered 32-channel input |
 | Phase-2 accepted an absent Phase-1 checkpoint | Training/inference could run against random deterministic weights | Active training/inference require an accessible regular Phase-1 file |
 | Only tensor shape/key checks were used | Same-shaped weights with different variables, scalers, dates, or grid could be accepted | Run `validate_prism_checkpoint_contract` before tensor loading |
 | Key-level `model.`/Lightning roots were not normalized | Valid deterministic checkpoints failed or were partially mapped | Strip only uniform known roots, then require complete deterministic coverage |
@@ -303,7 +369,7 @@ figures with shared comparison scales.
 
 ```bash
 mamba run -n Prithvi python -m pytest -q
-# 407 passed, 2 warnings in 259.28s
+# 423 passed, 2 warnings in 444.86s
 
 mamba run -n Prithvi python -m pytest -q \
   tests/test_refinement_evaluation.py \
@@ -312,17 +378,27 @@ mamba run -n Prithvi python -m pytest -q \
 
 mamba run -n Prithvi python -m pytest -q \
   tests/test_narr_prism_refinement_notebook.py
-# 6 passed
+# 19 passed in 48.25s
+
+mamba run -n Prithvi python -m pytest -q \
+  tests/test_prism_source_rebind.py \
+  tests/test_prism_checkpoint_contract.py \
+  tests/test_narr_prism_refinement_notebook.py
+# 29 passed in 39.26s
 
 mamba run -n Prithvi python -m ruff check \
   granitewxc/refinement \
+  granitewxc/utils/prism_checkpoint.py \
+  granitewxc/utils/prism_source_rebind.py \
   examples/NARR_PRISM/narr_prism_refinement.py \
   examples/NARR_PRISM/narr_prism_refinement_inference.py \
+  examples/NARR_PRISM/narr_prism_artifacts.py \
   examples/NARR_PRISM/refinement_smoke.py \
   examples/NARR_PRISM/evaluate_refinement.py \
   tests/test_refinement_phase2_contract.py \
   tests/test_narr_prism_refinement_inference.py \
   tests/test_narr_prism_refinement_notebook.py \
+  tests/test_prism_source_rebind.py \
   tests/test_refinement_evaluation.py \
   tests/test_refinement_evaluation_cli.py \
   --select E9,F,B905
@@ -335,6 +411,39 @@ git diff --check
 The full Ruff profile was not used as a completion claim because this
 repository currently contains many pre-existing 79-column/style findings. No
 unrelated mass formatting was performed.
+
+### Real artifact and notebook verification
+
+The recovery/rebuild and the final production-mode notebook check used these
+commands in the same `Prithvi` environment:
+
+```bash
+mamba run -n Prithvi env PYTHON_BIN=python PREPROCESS_SHARDS=48 \
+  bash examples/NARR_PRISM/run_preprocess.sh \
+  --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml --shards 48
+
+mamba run -n Prithvi python -m granitewxc.utils.prism_source_rebind \
+  examples/NARR_PRISM/artifacts/recovery_provenance/2026-08-12/normalization_manifest_historical.json \
+  examples/NARR_PRISM/preprocessed/narr_prism_California/scalars/normalization_manifest.json \
+  examples/NARR_PRISM/artifacts/recovery_provenance/2026-08-12/source_rebind_contract.json
+
+mamba run -n Prithvi jupyter nbconvert --to notebook --execute \
+  examples/NARR_PRISM/notebooks/narr_prism_refinement.ipynb \
+  --output /tmp/narr_prism_refinement_production_defaults.ipynb \
+  --ExecutePreprocessor.timeout=1800
+```
+
+The preprocessing command produced exactly 6,575 training, 730 validation,
+and 3,653 inference files. The last split is predictor-only. The notebook ran
+with its unmodified production defaults (`SMOKE_TEST=False`), resolved the
+external artifact portal, accepted only the signed device-number rebind, loaded
+all 208 Phase-1 tensors with no missing/unexpected/shape-mismatched keys, and
+confirmed the Phase-1 fingerprint `84c8509c…`. Its real first batch had input
+shape `[1, 32, 320, 320]`, target shape `[1, 3, 256, 256]`, and residual-valid
+fraction 0.651718. The selected diffusion Transformer initialized 8,200,128
+trainable refinement parameters while all 252,744,266 Phase-1 parameters
+remained frozen. Training/inference/evaluation switches were deliberately off;
+this was an executable production setup check, not a trained Phase-2 result.
 
 ### Per-method synthetic evidence
 
@@ -349,6 +458,30 @@ generalization or climate-skill result.
 | Flow Matching UNet | 1.077023 | 0.297376 | 72.39% | Pass |
 | Flow Matching Transformer | 1.292314 | 0.007635 | 99.41% | Pass |
 
+### Per-method real-data mechanics evidence
+
+Each head was also exercised sequentially on the same regenerated 1996-01-01
+training tile on `cuda:1`: real Phase 1, real scalers, real predictors and
+PRISM target, one objective/backward pass, and a two-step sample or ODE
+integration. All four produced `[1, 3, 256, 256]` outputs, finite values on the
+valid mask, zeros for invalid normalized residuals, NaNs for invalid physical
+outputs, and nonnegative physical precipitation. Every Phase-1 parameter
+remained frozen with no gradient; every refiner had finite nonzero gradients.
+
+| Head | Real-batch objective | Refiner gradient norm | Two-step reconstruction |
+| --- | ---: | ---: | --- |
+| Diffusion UNet | 1.113680 | 0.145386 | Pass |
+| Diffusion Transformer | 1.477615 | 3.881091 | Pass |
+| Flow Matching UNet | 1.827922 | 0.924171 | Pass |
+| Flow Matching Transformer | 2.193870 | 3.955415 | Pass |
+
+For this bounded mechanics check only, residual statistics were fitted to that
+single batch and were not saved. The evidence JSON is explicitly marked
+`scientific_validation=false` (SHA-256
+`0594964adc88faf2f60dbb7182ba5977e82d48d9dcf4cc267e2eb5f8829ef6e0`).
+Production training still fits residual normalization over the complete
+1996–2013 loader before optimization.
+
 Additional tests cover residual sign, exact zero-residual reconstruction,
 normalization inversion, invalid masks, finite gradients, output dimensions,
 fixed-seed reproducibility, all diffusion parameterizations, diffusion clean
@@ -360,9 +493,12 @@ and evaluation provenance rejection.
 ### Available real Phase-1 metrics
 
 The existing 2016–2025 comparison notebook contains historical Phase-1
-aggregates. They were not recomputed in this audit because its source artifacts
-are unavailable, and its cache identity was previously too weak. They are
-recorded only as baseline context:
+aggregates. They were not treated as newly measured evidence in this audit
+because those daily Phase-1 prediction files were deleted in the artifact
+incident and the old notebook cache identity was too weak. Predictor-only
+inference inputs are fully regenerated, but the deterministic prediction
+command in the production section must recreate those outputs. The historical
+aggregates are recorded only as baseline context:
 
 | Variable | Phase-1 mean | PRISM mean | Mean bias | Mean cellwise RMSE |
 | --- | ---: | ---: | ---: | ---: |
@@ -381,7 +517,9 @@ Core implementation:
 - `granitewxc/refinement/evaluation.py`
 - `granitewxc/refinement/{__init__,cache,io}.py`
 - `granitewxc/utils/{normalization,prism_checkpoint}.py` (signed support mask
-  and Phase-1 semantic contract)
+  and Phase-1 semantic contract);
+- `granitewxc/utils/prism_source_rebind.py` (strictly authenticated legacy
+  device-number relocation)
 
 NARR–PRISM workflow:
 
@@ -396,7 +534,9 @@ NARR–PRISM workflow:
 - `narr_prism_refinement_inference.py`;
 - `evaluate_refinement.py`;
 - `refinement_smoke.py`;
-- `notebooks/NARR_PRISM_refinement.ipynb`; and
+- `narr_prism_artifacts.py`, the tracked artifact links, and `.gitignore`
+  (safe external artifact portal);
+- `notebooks/narr_prism_refinement.ipynb`; and
 - cache hardening in `notebooks/Compare_inference_prism.ipynb`.
 
 Documentation and tests:
@@ -407,31 +547,38 @@ Documentation and tests:
 - `tests/test_narr_prism_refinement_notebook.py`;
 - `tests/test_narr_prism_target_free.py`;
 - `tests/test_refinement_evaluation.py`;
-- `tests/test_refinement_evaluation_cli.py`; and
+- `tests/test_refinement_evaluation_cli.py`;
 - `tests/test_narr_prism_inference_selection.py`,
   `tests/test_prism_normalization.py`, and
-  `tests/test_prism_checkpoint_contract.py`; and
+  `tests/test_prism_checkpoint_contract.py`;
+- `tests/test_prism_source_rebind.py`; and
 - focused fixture/config/checkpoint test updates.
 
 ## Commands for full production runs
 
-Run from the repository root after replacing the broken artifact links or
-passing an accessible checkpoint path. The four training commands use the same
-Phase-1 checkpoint:
+Run from the repository root after configuring and validating the local
+artifact portal. The four training commands use the same Phase-1 checkpoint:
 
 ```bash
 PHASE1_CKPT=examples/NARR_PRISM/experiments/checkpoints/narr_prism_California/last.ckpt
 
-# Recompute the same 1996--2013 scalers and add the separately signed,
-# training-derived target_valid_mask.npy required by production inference.
-mamba run -n Prithvi python examples/NARR_PRISM/compute_scalars_narr_prism.py \
-  --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_artifacts.py
 
-# Regenerate the independent split as predictor-only daily products. This
-# deliberately does not discover or embed 2016--2025 PRISM observations.
-mamba run -n Prithvi python examples/NARR_PRISM/preproc_narr_prism.py \
-  --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml \
-  --mode inference --overwrite
+# Regenerate training products, then training-only scalars/support mask, then
+# target-bearing validation and predictor-only independent inference products.
+# This ordering is required because training constructs both loaders.
+mamba run -n Prithvi env PYTHON_BIN=python PREPROCESS_SHARDS=48 \
+  bash examples/NARR_PRISM/run_preprocess.sh \
+  --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml --shards 48
+
+# This recovered schema-4 checkpoint was trained before the raw filesystem's
+# Linux device number changed. Authenticate the proven device-only relocation;
+# this command rejects changes to any path, inode, size, mtime, day, scalar,
+# grid, channel, transform, or other immutable contract field.
+mamba run -n Prithvi python -m granitewxc.utils.prism_source_rebind \
+  examples/NARR_PRISM/artifacts/recovery_provenance/2026-08-12/normalization_manifest_historical.json \
+  examples/NARR_PRISM/preprocessed/narr_prism_California/scalars/normalization_manifest.json \
+  examples/NARR_PRISM/artifacts/recovery_provenance/2026-08-12/source_rebind_contract.json
 
 mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_refinement.py train \
   --config examples/NARR_PRISM/NARR_PRISM_diffusion_unet.yaml \
@@ -453,20 +600,16 @@ mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_refinement.py train \
 Resume a run with `--resume` (the YAML checkpoint directory's `last.ckpt`) or
 `--resume /explicit/path.ckpt`.
 
-Generate the complete target-free 2014–2015 validation products first for
-method selection. Prediction never receives validation observations; the
+Use the complete 2014–2015 validation products generated by the pipeline above
+for method selection. Prediction never receives validation observations; the
 evaluator opens PRISM separately. The output split and its configured bounds
 are embedded in every daily file and validated during evaluation:
 
 ```bash
-mamba run -n Prithvi python examples/NARR_PRISM/preproc_narr_prism.py \
-  --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml \
-  --mode validation --overwrite
-
 mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_inference.py \
   --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml \
   --checkpoint "$PHASE1_CKPT" --split validation \
-  --output-dir examples/NARR_PRISM/experiments/validation_daily/phase1 \
+  --output-dir examples/NARR_PRISM/experiments/inference_output \
   --device cuda
 
 mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_refinement.py infer \
@@ -500,7 +643,7 @@ mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_refinement.py infer \
 mamba run -n Prithvi python examples/NARR_PRISM/evaluate_refinement.py \
   --config examples/NARR_PRISM/NARR_PRISM_diffusion_unet.yaml \
   --split validation \
-  --phase1-dir examples/NARR_PRISM/experiments/validation_daily/phase1/validation/narr_prism_California \
+  --phase1-dir examples/NARR_PRISM/experiments/inference_output/validation/narr_prism_California \
   --method diffusion_unet=examples/NARR_PRISM/experiments/validation_daily/diffusion_unet/validation/narr_prism_California \
   --method diffusion_transformer=examples/NARR_PRISM/experiments/validation_daily/diffusion_transformer/validation/narr_prism_California \
   --method flow_matching_unet=examples/NARR_PRISM/experiments/validation_daily/flow_matching_unet/validation/narr_prism_California \
@@ -579,37 +722,39 @@ execution is:
 NARR_PRISM_SMOKE_TEST=1 NARR_PRISM_REFINEMENT_DEVICE=cpu \
   NARR_PRISM_REFINEMENT_OUTPUT_DIR=/tmp/narr_prism_refinement_smoke \
   mamba run -n Prithvi jupyter nbconvert --to notebook --execute \
-  examples/NARR_PRISM/notebooks/NARR_PRISM_refinement.ipynb \
+  examples/NARR_PRISM/notebooks/narr_prism_refinement.ipynb \
   --output /tmp/NARR_PRISM_refinement_smoke.ipynb
 ```
 
 ## Remaining limitations and recommendation
 
-1. Restore `last.ckpt`, scalers, and preprocessed products, then rerun semantic
-   compatibility and real one-batch tests before starting long training.
-   Recompute scalars once to add the signed training-support artifact and
-   regenerate inference preprocessing once under the predictor-only contract.
-2. Train four independent Phase-2 checkpoints and run the paired 2014–2015
+1. Train four independent Phase-2 checkpoints and run the paired 2014–2015
    validation evaluation before selecting hyperparameters. Keep 2016–2025 as
    the independent inference period; do not fit normalizers or thresholds on it.
-3. Run the full 2016–2025 evaluator and inspect precipitation occurrence/tails,
+2. Run the full 2016–2025 evaluator and inspect precipitation occurrence/tails,
    temperature extremes, terrain strata, ensemble calibration, and boundary
    maps. A lower aggregate RMSE alone is insufficient.
-4. Raw PRISM target units should eventually be backed by a signed source
+3. Raw PRISM target units should eventually be backed by a signed source
    manifest because the source files themselves omit unit attributes.
-5. Joint/selected Phase-1 fine-tuning can train and resume with combined
+4. Joint/selected Phase-1 fine-tuning can train and resume with combined
    checkpoints, but frozen production inference intentionally rejects that
    format until a separate audited combined-checkpoint inference contract is
    implemented.
-6. Phase-2 schema-1 checkpoints are intentionally not loadable: their
+5. Phase-2 schema-1 checkpoints are intentionally not loadable: their
    precipitation residual baseline was the ungated hurdle amount latent. There
    is no lossless weight migration to schema 2's encoded final physical
    baseline, so such refinement heads must be retrained.
+6. Legacy raw-source signatures include Linux `st_dev`, which can change after
+   disk re-enumeration. The recovered schema-4 checkpoint is protected by the
+   exact device-only attestation above; a future signature schema should omit
+   volatile device numbers or add signed content hashes while retaining a
+   legacy reader.
 
 **Recommendation:** no one of the four refiners is scientifically recommended
-yet. All four are operational under automated/synthetic tests, but no real
-Phase-2 checkpoint or independent paired validation result is available in this
-checkout. Select the method only after running the same paired evaluator on
-validation-split daily products and obtaining measured 2014–2015 metrics; use
-the 2016–2025 command above only for the final independent evaluation. Do not
-infer a winner from the synthetic overfit table.
+yet. All four are operational under automated tests and real-data one-batch
+forward/backward/sampling checks, but no trained Phase-2 checkpoint or
+independent paired validation result is available in this checkout. Select the
+method only after running the same paired evaluator on validation-split daily
+products and obtaining measured 2014–2015 metrics; use the 2016–2025 command
+above only for the final independent evaluation. Do not infer a winner from
+the synthetic overfit or mechanics tables.

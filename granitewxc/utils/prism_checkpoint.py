@@ -19,12 +19,43 @@ from granitewxc.utils.predictands import (
     canonicalize_scaling_method,
 )
 from granitewxc.utils.prism_grid import load_canonical_grid
-
+from granitewxc.utils.prism_source_rebind import (
+    validate_phase1_source_rebind_attestation,
+)
 
 CONTRACT_KEY = "prism_pipeline_contract"
 CONTRACT_SCHEMA_VERSION = 5
 _LEGACY_CONTRACT_SCHEMA_VERSION = 4
 PRISM_DATA_TYPES = {"narr_prism", "merra_prism"}
+
+
+def _legacy_device_rebind_splits(
+    observed: Mapping[str, Any], expected: Mapping[str, Any]
+) -> tuple[str, str] | None:
+    """Return the sole old/new mismatch when it is the source split hash.
+
+    Deliberately compare the entire nested contract after substituting that one
+    value.  This keeps the attestation path from becoming a general schema-4
+    compatibility escape hatch.
+    """
+    observed_coordinates = observed.get("coordinates_and_artifacts")
+    expected_coordinates = expected.get("coordinates_and_artifacts")
+    if not isinstance(observed_coordinates, Mapping) or not isinstance(
+        expected_coordinates, Mapping
+    ):
+        return None
+    key = normalization.TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY
+    old_split = observed_coordinates.get(key)
+    new_split = expected_coordinates.get(key)
+    if not isinstance(old_split, str) or not isinstance(new_split, str):
+        return None
+    if old_split == new_split:
+        return None
+    rebound = _primitive(observed)
+    rebound["coordinates_and_artifacts"][key] = new_split
+    if rebound != dict(expected):
+        return None
+    return old_split, new_split
 
 
 def _get(value: Any, key: str, default: Any = None) -> Any:
@@ -371,6 +402,57 @@ def build_prism_checkpoint_contract(config: Any) -> dict[str, Any] | None:
     }
 
 
+def _validate_legacy_contract(
+    config: Any,
+    observed: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    """Validate schema 4, including its one authenticated relocation path."""
+    # Schema 4 predates the separately signed support mask. Production
+    # inference independently requires/authenticates the scalar-side artifact.
+    legacy_expected = _primitive(expected)
+    legacy_expected["schema_version"] = _LEGACY_CONTRACT_SCHEMA_VERSION
+    legacy_expected["coordinates_and_artifacts"].pop("target_valid_mask", None)
+    if dict(observed) == legacy_expected:
+        return dict(observed)
+
+    rebind_splits = _legacy_device_rebind_splits(observed, legacy_expected)
+    if rebind_splits is not None:
+        old_split, new_split = rebind_splits
+        scalar_dir = normalization.resolve_scalar_dir(config, for_writing=False)
+        try:
+            validate_phase1_source_rebind_attestation(
+                scalar_dir,
+                old_split_sha256=old_split,
+                new_split_sha256=new_split,
+                role=f"{role}:schema4-source-rebind",
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"[{role}] schema-4 checkpoint source-artifact split changed "
+                "and its device-only rebind attestation is missing or invalid: "
+                f"{exc}"
+            ) from exc
+        return dict(observed)
+
+    keys = sorted(set(observed) | set(legacy_expected))
+    mismatch_keys = [
+        key for key in keys if observed.get(key) != legacy_expected.get(key)
+    ]
+    details = "; ".join(
+        f"{key}: checkpoint={observed.get(key)!r}, "
+        f"config={legacy_expected.get(key)!r}"
+        for key in mismatch_keys
+    )
+    raise ValueError(
+        f"[{role}] schema-4 checkpoint PRISM pipeline contract mismatch "
+        f"({details}). Only an exactly attested source-device rebind is "
+        "permitted; use the exact training artifacts or retrain."
+    )
+
+
 def validate_prism_checkpoint_contract(
     config: Any,
     checkpoint: Mapping[str, Any],
@@ -397,16 +479,9 @@ def validate_prism_checkpoint_contract(
         raise ValueError(f"[{role}] invalid {CONTRACT_KEY}: expected a mapping")
     observed_schema = observed.get("schema_version")
     if observed_schema == _LEGACY_CONTRACT_SCHEMA_VERSION:
-        # Schema 4 predates the separately signed support mask. Preserve use of
-        # an otherwise exact Phase-1 checkpoint: production inference still
-        # independently requires/authenticates the new scalar-side artifact.
-        legacy_expected = _primitive(expected)
-        legacy_expected["schema_version"] = _LEGACY_CONTRACT_SCHEMA_VERSION
-        legacy_expected["coordinates_and_artifacts"].pop(
-            "target_valid_mask", None
+        return _validate_legacy_contract(
+            config, observed, expected, role=role
         )
-        if dict(observed) == legacy_expected:
-            return dict(observed)
     if observed_schema != CONTRACT_SCHEMA_VERSION:
         raise ValueError(
             f"[{role}] unsupported checkpoint PRISM contract schema "

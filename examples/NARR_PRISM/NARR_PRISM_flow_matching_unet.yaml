@@ -120,7 +120,8 @@ data:
   - ppt
   - tmax
   - tmin
-  use_static: true
+  # Elevation is already embedded in input_vars; Phase 1 has no static tensor.
+  use_static: false
   use_preprocessed: true
   preprocessed_dir: ./examples/NARR_PRISM/preprocessed
   scalar_dir: ./examples/NARR_PRISM/scalars_with_H

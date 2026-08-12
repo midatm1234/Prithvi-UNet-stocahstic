@@ -109,7 +109,10 @@ data:
   - ppt
   - tmax
   - tmin
-  use_static: true
+  # Elevation is already the explicit `elev` value channel (plus mask_elev)
+  # in input_vars.  The completed Phase-1 checkpoint contract records no
+  # separate static tensor, so this must remain false for exact compatibility.
+  use_static: false
   # Single source of truth: training/scalars/inference consume only the daily
   # products generated under preprocessed/<case_name>/<mode>.
   use_preprocessed: true

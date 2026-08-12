@@ -1,6 +1,7 @@
-experiments/
+# Per-clone portal for large checkpoints, preprocessing products, and scalars.
+/artifacts
+refinement_outputs/
 logs/
-scalars_with_H/
 notebooks/*_executed.ipynb
 *.nc
 *.npy

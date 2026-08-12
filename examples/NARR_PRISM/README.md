@@ -11,6 +11,29 @@ training preprocessing → training-only scalars → validation/inference prepro
 → training / fine-tuning → tiled inference → evaluation
 ```
 
+## Local artifact portal
+
+Large NARR–PRISM products are not stored in Git. The tracked compatibility
+links `experiments`, `preprocessed`, and `scalars_with_H` route through the
+ignored, per-clone `artifacts` entry. Configure that entry once with the
+directory that contains those three subdirectories:
+
+```bash
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_artifacts.py \
+  --artifact-root /path/to/NARR_PRISM
+```
+
+The helper validates the link graph, rejects self-referential/cyclic targets,
+and will not replace an existing nonmatching file, directory, or link. Run it
+without arguments at any time to verify the configured locations. A fresh
+clone can validate just the tracked relative-link layout before artifacts are
+attached with `--allow-missing`.
+
+Do not retarget the three tracked links to absolute paths. In particular, an
+absolute `experiments` link back to `examples/NARR_PRISM/experiments` points to
+itself and fails with `ELOOP`; routing through the ignored portal prevents a
+branch checkout from replacing an artifact directory with that link.
+
 ---
 
 ## Required Input Data
@@ -95,7 +118,9 @@ recomputed. `--shards N` partitions dates across parallel preprocessing
 processes without changing the resulting artifact contract.
 
 **Outputs:** `inputs_mean.npy`, `inputs_std.npy`, `targets_mean.npy`,
-`targets_std.npy`, and `metadata.json` in `<preprocessed_dir>/<case_name>/scalars/`.
+`targets_std.npy`, the training-only `target_valid_mask.npy`, `metadata.json`,
+and `normalization_manifest.json` in
+`<preprocessed_dir>/<case_name>/scalars/`.
 The case directory also contains the persisted canonical PRISM coordinate
 contract. Each daily product records preprocessing and source-artifact
 signatures; cache hits are accepted only when those signatures still match.
