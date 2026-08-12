@@ -17,11 +17,11 @@ and the Phase-1 checkpoint identity.
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
 import torch
+from tqdm import tqdm
 
 from granitewxc.refinement.checkpoint import (
     CHECKPOINT_KIND_COMBINED,
@@ -221,12 +221,19 @@ class RefinementTrainer:
         dtype = torch.bfloat16 if mode == "bf16" else torch.float16
         return torch.autocast(device_type="cuda", dtype=dtype)
 
-    def train_one_epoch(self, loader: Iterable[Mapping[str, Any]], limit_steps: int = 0) -> float:
+    def train_one_epoch(
+        self,
+        loader: Iterable[Mapping[str, Any]],
+        limit_steps: int = 0,
+        epoch: int = 0,
+    ) -> float:
         self.model.train()
         total, count = 0.0, 0
-        start = time.perf_counter()
         self.optimizer.zero_grad(set_to_none=True)
 
+        n = limit_steps if limit_steps > 0 else (len(loader) if hasattr(loader, "__len__") else None)
+        ep_label = f"Ep {epoch+1:03d} train"
+        bar = tqdm(total=n, desc=ep_label, unit="batch", ascii=" #", ncols=100, leave=True)
         for step, batch in enumerate(loader):
             if limit_steps and step >= limit_steps:
                 break
@@ -235,6 +242,7 @@ class RefinementTrainer:
                 output = self.model.training_step(batch, generator=self._generator)
                 loss = output.losses["loss"]
             if not torch.isfinite(loss):
+                bar.close()
                 raise RuntimeError(f"Non-finite refinement loss at step {step}: {loss.item()}")
 
             scaled = loss / self.accum
@@ -262,18 +270,28 @@ class RefinementTrainer:
 
             total += float(loss.detach())
             count += 1
+            bar.update(1)
             if count % self.log_every == 0:
-                self.log(
-                    f"[refinement] epoch {self.state.epoch} step {count} "
-                    f"loss={total / count:.6f} ({count / (time.perf_counter() - start):.2f} it/s)"
+                bar.set_postfix(
+                    loss=f"{total / count:.4f}",
+                    lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
                 )
-
+                bar.refresh()
+        bar.close()
         return total / max(1, count)
 
     @torch.no_grad()
-    def validate(self, loader: Iterable[Mapping[str, Any]], limit_steps: int = 0) -> float:
+    def validate(
+        self,
+        loader: Iterable[Mapping[str, Any]],
+        limit_steps: int = 0,
+        epoch: int = 0,
+    ) -> float:
         self.model.eval()
         total, count = 0.0, 0
+        n = limit_steps if limit_steps > 0 else (len(loader) if hasattr(loader, "__len__") else None)
+        bar = tqdm(total=n, desc=f"Ep {epoch+1:03d} val  ", unit="batch", ascii=" #",
+                   ncols=100, leave=True)
         for step, batch in enumerate(loader):
             if limit_steps and step >= limit_steps:
                 break
@@ -282,6 +300,11 @@ class RefinementTrainer:
                 output = self.model.training_step(batch, generator=self._generator)
             total += float(output.losses["loss"].detach())
             count += 1
+            bar.update(1)
+            if count % self.log_every == 0:
+                bar.set_postfix(val_loss=f"{total / count:.4f}")
+                bar.refresh()
+        bar.close()
         return total / max(1, count)
 
     def fit(
@@ -294,22 +317,26 @@ class RefinementTrainer:
         limit_steps_valid: int = 0,
         save_every: int = 1,
     ) -> RefinementTrainState:
-        for _ in range(num_epochs):
-            train_loss = self.train_one_epoch(train_loader, limit_steps=limit_steps_train)
+        for ep in range(self.state.epoch, self.state.epoch + num_epochs):
+            train_loss = self.train_one_epoch(
+                train_loader, limit_steps=limit_steps_train, epoch=ep
+            )
             self.state.train_loss_history.append(train_loss)
             val_loss = None
             if val_loader is not None:
-                val_loss = self.validate(val_loader, limit_steps=limit_steps_valid)
+                val_loss = self.validate(
+                    val_loader, limit_steps=limit_steps_valid, epoch=ep
+                )
                 self.state.val_loss_history.append(val_loss)
             is_best = val_loss is not None and (
                 self.state.best_val_loss is None or val_loss < self.state.best_val_loss
             )
             if is_best:
                 self.state.best_val_loss = val_loss
-            self.log(
-                f"[refinement] epoch {self.state.epoch} train={train_loss:.6f} "
-                f"val={'n/a' if val_loss is None else f'{val_loss:.6f}'}"
-            )
+            val_str = "n/a" if val_loss is None else f"{val_loss:.4f}"
+            best_str = "" if self.state.best_val_loss is None else f"  best={self.state.best_val_loss:.4f}"
+            marker = "  *** new best ***" if is_best else ""
+            print(f"Ep {ep+1:03d}  train={train_loss:.4f}  val={val_str}{best_str}{marker}")
             # ``state.epoch`` is advanced *before* saving so a checkpoint records
             # the number of completed epochs, i.e. the epoch to resume at.
             self.state.epoch += 1

@@ -192,6 +192,7 @@ class DiffusionTransformerRefiner(_BaseDiffusionRefiner):
             max_tokens_lon=t.max_tokens_lon,
             gradient_checkpointing=t.gradient_checkpointing,
             optimized_attention=t.optimized_attention,
+            zero_init_output=t.zero_init_output,
         )
 
     def set_attention_implementation(self, implementation: str) -> None:

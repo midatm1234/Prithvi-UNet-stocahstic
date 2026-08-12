@@ -43,6 +43,12 @@ from utils.quantization_diagnostics import (  # noqa: E402
     save_json,
 )
 from granitewxc.models.model import get_finetune_model_UNET  # noqa: E402
+from granitewxc.refinement.checkpoint import (  # noqa: E402
+    load_phase1_state_dict,
+    load_refinement_state_dict,
+    validate_phase1_reference,
+)
+from granitewxc.refinement.two_phase import build_two_phase_model  # noqa: E402
 from granitewxc.utils.config import get_config  # noqa: E402
 from sa_params import (  # noqa: E402
     UserParams,
@@ -56,6 +62,7 @@ from run_utils import assert_no_eccc_reference, load_run_manifest  # noqa: E402
 
 # ===================== USER PARAMETERS (EDIT ME) =====================
 NUM_RUNS = 12
+ACTIVE_RUN_INDICES = [0]  # run only case 1/12 for now
 
 # Each list must have NUM_RUNS entries.
 TEST_SPLITS = ["test/historical/predictors/perfect","test/historical/predictors/perfect",
@@ -66,12 +73,12 @@ TEST_SPLITS = ["test/historical/predictors/perfect","test/historical/predictors/
         "test/end_century/predictors/imperfect", "test/end_century/predictors/imperfect"
 ]
 
-PREDICTOR_FILES = ["ACCESS-CM2_1981-2000_regridded.nc","NorESM2-MM_1981-2000_regridded.nc",
-        "ACCESS-CM2_1981-2000_regridded.nc","NorESM2-MM_1981-2000_regridded.nc",
-        "ACCESS-CM2_2041-2060_regridded.nc","NorESM2-MM_2041-2060_regridded.nc",
-        "ACCESS-CM2_2041-2060_regridded.nc","NorESM2-MM_2041-2060_regridded.nc",
-        "ACCESS-CM2_2080-2099_regridded.nc","NorESM2-MM_2080-2099_regridded.nc",
-        "ACCESS-CM2_2080-2099_regridded.nc","NorESM2-MM_2080-2099_regridded.nc"
+PREDICTOR_FILES = ["ACCESS-CM2_1981-2000.nc","NorESM2-MM_1981-2000.nc",
+        "ACCESS-CM2_1981-2000.nc","NorESM2-MM_1981-2000.nc",
+        "ACCESS-CM2_2041-2060.nc","NorESM2-MM_2041-2060.nc",
+        "ACCESS-CM2_2041-2060.nc","NorESM2-MM_2041-2060.nc",
+        "ACCESS-CM2_2080-2099.nc","NorESM2-MM_2080-2099.nc",
+        "ACCESS-CM2_2080-2099.nc","NorESM2-MM_2080-2099.nc"
 ]
 
 PREDICTION_OUTPUT_NAMES = ["Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc", "Predictions_pr_tasmax_NorESM2-MM_1981-2000.nc",
@@ -82,30 +89,24 @@ PREDICTION_OUTPUT_NAMES = ["Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc", "Pre
         "Predictions_pr_tasmax_ACCESS-CM2_2080-2099.nc", "Predictions_pr_tasmax_NorESM2-MM_2080-2099.nc"
 ]
 
-INFERENCE_OUTPUT_ROOTS = ["/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/end-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/SA_T2_ACCESS-CM2_static_train/predictions/end-century/imperfect/"
+INFERENCE_OUTPUT_ROOTS = [
+    str(PROJECT_DIR / f"runs/SA_T2_ACCESS-CM2_static_train/predictions/{period}/{quality}/")
+    for period, quality in (
+        ("historical", "perfect"), ("historical", "perfect"),
+        ("historical", "imperfect"), ("historical", "imperfect"),
+        ("mid-century", "perfect"), ("mid-century", "perfect"),
+        ("mid-century", "imperfect"), ("mid-century", "imperfect"),
+        ("end-century", "perfect"), ("end-century", "perfect"),
+        ("end-century", "imperfect"), ("end-century", "imperfect"),
+    )
 ]
 
 # Fixed config for the fine-tuned model
 REPO_ROOT = REPO_ROOT.resolve()
 PROJECT_DIR = PROJECT_DIR.resolve()
-DATASET_ROOT = REPO_ROOT / "granite-geospatial-wxc-downscaling/CORDEX/SA_domain"
-CONFIG_PATH = PROJECT_DIR / "SA_T2_ACCESS-CM2_static_v6.yaml"
+CONFIG_PATH = PROJECT_DIR / "SA_T2_ACCESS-CM2_static_diffusion_transformer.yaml"
+DATASET_ROOT: Path | None = None  # derived from YAML by _resolve_dataset_root()
 RUNS_ROOT = PROJECT_DIR / f"runs_v6/{CONFIG_PATH.stem.replace('_v6', '')}_train"
-
-TRAIN_SPLIT = "train/Emulator_hist_future"
-TARGET_TEMPLATE_FILE = "pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc"
-TRAIN_TARGETS = [DATASET_ROOT / TRAIN_SPLIT / "target" / TARGET_TEMPLATE_FILE]
 
 FINETUNE_RUN_NAME = getattr(get_config(str(CONFIG_PATH)), "job_id", None)  # set None to auto-pick latest
 USE_STATIC = True
@@ -116,7 +117,9 @@ REPAIR_INVALID_INPUTS = True
 DEVICE_TARGET = "cuda"
 NUM_WORKERS = 2
 INFERENCE_BATCH_SIZE = 8  # inference-only; does not affect model weights
-PREFERRED_CHECKPOINT = "best"
+PREFERRED_CHECKPOINT = "best"  # Phase-1 fallback only
+REFINEMENT_CHECKPOINT_NAME = "last.ckpt"
+REFINEMENT_ENSEMBLE_SIZE = 5
 MIN_FREE_GB = 8  # minimum free GPU memory to consider "idle"
 MAX_GPUS = 1  # set to an int to cap how many GPUs to expose
 RESPECT_CUDA_VISIBLE_DEVICES = True  # ignore preset CUDA_VISIBLE_DEVICES when auto-selecting idle GPUs
@@ -263,6 +266,7 @@ def _select_device() -> torch.device:
 
 
 def _collect_scaler_dtype_summary(model: torch.nn.Module) -> dict[str, str]:
+    model = getattr(model, "phase1", model)
     summary: dict[str, str] = {}
     for name in (
         "input_scalers_mu",
@@ -279,6 +283,7 @@ def _collect_scaler_dtype_summary(model: torch.nn.Module) -> dict[str, str]:
 
 
 def _normalize_predictors_for_diagnostics(batch: dict[str, torch.Tensor], model: torch.nn.Module) -> torch.Tensor:
+    model = getattr(model, "phase1", model)
     x = batch["x"].float()
     batch_size, _, height, width = x.shape
     n_input_timestamps = int(getattr(model, "n_input_timestamps", 1))
@@ -291,6 +296,7 @@ def _normalize_predictors_for_diagnostics(batch: dict[str, torch.Tensor], model:
 
 
 def _to_pre_inverse_output(pred_inverse: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
+    model = getattr(model, "phase1", model)
     pred = pred_inverse.float()
     sigma = model.output_scalers_sigma.to(device=pred.device, dtype=pred.dtype)
     mu = getattr(model, "output_scalers_mu", None)
@@ -303,6 +309,8 @@ def _to_pre_inverse_output(pred_inverse: torch.Tensor, model: torch.nn.Module) -
 
 def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
     predictions = []
+    deterministic_predictions = []
+    ensemble_member_predictions = []
     pre_inverse_predictions = []
     targets = []
 
@@ -353,7 +361,7 @@ def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
 
     with torch.no_grad():
         model.eval()
-        for batch in tqdm(dataloader, desc="Running inference", leave=False):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Running inference", leave=False)):
             if "x" not in batch or "y" not in batch:
                 raise KeyError("Inference batch must include 'x' and 'y'")
 
@@ -370,12 +378,27 @@ def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
             normalized_x = _normalize_predictors_for_diagnostics(batch, model)
             stage_stats["normalized_predictors"].add(normalized_x.detach().cpu().numpy())
 
+            # Initialise the lazy refiner from the first real batch, then load Phase 2.
+            if not getattr(model, "_last_checkpoint_loaded", False):
+                with torch.no_grad():
+                    model._prepare(batch)
+                report = load_refinement_state_dict(model, model._last_checkpoint_payload)
+                model._last_checkpoint_loaded = True
+                print(f"[checkpoint] loaded refinement {REFINEMENT_CHECKPOINT_NAME}: {report.summary()}")
+            if boundary_cfg.enabled and not getattr(model, "_boundary_notice_printed", False):
+                print("[refinement] full-frame sampling avoids independent tile-noise seams.")
+                model._boundary_notice_printed = True
             with autocast_context():
-                out, _, out_raw_model = infer_batch_with_boundary_mitigation(
-                    model=model,
-                    batch=batch,
-                    cfg=boundary_cfg,
+                refined = model.predict(
+                    batch,
+                    ensemble_size=REFINEMENT_ENSEMBLE_SIZE,
+                    seed=int(model.refinement_config.seed) + batch_idx,
+                    return_members=True,
                 )
+                if refined.refined is None or refined.refined_normalized is None or refined.members is None:
+                    raise RuntimeError("The active refinement model returned incomplete ensemble output.")
+                out = refined.refined
+                out_raw_model = refined.refined_normalized
 
             if FORCE_OUTPUT_FLOAT32:
                 out = out.float()
@@ -385,6 +408,8 @@ def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
             out_pre_inverse_cpu = out_raw_model.detach().cpu()
 
             predictions.append(out_cpu)
+            deterministic_predictions.append(refined.deterministic.detach().cpu().float())
+            ensemble_member_predictions.append(refined.members.detach().cpu().float())
             pre_inverse_predictions.append(out_pre_inverse_cpu)
             targets.append(batch["y"].detach().cpu().float())
 
@@ -401,6 +426,8 @@ def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
 
     return {
         "predictions": torch.cat(predictions, dim=0),
+        "deterministic_predictions": torch.cat(deterministic_predictions, dim=0),
+        "ensemble_member_predictions": torch.cat(ensemble_member_predictions, dim=0),
         "predictions_pre_inverse": torch.cat(pre_inverse_predictions, dim=0),
         "targets": torch.cat(targets, dim=0),
         "stage_stats": {key: value.finalize() for key, value in stage_stats.items()},
@@ -561,106 +588,108 @@ def _build_dataloader(config, predictor_paths, target_paths, device):
     )
 
 
+def _resolve_repo_path(value: str | os.PathLike) -> Path:
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (REPO_ROOT / path).resolve()
+
+
+def _resolve_dataset_root(config) -> Path:
+    """Derive SA_domain from YAML-owned data paths; never guess it silently."""
+    configured = []
+    for field in ("training_predictor_paths", "training_target_paths", "static_path"):
+        value = getattr(config.data, field, None)
+        values = value if isinstance(value, (list, tuple)) else [value]
+        configured.extend(Path(item).expanduser().resolve() for item in values if item)
+    roots = []
+    for path in configured:
+        for parent in (path, *path.parents):
+            if parent.name.lower() == "sa_domain":
+                roots.append(parent)
+                break
+    roots = list(dict.fromkeys(roots))
+    if len(roots) != 1:
+        raise RuntimeError(f"YAML data paths must resolve to one SA_domain root; found {roots}")
+    root = roots[0]
+    if not root.is_dir():
+        raise FileNotFoundError(f"YAML-derived dataset root does not exist: {root}")
+    return root
+
+
+def _resolve_test_predictor(dataset_root: Path, test_split: str, filename: str) -> Path:
+    directory = dataset_root / test_split
+    requested = directory / filename
+    alternatives = [requested]
+    if filename.endswith("_regridded.nc"):
+        alternatives.append(directory / filename.replace("_regridded.nc", ".nc"))
+    elif filename.endswith(".nc"):
+        alternatives.append(directory / filename.replace(".nc", "_regridded.nc"))
+    existing = list(dict.fromkeys(path.resolve() for path in alternatives if path.is_file()))
+    if len(existing) == 1:
+        if existing[0] != requested.resolve():
+            print(f"[data] predictor filename compatibility fallback: {requested.name} -> {existing[0].name}")
+        return existing[0]
+    if len(existing) > 1:
+        raise RuntimeError(f"Ambiguous predictor files for {filename}: {existing}")
+    attempted = "\n  ".join(str(path) for path in alternatives)
+    raise FileNotFoundError(f"Test predictor not found; tried:\n  {attempted}")
+
+
+def _resolve_refinement_checkpoint(config) -> Path:
+    configured_dir = Path(config.checkpoint_dir).expanduser()
+    if configured_dir.is_absolute():
+        candidates = [configured_dir / REFINEMENT_CHECKPOINT_NAME]
+    else:
+        # The refinement notebook runs with cwd=PROJECT_DIR, while YAML paths
+        # are commonly authored relative to REPO_ROOT. Support both meanings.
+        candidates = [
+            (REPO_ROOT / configured_dir / REFINEMENT_CHECKPOINT_NAME).resolve(),
+            (PROJECT_DIR / configured_dir / REFINEMENT_CHECKPOINT_NAME).resolve(),
+        ]
+    candidates = list(dict.fromkeys(candidates))
+    existing = [path for path in candidates if path.is_file()]
+    if len(existing) == 1:
+        return existing[0]
+    if len(existing) > 1:
+        print(f"[checkpoint] multiple last.ckpt candidates found; using {existing[0]}")
+        return existing[0]
+    attempted = "\n  ".join(str(path) for path in candidates)
+    raise FileNotFoundError(f"refinement last.ckpt not found; tried:\n  {attempted}")
+
+
 def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, Path]:
-    runs_root = _select_runs_root(RUNS_ROOT, FINETUNE_RUN_NAME)
-    if runs_root != RUNS_ROOT:
-        print(f"[runs] Using fallback runs root: {runs_root} (preferred {RUNS_ROOT})")
-
-    base_params = UserParams(
-        repo_root=REPO_ROOT,
-        project_dir=PROJECT_DIR,
-        runs_root=runs_root,
-        config_path=CONFIG_PATH,
-        inference_run_name=FINETUNE_RUN_NAME,
-        preferred_checkpoint=PREFERRED_CHECKPOINT,
-        device_target=DEVICE_TARGET,
-        batch_size=INFERENCE_BATCH_SIZE,
-        num_workers=NUM_WORKERS,
-        use_static=USE_STATIC,
-    )
-
-    validate_paths(base_params)
-    run_name, run_dir = resolve_existing_run_dir(base_params)
-    manifest = load_run_manifest(run_dir)
-    resolved_config_path = Path(manifest["config_snapshot"]).resolve()
-    base_config_raw = manifest.get("base_config")
-    config_source_path = resolved_config_path
-    if base_config_raw:
-        candidate = Path(base_config_raw).expanduser().resolve()
-        if candidate.exists():
-            config_source_path = candidate
-
-    os.chdir(PROJECT_DIR)
-    config = get_config(str(config_source_path))
-    assert_no_eccc_reference(config_source_path)
-    print(f"[config] source={config_source_path}")
-
-    manifest_scalars = manifest.get("scalars", {})
-    if isinstance(manifest_scalars, dict):
-        model_scaler_map = {
-            "model.input_mu": "input_mu",
-            "model.input_sigma": "input_sigma",
-            "model.target_mu": "target_mu",
-            "model.target_sigma": "target_sigma",
-        }
-        for key, attr in model_scaler_map.items():
-            path = manifest_scalars.get(key)
-            if path:
-                setattr(config.model, attr, path)
-        data_scalers = manifest_scalars.get("data.scalers")
-        if data_scalers:
-            config.data.scalers = data_scalers
-
-    if NUM_WORKERS is not None:
-        config.dl_num_workers = int(NUM_WORKERS)
-    if INFERENCE_BATCH_SIZE is not None:
-        config.batch_size = int(INFERENCE_BATCH_SIZE)
+    global DATASET_ROOT
+    config = get_config(str(CONFIG_PATH))
+    assert_no_eccc_reference(CONFIG_PATH)
+    DATASET_ROOT = _resolve_dataset_root(config)
+    print(f"[config] source={CONFIG_PATH}")
+    print(f"[data] YAML-derived dataset root={DATASET_ROOT}")
+    config.dl_num_workers = int(NUM_WORKERS) if NUM_WORKERS is not None else config.dl_num_workers
+    config.batch_size = int(INFERENCE_BATCH_SIZE) if INFERENCE_BATCH_SIZE is not None else config.batch_size
     config.device_target = DEVICE_TARGET
     if USE_STATIC is not None:
         config.data.use_static = bool(USE_STATIC)
     if STATIC_PATH:
         config.data.static_path = str(Path(STATIC_PATH).resolve())
 
-    checkpoint_path = resolve_checkpoint(base_params, run_dir)
-    assert_no_eccc_reference(checkpoint_path)
+    phase1_path = _resolve_repo_path(config.model.phase1["checkpoint"])
+    refinement_path = _resolve_refinement_checkpoint(config)
+    if not phase1_path.is_file():
+        raise FileNotFoundError(f"Phase-1 checkpoint not found: {phase1_path}")
+    assert_no_eccc_reference(phase1_path)
+    assert_no_eccc_reference(refinement_path)
 
-    model = get_finetune_model_UNET(config)
-    checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
-    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-    model_state = model.state_dict()
-    weights_have_module_prefix = all(key.startswith("module.") for key in state_dict.keys())
-    model_expects_module_prefix = all(key.startswith("module.") for key in model_state.keys())
+    model = build_two_phase_model(get_finetune_model_UNET(config), config)
+    phase1_payload = torch.load(str(phase1_path), map_location="cpu", weights_only=True)
+    print(f"[checkpoint] loaded Phase 1: {load_phase1_state_dict(model, phase1_payload).summary()}")
+    refinement_payload = torch.load(str(refinement_path), map_location="cpu", weights_only=True)
+    validate_phase1_reference(refinement_payload, model.phase1.state_dict(), strict=True)
+    model._last_checkpoint_payload = refinement_payload
+    model._last_checkpoint_loaded = False
 
-    if model_expects_module_prefix and not weights_have_module_prefix:
-        state_dict = state_dict.__class__((("module." + key), value) for key, value in state_dict.items())
-    elif weights_have_module_prefix and not model_expects_module_prefix:
-        prefix_len = len("module.")
-        state_dict = state_dict.__class__((key[prefix_len:], value) for key, value in state_dict.items())
-
-    scaler_key_parts = (
-        "input_scalers_",
-        "output_scalers_",
-        "static_input_scalers_",
-        "static_output_scalers_",
-    )
-    state_dict = state_dict.__class__(
-        (key, value)
-        for key, value in state_dict.items()
-        if not any(part in key for part in scaler_key_parts)
-    )
-    incompatible = model.load_state_dict(state_dict, strict=False)
-    missing = [
-        key
-        for key in incompatible.missing_keys
-        if not any(part in key for part in scaler_key_parts)
-    ]
-    if missing or incompatible.unexpected_keys:
-        raise RuntimeError(
-            "Checkpoint/model mismatch after filtering scaler tensors. "
-            f"missing={missing[:8]}, unexpected={incompatible.unexpected_keys[:8]}"
-        )
-
-    return run_name, run_dir, checkpoint_path, config, model, runs_root
+    run_name = str(getattr(config, "job_id", CONFIG_PATH.stem))
+    run_dir = phase1_path.parents[2]
+    print(f"[checkpoint] staged refinement checkpoint: {refinement_path}")
+    return run_name, run_dir, refinement_path, config, model, run_dir.parent
 
 
 def main() -> None:
@@ -706,8 +735,12 @@ def main() -> None:
         f"force_output_float32={FORCE_OUTPUT_FLOAT32}"
     )
 
-    run_indices = range(DIST_RANK, NUM_RUNS, DIST_WORLD_SIZE) if DIST_ENABLED else range(NUM_RUNS)
-    for idx in run_indices:
+    invalid_indices = [idx for idx in ACTIVE_RUN_INDICES if idx < 0 or idx >= NUM_RUNS]
+    if invalid_indices:
+        raise ValueError(f"ACTIVE_RUN_INDICES contains invalid entries: {invalid_indices}")
+    run_indices = ACTIVE_RUN_INDICES[DIST_RANK::DIST_WORLD_SIZE] if DIST_ENABLED else ACTIVE_RUN_INDICES
+    active_run_count = len(ACTIVE_RUN_INDICES)
+    for active_position, idx in enumerate(run_indices, start=1):
         test_split = TEST_SPLITS[idx]
         predictor_file = PREDICTOR_FILES[idx]
         prediction_output_name = PREDICTION_OUTPUT_NAMES[idx]
@@ -716,8 +749,10 @@ def main() -> None:
             runs_root_used.parent.name,
         )
 
+        if DATASET_ROOT is None:
+            raise RuntimeError("Dataset root was not initialized from the YAML.")
         if predictor_file:
-            test_predictors = [DATASET_ROOT / test_split / predictor_file]
+            test_predictors = [_resolve_test_predictor(DATASET_ROOT, test_split, predictor_file)]
         else:
             test_predictors = sorted((DATASET_ROOT / test_split).glob("*.nc"))
 
@@ -730,7 +765,7 @@ def main() -> None:
             inference_output_root=inference_output_root,
             inference_predictor_root=DATASET_ROOT / test_split,
             test_predictor_paths=test_predictors,
-            test_target_paths=TRAIN_TARGETS,
+            test_target_paths=[_resolve_repo_path(path) for path in config.data.training_target_paths],
             use_static=USE_STATIC,
             checkpoint_path=None,
             preferred_checkpoint=PREFERRED_CHECKPOINT,
@@ -773,9 +808,9 @@ def main() -> None:
             extra={"run_name": run_name, "checkpoint": str(checkpoint_path)},
         )
 
-        print(f"[{idx + 1:02d}/{NUM_RUNS}] Using predictors from {Path(test_predictor_paths[0]).parent}")
-        print(f"[{idx + 1:02d}/{NUM_RUNS}] Output directory: {output_root}")
-        print(f"[{idx + 1:02d}/{NUM_RUNS}] Saved parameter snapshot to {params_json}")
+        print(f"[{active_position:02d}/{active_run_count}] Using predictors from {Path(test_predictor_paths[0]).parent}")
+        print(f"[{active_position:02d}/{active_run_count}] Output directory: {output_root}")
+        print(f"[{active_position:02d}/{active_run_count}] Saved parameter snapshot to {params_json}")
 
         test_dl = _build_dataloader(config, config.data.test_predictor_paths, config.data.test_target_paths, device)
 
@@ -797,15 +832,25 @@ def main() -> None:
             )
         inference_result = _run_full_inference(test_dl, model, device, target_vars, boundary_cfg)
         full_outputs = inference_result["predictions"]
+        full_deterministic_outputs = inference_result["deterministic_predictions"]
+        full_ensemble_member_outputs = inference_result["ensemble_member_predictions"]
         full_outputs_pre_inverse = inference_result["predictions_pre_inverse"]
         full_targets = inference_result["targets"]
 
         outputs_np = full_outputs.numpy().astype(np.float32, copy=False)
+        deterministic_outputs_np = full_deterministic_outputs.numpy().astype(np.float32, copy=False)
+        ensemble_member_outputs_np = full_ensemble_member_outputs.numpy().astype(np.float32, copy=False)
         outputs_pre_inverse_np = full_outputs_pre_inverse.numpy().astype(np.float32, copy=False)
         targets_np = full_targets.numpy().astype(np.float32, copy=False)
         if outputs_np.shape[1] != len(target_vars):
             raise ValueError(
                 f"Model produced {outputs_np.shape[1]} channels but target_vars expects {len(target_vars)}"
+            )
+        expected_member_shape = (outputs_np.shape[0], REFINEMENT_ENSEMBLE_SIZE, len(target_vars))
+        if ensemble_member_outputs_np.shape[:3] != expected_member_shape:
+            raise ValueError(
+                f"Unexpected ensemble shape {ensemble_member_outputs_np.shape}; "
+                f"expected [time, {REFINEMENT_ENSEMBLE_SIZE}, {len(target_vars)}, lat, lon]"
             )
 
         predicted_var_values = _build_var_array_map(target_vars, outputs_np)
@@ -829,7 +874,9 @@ def main() -> None:
 
         diagnostics_payload = {
             "run_index": idx + 1,
-            "num_runs": NUM_RUNS,
+            "scenario_count": NUM_RUNS,
+            "active_run_position": active_position,
+            "active_run_count": active_run_count,
             "predictor_paths": test_predictor_paths,
             "target_template_paths": target_template_paths,
             "stage_stats": inference_result["stage_stats"],
@@ -838,6 +885,7 @@ def main() -> None:
             "scaler_dtypes": scaler_dtype_summary,
             "mixed_precision_enabled": bool(ENABLE_MIXED_PRECISION),
             "force_output_float32": bool(FORCE_OUTPUT_FLOAT32),
+            "refinement_ensemble_size": REFINEMENT_ENSEMBLE_SIZE,
             "predictands": {name: spec.to_dict() for name, spec in predictand_specs.items()},
         }
         if SAVE_DIAGNOSTICS_JSON:
@@ -883,12 +931,16 @@ def main() -> None:
             lon_coord = template_ds[lon_name].load()
 
         coords = {time_dim: predictor_time_coord, lat_dim: lat_coord, lon_dim: lon_coord}
-        prediction_ds = xr.Dataset(coords=coords)
+        ensemble_coords = {
+            **coords,
+            "ensemble": np.arange(REFINEMENT_ENSEMBLE_SIZE, dtype=np.int32),
+        }
+        prediction_ds = xr.Dataset(coords=ensemble_coords)
         for var_idx, name in enumerate(target_vars):
             prediction_ds[name] = xr.DataArray(
-                outputs_np[:, var_idx],
-                dims=(time_dim, lat_dim, lon_dim),
-                coords=coords,
+                ensemble_member_outputs_np[:, :, var_idx],
+                dims=(time_dim, "ensemble", lat_dim, lon_dim),
+                coords=ensemble_coords,
                 attrs=target_attrs.get(name, {}),
             )
 
@@ -896,6 +948,8 @@ def main() -> None:
             prediction_ds[name] = prediction_ds[name].astype(np.float32)
 
         prediction_ds.attrs.update(template_attrs)
+        prediction_ds.attrs["prediction_kind"] = "refinement_ensemble_members"
+        prediction_ds.attrs["ensemble_size"] = REFINEMENT_ENSEMBLE_SIZE
         prediction_output_path = output_root / prediction_output_stub
         prediction_ds.to_netcdf(
             prediction_output_path,
@@ -903,16 +957,37 @@ def main() -> None:
             encoding=_build_netcdf_encoding(target_vars),
         )
         print(
-            f"[{idx + 1:02d}/{NUM_RUNS}] Saved predictions to {prediction_output_path} "
+            f"[{active_position:02d}/{active_run_count}] Saved refined ensemble members to {prediction_output_path} "
             f"({predictor_time_coord.values[0]} -> {predictor_time_coord.values[-1]})"
         )
+
+        deterministic_ds = xr.Dataset(coords=coords)
+        for var_idx, name in enumerate(target_vars):
+            deterministic_ds[name] = xr.DataArray(
+                deterministic_outputs_np[:, var_idx],
+                dims=(time_dim, lat_dim, lon_dim),
+                coords=coords,
+                attrs=target_attrs.get(name, {}),
+            ).astype(np.float32)
+        deterministic_ds.attrs.update(template_attrs)
+        deterministic_ds.attrs["prediction_kind"] = "phase1_unet_deterministic"
+        deterministic_stub = prediction_output_stub.with_name(
+            f"{prediction_output_stub.stem}.baseline{prediction_output_stub.suffix}"
+        )
+        deterministic_output_path = output_root / deterministic_stub
+        deterministic_ds.to_netcdf(
+            deterministic_output_path,
+            engine="h5netcdf",
+            encoding=_build_netcdf_encoding(target_vars),
+        )
+        print(f"[{active_position:02d}/{active_run_count}] Saved deterministic U-Net output to {deterministic_output_path}")
 
         pickle_path = output_root / prediction_output_stub.with_suffix(".pkl")
         with open(pickle_path, "wb") as handle:
             import pickle
 
-            pickle.dump(outputs_np, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"[{idx + 1:02d}/{NUM_RUNS}] Saved raw predictions array to {pickle_path}")
+            pickle.dump(ensemble_member_outputs_np, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[{active_position:02d}/{active_run_count}] Saved raw ensemble-members array to {pickle_path}")
 
         pre_inverse_pickle_path = output_root / prediction_output_stub.with_suffix(".pre_inverse.pkl")
         with open(pre_inverse_pickle_path, "wb") as handle:
@@ -920,7 +995,7 @@ def main() -> None:
 
             pickle.dump(outputs_pre_inverse_np, handle, protocol=pickle.HIGHEST_PROTOCOL)
         print(
-            f"[{idx + 1:02d}/{NUM_RUNS}] Saved pre-inverse predictions array to "
+            f"[{active_position:02d}/{active_run_count}] Saved pre-inverse predictions array to "
             f"{pre_inverse_pickle_path}"
         )
 

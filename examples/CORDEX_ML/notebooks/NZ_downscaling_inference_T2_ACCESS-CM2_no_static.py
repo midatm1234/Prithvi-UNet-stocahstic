@@ -82,18 +82,13 @@ PREDICTION_OUTPUT_NAMES = ["Predictions_pr_tasmax_ACCESS-CM2_1981-2000.nc", "Pre
         "Predictions_pr_tasmax_ACCESS-CM2_2080-2099.nc", "Predictions_pr_tasmax_EC-Earth3_2080-2099.nc"
 ]
 
-INFERENCE_OUTPUT_ROOTS = ["/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/historical/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/historical/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/mid-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/mid-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/end-century/perfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/end-century/imperfect/",
-        "/mnt/data2/kyo/granite-wxc/examples/CORDEX_ML/runs_v6/NZ_T2_ACCESS-CM2_no_static_train/predictions/end-century/imperfect/"
+INFERENCE_OUTPUT_ROOTS = [
+    str(PROJECT_DIR / "runs/NZ_T2_ACCESS-CM2_no_static_train/predictions/historical/perfect/"),
+    str(PROJECT_DIR / "runs/NZ_T2_ACCESS-CM2_no_static_train/predictions/historical/imperfect/"),
+    str(PROJECT_DIR / "runs/NZ_T2_ACCESS-CM2_no_static_train/predictions/mid-century/perfect/"),
+    str(PROJECT_DIR / "runs/NZ_T2_ACCESS-CM2_no_static_train/predictions/mid-century/imperfect/"),
+    str(PROJECT_DIR / "runs/NZ_T2_ACCESS-CM2_no_static_train/predictions/end-century/perfect/"),
+    str(PROJECT_DIR / "runs/NZ_T2_ACCESS-CM2_no_static_train/predictions/end-century/imperfect/"),
 ]
 
 # Fixed config for the fine-tuned model

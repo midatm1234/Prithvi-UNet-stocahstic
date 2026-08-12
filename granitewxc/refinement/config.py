@@ -365,6 +365,7 @@ class TransformerConfig:
     max_tokens_lon: int = 256
     gradient_checkpointing: bool = False
     optimized_attention: str = "auto"
+    zero_init_output: bool = False
 
     _KEYS = (
         "patch_size",
@@ -380,6 +381,7 @@ class TransformerConfig:
         "max_tokens_lon",
         "gradient_checkpointing",
         "optimized_attention",
+        "zero_init_output",
     )
 
     @classmethod
@@ -433,6 +435,7 @@ class TransformerConfig:
             max_tokens_lon=_as_int(sec, "max_tokens_lon", raw.get("max_tokens_lon"), d.max_tokens_lon),
             gradient_checkpointing=_as_bool(sec, "gradient_checkpointing", raw.get("gradient_checkpointing"), d.gradient_checkpointing),
             optimized_attention=_as_choice(sec, "optimized_attention", raw.get("optimized_attention"), d.optimized_attention, _ATTENTION_IMPLEMENTATIONS),
+            zero_init_output=_as_bool(sec, "zero_init_output", raw.get("zero_init_output"), d.zero_init_output),
         )
         if int(embedding_dim // num_heads) % 2 != 0:
             raise ConfigValidationError(

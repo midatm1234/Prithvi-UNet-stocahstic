@@ -77,6 +77,11 @@ def extract_model_state(checkpoint: Any) -> dict[str, torch.Tensor]:
     """Return the model tensors from any of the checkpoint layouts in use."""
     if checkpoint is None:
         raise ValueError("Checkpoint is empty.")
+    # migrate_phase1_state_dict returns (state_dict, renames). If a caller
+    # accidentally passes that tuple here instead of the raw checkpoint, recover
+    # gracefully by using the first element.
+    if isinstance(checkpoint, tuple) and len(checkpoint) == 2 and isinstance(checkpoint[0], Mapping):
+        checkpoint = checkpoint[0]
     state = checkpoint
     if isinstance(checkpoint, Mapping):
         for key in ("model", "state_dict", "model_state_dict", "phase1"):
