@@ -1,8 +1,8 @@
-"""Preprocess NARR predictors and PRISM targets for the downscaling workflow.
+"""Preprocess NARR predictors and optional PRISM targets for downscaling.
 
 Steps performed:
-  1. Read daily NARR files and PRISM target files for the requested period.
-  2. Align predictor and target dates.
+  1. Read daily NARR files and, for supervised splits, PRISM target files.
+  2. Align predictor and target dates when observed targets are requested.
   3. Regrid / interpolate NARR predictors to the PRISM target grid.
   4. Write preprocessed NetCDF files (one per date) to the output directory.
 
@@ -236,6 +236,27 @@ def _get_target_grid(
     raise RuntimeError("No PRISM target files found to extract grid")
 
 
+def _mode_saves_targets(cfg: Dict[str, Any], mode: str) -> bool:
+    """Return whether a split embeds observed PRISM fields.
+
+    Training and validation require targets. Independent inference is
+    predictor-only by default; evaluation reads PRISM separately by exact date.
+    """
+    pp_cfg = cfg.get("preprocess", {}) or {}
+    if mode == "training":
+        return bool(pp_cfg.get("save_train_targets", True))
+    if mode == "validation":
+        return bool(pp_cfg.get("save_val_targets", True))
+    if mode == "inference":
+        return bool(
+            pp_cfg.get("save_inference_targets", False)
+            or pp_cfg.get(
+                "inference_include_observed_targets_for_eval", False
+            )
+        )
+    raise ValueError(f"Unsupported preprocessing mode: {mode}")
+
+
 def preprocess(
     cfg: Dict[str, Any],
     mode: str = "training",
@@ -249,9 +270,11 @@ def preprocess(
 
     data_cfg = cfg.get("data", {})
     predictor_dir = resolve_path(data_cfg["predictor_dir"])
-    target_dir = resolve_path(data_cfg["target_dir"])
+    target_dir_value = data_cfg.get("target_dir")
+    target_dir = resolve_path(target_dir_value) if target_dir_value else None
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
     predictor_variables = expand_predictor_variables(data_cfg.get("predictor_variables", {}))
+    include_targets = _mode_saves_targets(cfg, mode)
     regrid_method = str(data_cfg.get("regrid_method", "bilinear")).lower()
     if regrid_method not in {"linear", "bilinear"}:
         raise ValueError(
@@ -274,8 +297,18 @@ def preprocess(
     print(f"[preproc] Using case_name: {case_name}")
     print(f"[preproc] Using preprocessing directory: {norm.case_preprocess_dir(cfg)}")
     print(f"[preproc] Writing {mode} outputs to: {output_dir}")
+    print(
+        f"[preproc] include_targets={include_targets}; independent inference "
+        "is predictor-only unless explicitly enabled for evaluation"
+    )
 
-    validate_target_variables(target_dir, target_variables)
+    if include_targets:
+        if target_dir is None:
+            raise ValueError(
+                "data.target_dir is required when preprocessing observed "
+                "PRISM targets"
+            )
+        validate_target_variables(target_dir, target_variables)
 
     # Date range
     start, end = parse_date_range_from_config(cfg, mode)
@@ -283,26 +316,40 @@ def preprocess(
 
     # Discover files
     narr_files = discover_narr_files(predictor_dir, start, end, predictor_variables)
-    prism_files = discover_all_prism_targets(target_dir, target_variables, start, end)
+    prism_files = (
+        discover_all_prism_targets(
+            target_dir, target_variables, start, end
+        )
+        if include_targets
+        else {variable: [] for variable in target_variables}
+    )
 
     if not narr_files:
         raise RuntimeError(f"No NARR files found in {predictor_dir} for {start}–{end}")
-    for var in target_variables:
-        if not prism_files.get(var):
-            raise RuntimeError(f"No PRISM files found for variable '{var}' in {start}–{end}")
+    if include_targets:
+        for var in target_variables:
+            if not prism_files.get(var):
+                raise RuntimeError(
+                    f"No PRISM files found for variable '{var}' in {start}–{end}"
+                )
 
     # Align dates
     predictor_dates = [d for d, _ in narr_files]
     target_date_maps = {var: [d for d, _ in fl] for var, fl in prism_files.items()}
     requested_dates = inclusive_daily_dates(start, end)
     validate_dates_exist(requested_dates, predictor_dates, "predictor")
-    for var, available_dates in target_date_maps.items():
-        validate_dates_exist(requested_dates, available_dates, f"target ({var})")
-    aligned_dates = align_dates(predictor_dates, target_date_maps)
-    if aligned_dates != requested_dates:
-        raise RuntimeError(
-            "Aligned NARR/PRISM dates do not exactly cover the configured split"
-        )
+    if include_targets:
+        for var, available_dates in target_date_maps.items():
+            validate_dates_exist(
+                requested_dates, available_dates, f"target ({var})"
+            )
+        aligned_dates = align_dates(predictor_dates, target_date_maps)
+        if aligned_dates != requested_dates:
+            raise RuntimeError(
+                "Aligned NARR/PRISM dates do not exactly cover the configured split"
+            )
+    else:
+        aligned_dates = requested_dates
     if date_shard_count < 1 or not 0 <= date_shard_index < date_shard_count:
         raise ValueError(
             f"invalid date shard {date_shard_index}/{date_shard_count}"
@@ -322,24 +369,32 @@ def preprocess(
     pred_map = {d: p for d, p in narr_files}
     target_maps = {var: {d: p for d, p in fl} for var, fl in prism_files.items()}
 
-    # Get target grid from first PRISM file
-    target_grid, (target_lat, target_lon), target_slices = _get_target_grid(prism_files, data_cfg)
-    first_target_path = next(
-        str(path)
-        for file_list in prism_files.values()
-        for _, path in file_list[:1]
-    )
-    canonical_grid = prism_grid_contract.ensure_canonical_grid(
-        norm.case_preprocess_dir(cfg),
-        target_lat,
-        target_lon,
-        source=first_target_path,
-        context="NARR preprocessing target grid",
-    )
+    # Target-bearing training/validation establishes the canonical PRISM grid.
+    # Predictor-only inference reuses that persisted geometry and never opens
+    # held-out PRISM merely to rediscover coordinates.
+    if include_targets:
+        _, (target_lat, target_lon), target_slices = _get_target_grid(
+            prism_files, data_cfg
+        )
+        first_target_path = next(
+            str(path)
+            for file_list in prism_files.values()
+            for _, path in file_list[:1]
+        )
+        canonical_grid = prism_grid_contract.ensure_canonical_grid(
+            norm.case_preprocess_dir(cfg),
+            target_lat,
+            target_lon,
+            source=first_target_path,
+            context="NARR preprocessing target grid",
+        )
+    else:
+        canonical_grid = prism_grid_contract.load_canonical_grid(
+            norm.case_preprocess_dir(cfg), required=True
+        )
+        assert canonical_grid is not None
+        target_slices = (slice(None), slice(None))
     target_lat, target_lon = canonical_grid.lat, canonical_grid.lon
-    target_grid = xr.Dataset(
-        {"lat": ("lat", target_lat), "lon": ("lon", target_lon)}
-    )
     print(f"[preproc] PRISM target grid {len(target_lat)}x{len(target_lon)}")
     print(
         f"[preproc] canonical PRISM grid fingerprint="
@@ -386,7 +441,11 @@ def preprocess(
 
     required_product_variables = [
         f"predictor_{var}_{int(level)}" for var, level in predictor_variables
-    ] + [f"target_{var}" for var in target_variables]
+    ]
+    if include_targets:
+        required_product_variables.extend(
+            f"target_{var}" for var in target_variables
+        )
     if elevation_arr is not None:
         required_product_variables.append("static_elevation")
 
@@ -394,7 +453,7 @@ def preprocess(
         data_type="narr_prism",
         predictor_variables=predictor_variables,
         target_variables=target_variables,
-        include_targets=True,
+        include_targets=include_targets,
         regrid_method=regrid_method,
         canonical_grid_fingerprint=canonical_grid.fingerprint,
         static_elevation_sha256=elevation_sha256,
@@ -408,15 +467,16 @@ def preprocess(
         out_file = output_dir / f"narr_prism_{sample_date:%Y%m%d}.nc"
         narr_file_map = pred_map[sample_date]
         daily_sources = {
-            **{
-                f"predictor:{variable}": path
-                for variable, path in narr_file_map.items()
-            },
-            **{
-                f"target:{variable}": target_maps[variable][sample_date]
-                for variable in target_variables
-            },
+            f"predictor:{variable}": path
+            for variable, path in narr_file_map.items()
         }
+        if include_targets:
+            daily_sources.update(
+                {
+                    f"target:{variable}": target_maps[variable][sample_date]
+                    for variable in target_variables
+                }
+            )
         daily_source_signature = source_artifact_signature(daily_sources)
         if out_file.exists() and not overwrite:
             try:
@@ -461,7 +521,7 @@ def preprocess(
         # preserve that so the loss can ignore those pixels. ppt keeps its real
         # zeros (dry) which are distinct from NaN (missing).
         tgt_arrays: Dict[str, np.ndarray] = {}
-        for var in target_variables:
+        for var in target_variables if include_targets else ():
             tgt_path = target_maps[var][sample_date]
             with xr.open_dataset(str(tgt_path)) as ds_tgt:
                 dvar = _find_numeric_datavar(ds_tgt, tgt_path)
@@ -511,8 +571,14 @@ def preprocess(
                         f"    [preproc] WARNING: {channel_name} has 0 NaN but {n_zero} "
                         f"exact zeros — below-surface cells may have been zero-filled."
                     )
-            for var, arr in tgt_arrays.items():
-                _diagnose_field(f"target_{var}", None, arr)
+            if tgt_arrays:
+                for var, arr in tgt_arrays.items():
+                    _diagnose_field(f"target_{var}", None, arr)
+            else:
+                print(
+                    "    [diag] targets omitted from predictor-only "
+                    "inference preprocessing"
+                )
 
         # Build output dataset
         out_ds_vars: Dict[str, Any] = {}
@@ -537,10 +603,15 @@ def preprocess(
                 "prism_grid_fingerprint": canonical_grid.fingerprint,
                 "source_artifact_signature": daily_source_signature,
                 **preprocessing_attrs(preprocessing_contract),
+                "contains_targets": str(bool(tgt_arrays)),
+                "targets_are_optional_evaluation_data": str(
+                    mode == "inference" and bool(tgt_arrays)
+                ),
                 "missing_value_note": (
                     "NaN marks missing data: pressure-level predictors below the "
-                    "surface over high terrain, and PRISM targets over ocean / "
-                    "outside CONUS. These are NOT physical zeros."
+                    "surface over high terrain. When target_* variables are "
+                    "present, target NaNs mark ocean / outside CONUS. These "
+                    "are NOT physical zeros."
                 ),
             },
         )

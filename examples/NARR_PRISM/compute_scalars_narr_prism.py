@@ -221,6 +221,36 @@ def _load_target_arrays(
     return np.stack(arrays, axis=0)
 
 
+def _derive_joint_target_valid_mask(
+    target_grid_counts: np.ndarray,
+    *,
+    expected_grid_shape: Sequence[int],
+) -> np.ndarray:
+    """Return static support shared by every configured output variable.
+
+    ``target_grid_counts`` is accumulated only while iterating the configured
+    training split.  A grid cell belongs to the joint output support when each
+    output channel has at least one finite training observation. Daily missing
+    values remain handled by the sample-level loss mask; they do not erase an
+    otherwise supported land cell from all future inference products.
+    """
+    counts = np.asarray(target_grid_counts)
+    expected = tuple(int(value) for value in expected_grid_shape)
+    if counts.ndim != 3 or tuple(counts.shape[-2:]) != expected:
+        raise ValueError(
+            "Training target-count grid must have shape [C,H,W] on the exact "
+            f"canonical PRISM grid {expected}; got {counts.shape}"
+        )
+    if counts.shape[0] < 1:
+        raise ValueError("At least one configured target channel is required")
+    mask = np.all(counts > 0, axis=0)
+    if not bool(mask.any()):
+        raise RuntimeError(
+            "The configured training targets have no jointly supported grid cell"
+        )
+    return np.asarray(mask, dtype=bool)
+
+
 def compute_scalars(
     cfg: Dict[str, Any],
     progress_interval: int = 50,
@@ -480,6 +510,10 @@ def compute_scalars(
     y_grid_sum: Optional[np.ndarray] = None
     y_grid_sumsq: Optional[np.ndarray] = None
     y_grid_count: Optional[np.ndarray] = None
+    # Full canonical-grid counts used only for the support mask. These remain
+    # independent of scalar_stride so adding the mask never changes historical
+    # global scalar estimates.
+    target_support_count: Optional[np.ndarray] = None
 
     for idx, sample_date in enumerate(aligned_dates):
         if use_preprocessed:
@@ -522,20 +556,19 @@ def compute_scalars(
                         )
                     )
                 x = np.stack(x_arrays, axis=0)
-                y = np.stack(
+                y_full = np.stack(
                     [
                         prism_preprocessed.read_spatial_variable(
                             ds,
                             name,
                             lat_name,
                             lon_name,
-                            lat_slice=grid_slice,
-                            lon_slice=grid_slice,
                         )
                         for name in preprocessed_target_names
                     ],
                     axis=0,
                 )
+                y = y_full[:, ::stride, ::stride]
         else:
             x = _load_predictor_arrays(
                 pred_map[sample_date],
@@ -544,7 +577,7 @@ def compute_scalars(
                 sub_lat,
                 sub_lon,
             )
-            y = _load_target_arrays(
+            y_full = _load_target_arrays(
                 target_maps,
                 target_variables,
                 sample_date,
@@ -552,7 +585,12 @@ def compute_scalars(
                 lat_slice=lat_slice,
                 lon_slice=lon_slice,
             )
-            y = y[:, ::stride, ::stride]
+            y = y_full[:, ::stride, ::stride]
+
+        full_valid = np.isfinite(y_full)
+        if target_support_count is None:
+            target_support_count = np.zeros_like(y_full, dtype=np.uint32)
+        target_support_count += full_valid.astype(np.uint32)
 
         # Append raw-source elevation; preprocessed products already supplied it.
         if elevation_arr is not None and not use_preprocessed:
@@ -670,6 +708,16 @@ def compute_scalars(
     missing_grid = y_grid_count == 0
     targets_grid_mean[missing_grid] = 0.0
     targets_grid_std[missing_grid] = 1.0
+    assert target_support_count is not None
+    target_valid_mask = _derive_joint_target_valid_mask(
+        target_support_count,
+        expected_grid_shape=canonical_grid.shape,
+    )
+    print(
+        "[scalars] joint training-target support: "
+        f"{int(target_valid_mask.sum())}/{target_valid_mask.size} cells "
+        f"({100.0 * float(target_valid_mask.mean()):.2f}%)"
+    )
 
     # Apply predictand-aware target scaling. This MUST run regardless of whether
     # any variable uses gridpoint normalization: e.g. ppt uses divide_only/global
@@ -809,6 +857,7 @@ def compute_scalars(
         "targets_std_raw": targets_std,
         "targets_grid_mean": targets_grid_mean,
         "targets_grid_std": targets_grid_std,
+        "target_valid_mask": target_valid_mask,
         "input_pixel_count": x_count.tolist(),
         "target_pixel_count": y_count.tolist(),
         "target_grid_sample_count": len(aligned_dates),
@@ -838,7 +887,6 @@ def _compact_summary(arr: np.ndarray) -> dict:
 def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
-    data_cfg = cfg.get("data", {})
 
     if args.output_dir:
         output_dir = str(resolve_path(args.output_dir))
@@ -868,6 +916,15 @@ def main() -> None:
             f"({norm.scaler_kind(stats[key])})"
         )
 
+    target_valid_mask_path = norm.target_valid_mask_path(output_dir)
+    np.save(target_valid_mask_path, stats["target_valid_mask"])
+    print(
+        f"[scalars] saved {target_valid_mask_path}  "
+        f"shape={stats['target_valid_mask'].shape}  "
+        f"valid={int(stats['target_valid_mask'].sum())}/"
+        f"{stats['target_valid_mask'].size}"
+    )
+
     # Save metadata
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -878,6 +935,12 @@ def main() -> None:
         "input_pixel_count": stats["input_pixel_count"],
         "target_pixel_count": stats["target_pixel_count"],
         "scaling_statistics": stats["scaling_statistics"],
+        "target_valid_mask": {
+            "criterion": norm.TARGET_VALID_MASK_CRITERION,
+            "valid_cells": int(stats["target_valid_mask"].sum()),
+            "total_cells": int(stats["target_valid_mask"].size),
+            "shape": list(stats["target_valid_mask"].shape),
+        },
         "summary": {
             "inputs_mean": _compact_summary(stats["inputs_mean"]),
             "inputs_std": _compact_summary(stats["inputs_std"]),
@@ -915,6 +978,15 @@ def main() -> None:
             norm.TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY: stats[
                 norm.TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY
             ],
+            norm.TARGET_VALID_MASK_MANIFEST_KEY: (
+                norm.build_target_valid_mask_manifest_entry(
+                    target_valid_mask_path,
+                    cfg=cfg,
+                    training_source_artifact_split_signature=stats[
+                        norm.TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY
+                    ],
+                )
+            ),
         },
     )
     print(f"[scalars] normalization manifest → {manifest_path}")

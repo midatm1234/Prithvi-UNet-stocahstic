@@ -27,10 +27,12 @@ from granitewxc.refinement.base import (
     register_refiner,
 )
 from granitewxc.refinement.config import (
+    AuxiliaryLossConfig,
     REFINEMENT_TYPES,
     ConfigValidationError,
     PerformanceConfig,
     RefinementConfig,
+    ResidualNormalizationConfig,
     config_fingerprint,
     resolve_performance_config,
     resolve_refinement_config,
@@ -51,9 +53,11 @@ from granitewxc.refinement.two_phase import (
 __all__ = [
     "REFINEMENT_TYPES",
     "ConfigValidationError",
+    "AuxiliaryLossConfig",
     "NormalizedTargetSpace",
     "PerformanceConfig",
     "RefinementConfig",
+    "ResidualNormalizationConfig",
     "RefinementTrainState",
     "RefinementTrainer",
     "ResidualRefiner",

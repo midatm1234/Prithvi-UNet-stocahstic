@@ -89,10 +89,19 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
         valid_mask: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> dict[str, torch.Tensor]:
+        self._require_residual_normalization()
+        residual_target = self.apply_valid_mask(
+            residual_target, valid_mask
+        )
         batch = residual_target.shape[0]
         device, dtype = residual_target.device, residual_target.dtype
 
-        x0 = self._randn(tuple(residual_target.shape), device, dtype, generator)
+        x0 = self.apply_valid_mask(
+            self._randn(
+                tuple(residual_target.shape), device, dtype, generator
+            ),
+            valid_mask,
+        )
         t = self._sample_flow_time(batch, device, generator)
         t_b = t.reshape(-1, *([1] * (residual_target.ndim - 1))).to(dtype)
 
@@ -100,8 +109,27 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
         velocity_target = residual_target - x0
 
         prediction = self.net(x_t, conditioning, self._embed_time(t))
-        loss = masked_loss(prediction, velocity_target, valid_mask, self.loss_kind)
-        return {"loss": loss, "flow_time": t, "prediction": prediction}
+        variable_weights = self.config.auxiliary_loss.variable_weights or None
+        objective = masked_loss(
+            prediction, velocity_target, valid_mask, self.loss_kind, variable_weights
+        )
+        # Along x_t=(1-t)x_0+t x_1, a velocity estimate gives the endpoint
+        # x_1_hat = x_t + (1-t)v_hat. Auxiliary losses are applied only here,
+        # never directly between a velocity and a clean residual.
+        clean_estimate = x_t + (1.0 - t_b) * prediction
+        auxiliary = self.auxiliary_losses(clean_estimate, residual_target, valid_mask)
+        loss = objective + auxiliary["auxiliary_loss"]
+        return {
+            "loss": loss,
+            "stochastic_objective": objective,
+            **auxiliary,
+            "flow_time": t,
+            "source_residual": x0,
+            "interpolated_residual": x_t,
+            "clean_residual": residual_target,
+            "estimated_clean_residual": clean_estimate,
+            "prediction": prediction,
+        }
 
     # -- integration -----------------------------------------------------
     @torch.no_grad()
@@ -111,7 +139,9 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
         *,
         generator: torch.Generator | None = None,
         num_steps: int | None = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self._require_residual_normalization()
         steps = int(num_steps if num_steps is not None else self.integration_steps)
         if steps < 1:
             raise ValueError("integration_steps must be >= 1")
@@ -119,7 +149,9 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
         device, dtype = conditioning.device, conditioning.dtype
 
         if self.stochastic_initialization:
-            x = self._randn(shape, device, dtype, generator)
+            x = self.apply_valid_mask(
+                self._randn(shape, device, dtype, generator), valid_mask
+            )
         else:
             x = torch.zeros(shape, device=device, dtype=dtype)
 
@@ -137,27 +169,52 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
             t1 = grid[idx + 1]
             dt = (t1 - t0).to(dtype)
             if self.solver == "euler":
-                x = x + dt * velocity(x, t0)
+                update = self.apply_valid_mask(
+                    velocity(x, t0), valid_mask
+                )
+                x = x + dt * update
             elif self.solver == "midpoint":
-                k1 = velocity(x, t0)
-                mid = x + 0.5 * dt * k1
-                x = x + dt * velocity(mid, (t0 + t1) * 0.5)
+                k1 = self.apply_valid_mask(
+                    velocity(x, t0), valid_mask
+                )
+                mid = self.apply_valid_mask(
+                    x + 0.5 * dt * k1, valid_mask
+                )
+                midpoint_update = self.apply_valid_mask(
+                    velocity(mid, (t0 + t1) * 0.5), valid_mask
+                )
+                x = x + dt * midpoint_update
             elif self.solver == "heun":
-                k1 = velocity(x, t0)
-                x_euler = x + dt * k1
-                k2 = velocity(x_euler, t1)
+                k1 = self.apply_valid_mask(
+                    velocity(x, t0), valid_mask
+                )
+                x_euler = self.apply_valid_mask(
+                    x + dt * k1, valid_mask
+                )
+                k2 = self.apply_valid_mask(
+                    velocity(x_euler, t1), valid_mask
+                )
                 x = x + 0.5 * dt * (k1 + k2)
             else:  # pragma: no cover - guarded by config validation
                 raise ValueError(f"Unsupported flow solver {self.solver!r}")
+            x = self.apply_valid_mask(x, valid_mask)
         return x
 
     @torch.no_grad()
-    def deterministic_residual(self, conditioning: torch.Tensor) -> torch.Tensor:
+    def deterministic_residual(
+        self,
+        conditioning: torch.Tensor,
+        *,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Integrate the mean path from ``x_0 = 0`` with the configured solver."""
+        self._require_residual_normalization()
         saved = self.stochastic_initialization
         try:
             self.stochastic_initialization = False
-            return self.sample(conditioning, generator=None)
+            return self.sample(
+                conditioning, generator=None, valid_mask=valid_mask
+            )
         finally:
             self.stochastic_initialization = saved
 

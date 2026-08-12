@@ -10,6 +10,7 @@ from granitewxc.refinement.checkpoint import (
     CHECKPOINT_KIND_COMBINED,
     CHECKPOINT_KIND_REFINEMENT,
     build_refinement_checkpoint,
+    extract_model_state,
     load_phase1_state_dict,
     load_refinement_state_dict,
     migrate_phase1_state_dict,
@@ -31,6 +32,31 @@ def legacy_checkpoint(phase1: TinyPhase1) -> dict:
         "epoch": 17,
         "loss": 2.6,
         "val_loss": 2.56,
+    }
+
+
+def _resume_config(model, *, scheduler_t_max: int = 10, warmup_steps: int = 0):
+    """Resolved numerical contract used by the production Phase-2 entry point."""
+    return {
+        "refinement": model.refinement_config.to_dict(),
+        "performance": model.performance_config.to_dict(),
+        "training": {
+            "contract_version": 1,
+            "optimizer": "torch.optim.AdamW",
+            "base_learning_rate": 1.0e-3,
+            "min_learning_rate": 0.0,
+            "scheduler": "torch.optim.lr_scheduler.CosineAnnealingLR",
+            "scheduler_t_max": scheduler_t_max,
+            "warmup_steps": warmup_steps,
+            "gradient_accumulation_steps": 1,
+            "max_grad_norm": None,
+            "epochs": 2,
+            "limit_steps_train": 0,
+            "limit_steps_valid": 0,
+            "effective_train_batches_per_epoch": 1,
+            "optimizer_steps_per_epoch": 1,
+            "total_optimizer_steps": 2,
+        },
     }
 
 
@@ -60,6 +86,25 @@ def test_migration_is_idempotent():
 def test_wrapper_prefixes_are_stripped():
     state = {"module._orig_mod.conv.weight": torch.zeros(1)}
     assert list(strip_wrapper_prefixes(state)) == ["conv.weight"]
+    for nested in (
+        "model.module.conv.weight",
+        "network._orig_mod.conv.weight",
+        "module.model._orig_mod.conv.weight",
+    ):
+        assert list(strip_wrapper_prefixes({nested: torch.zeros(1)})) == [
+            "conv.weight"
+        ]
+
+
+def test_standard_state_dict_envelope_wins_over_model_hyperparameters():
+    tensors = {"encoder.weight": torch.ones(1)}
+    checkpoint = {
+        "model": {"architecture": "not-a-state-dict"},
+        "state_dict": tensors,
+    }
+    extracted = extract_model_state(checkpoint)
+    assert set(extracted) == set(tensors)
+    assert torch.equal(extracted["encoder.weight"], tensors["encoder.weight"])
 
 
 def test_fingerprint_is_prefix_independent_and_value_sensitive():
@@ -233,7 +278,7 @@ def test_save_and_resume_restores_full_training_state(refiner_type, tmp_path):
         scaler=scaler,
         checkpoint_dir=str(tmp_path),
         phase1_checkpoint="/reference/last.ckpt",
-        resolved_config={"refinement": {"type": refiner_type}},
+        resolved_config=_resume_config(model),
         case_name="unit_test",
         seed=7,
         logger=lambda _msg: None,
@@ -264,6 +309,7 @@ def test_save_and_resume_restores_full_training_state(refiner_type, tmp_path):
         scaler=scaler2,
         checkpoint_dir=str(tmp_path),
         phase1_checkpoint="/reference/last.ckpt",
+        resolved_config=_resume_config(model2),
         case_name="unit_test",
         logger=lambda _msg: None,
     )
@@ -277,12 +323,158 @@ def test_save_and_resume_restores_full_training_state(refiner_type, tmp_path):
     assert trainer2.state.train_loss_history == trainer.state.train_loss_history
 
 
+def test_resume_rejects_changed_warmup_or_cosine_horizon(tmp_path):
+    """A checkpoint taken during warmup may not resume on a new LR trajectory."""
+    batch = make_batch(height=16, width=16)
+    model = build("diffusion_unet", batch)
+    optimizer = torch.optim.AdamW(model.refiner.parameters(), lr=1.0e-3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=8)
+    trainer = RefinementTrainer(
+        model,
+        optimizer,
+        scheduler=scheduler,
+        checkpoint_dir=str(tmp_path),
+        resolved_config=_resume_config(
+            model, scheduler_t_max=8, warmup_steps=4
+        ),
+        warmup_steps=4,
+        logger=lambda _message: None,
+    )
+    trainer.train_one_epoch([batch], limit_steps=1)
+    assert trainer.state.global_step == 1 < trainer.warmup_steps
+    trainer.save()
+
+    model2 = build("diffusion_unet", batch)
+    model2.load_state_dict(
+        {
+            **model2.state_dict(),
+            **{
+                key: value
+                for key, value in model.state_dict().items()
+                if key.startswith("phase1.")
+            },
+        },
+        strict=True,
+    )
+    optimizer2 = torch.optim.AdamW(model2.refiner.parameters(), lr=1.0e-3)
+    scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=9)
+    trainer2 = RefinementTrainer(
+        model2,
+        optimizer2,
+        scheduler=scheduler2,
+        checkpoint_dir=str(tmp_path),
+        resolved_config=_resume_config(
+            model2, scheduler_t_max=9, warmup_steps=5
+        ),
+        warmup_steps=5,
+        logger=lambda _message: None,
+    )
+    with pytest.raises(RuntimeError, match="training contract.*inexact resume"):
+        trainer2.resume(str(tmp_path / "last.ckpt"))
+
+
+def test_resume_rejects_saved_performance_or_precision_mismatch(tmp_path):
+    batch = make_batch(height=16, width=16)
+    model = build("flow_matching_unet", batch)
+    trainer = RefinementTrainer(
+        model,
+        torch.optim.AdamW(model.refiner.parameters(), lr=1.0e-3),
+        checkpoint_dir=str(tmp_path),
+        resolved_config=_resume_config(model),
+        logger=lambda _message: None,
+    )
+    path = trainer.save()
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["resolved_config"]["performance"]["precision"]["mode"] = "bf16"
+    save_checkpoint_atomic(payload, path, atomic=False)
+
+    model2 = build("flow_matching_unet", batch)
+    model2.load_state_dict(
+        {
+            **model2.state_dict(),
+            **{
+                key: value
+                for key, value in model.state_dict().items()
+                if key.startswith("phase1.")
+            },
+        },
+        strict=True,
+    )
+    trainer2 = RefinementTrainer(
+        model2,
+        torch.optim.AdamW(model2.refiner.parameters(), lr=1.0e-3),
+        checkpoint_dir=str(tmp_path),
+        resolved_config=_resume_config(model2),
+        logger=lambda _message: None,
+    )
+    with pytest.raises(RuntimeError, match="performance contract.*inexact resume"):
+        trainer2.resume(path)
+
+
+def test_schema2_resume_rejects_missing_training_contract(tmp_path):
+    batch = make_batch(height=16, width=16)
+    model = build("flow_matching_unet", batch)
+    trainer = RefinementTrainer(
+        model,
+        torch.optim.AdamW(model.refiner.parameters(), lr=1.0e-3),
+        checkpoint_dir=str(tmp_path),
+        resolved_config={"refinement": model.refinement_config.to_dict()},
+        logger=lambda _message: None,
+    )
+    path = trainer.save()
+
+    model2 = build("flow_matching_unet", batch)
+    model2.load_state_dict(
+        {
+            **model2.state_dict(),
+            **{
+                key: value
+                for key, value in model.state_dict().items()
+                if key.startswith("phase1.")
+            },
+        },
+        strict=True,
+    )
+    trainer2 = RefinementTrainer(
+        model2,
+        torch.optim.AdamW(model2.refiner.parameters(), lr=1.0e-3),
+        checkpoint_dir=str(tmp_path),
+        logger=lambda _message: None,
+    )
+    with pytest.raises(RuntimeError, match="resolved_config.training"):
+        trainer2.resume(path)
+
+
+def test_schema1_resume_is_rejected_before_state_loading(tmp_path):
+    batch = make_batch(height=16, width=16)
+    model = build("flow_matching_unet", batch)
+    trainer = RefinementTrainer(
+        model,
+        torch.optim.AdamW(model.refiner.parameters(), lr=1.0e-3),
+        checkpoint_dir=str(tmp_path),
+        resolved_config=_resume_config(model),
+        logger=lambda _message: None,
+    )
+    path = trainer.save()
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["checkpoint_schema_version"] = 1
+    payload["refinement_semantics_version"] = "legacy-hurdle-latent-v1"
+    save_checkpoint_atomic(payload, path, atomic=False)
+
+    with pytest.raises(RuntimeError, match="cannot be resumed safely"):
+        trainer.resume(path)
+
+
 def test_resume_detects_a_different_phase1(tmp_path):
     batch = make_batch(height=16, width=16)
     model = build("diffusion_unet", batch)
     optimizer = torch.optim.AdamW(model.refiner.parameters(), lr=1e-3)
     trainer = RefinementTrainer(
-        model, optimizer, checkpoint_dir=str(tmp_path), logger=lambda _m: None
+        model,
+        optimizer,
+        checkpoint_dir=str(tmp_path),
+        resolved_config=_resume_config(model),
+        logger=lambda _m: None,
     )
     trainer.save()
 
@@ -294,6 +486,7 @@ def test_resume_detects_a_different_phase1(tmp_path):
         other,
         torch.optim.AdamW(other.refiner.parameters(), lr=1e-3),
         checkpoint_dir=str(tmp_path),
+        resolved_config=_resume_config(other),
         logger=lambda _m: None,
     )
     with pytest.raises(RuntimeError, match="Phase-1 identity mismatch"):

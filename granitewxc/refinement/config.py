@@ -45,9 +45,12 @@ __all__ = [
     "ConditioningConfig",
     "DiffusionConfig",
     "FlowMatchingConfig",
+    "ResidualNormalizationConfig",
+    "AuxiliaryLossConfig",
     "TransformerConfig",
     "RefinementConfig",
     "PerformanceConfig",
+    "canonicalize_saved_refinement_config",
     "resolve_refinement_config",
     "resolve_performance_config",
     "config_fingerprint",
@@ -197,6 +200,7 @@ class ConditioningConfig:
     unet_features: bool = False
     static_fields: bool = True
     masks: bool = True
+    coordinates: bool = False
 
     _KEYS = (
         "deterministic_output",
@@ -205,6 +209,7 @@ class ConditioningConfig:
         "unet_features",
         "static_fields",
         "masks",
+        "coordinates",
     )
 
     @classmethod
@@ -437,10 +442,10 @@ class TransformerConfig:
             optimized_attention=_as_choice(sec, "optimized_attention", raw.get("optimized_attention"), d.optimized_attention, _ATTENTION_IMPLEMENTATIONS),
             zero_init_output=_as_bool(sec, "zero_init_output", raw.get("zero_init_output"), d.zero_init_output),
         )
-        if int(embedding_dim // num_heads) % 2 != 0:
+        if out.positional_encoding == "sincos_2d" and embedding_dim % 4 != 0:
             raise ConfigValidationError(
-                f"{sec}: head dimension ({embedding_dim // num_heads}) must be even so "
-                "the 2-D sin/cos positional encoding can be split across axes."
+                f"{sec}.embedding_dim ({embedding_dim}) must be divisible by 4 for "
+                "the 2-D sin/cos positional encoding."
             )
         return out
 
@@ -457,8 +462,121 @@ class TransformerConfig:
             "max_tokens_lon": self.max_tokens_lon,
             "gradient_checkpointing": self.gradient_checkpointing,
             "optimized_attention": self.optimized_attention,
+            "zero_init_output": self.zero_init_output,
         }
         return data
+
+
+@dataclass(frozen=True)
+class ResidualNormalizationConfig:
+    """Training-residual standardization fitted on the Phase-2 training split.
+
+    Statistics are one mean and standard deviation per explicitly ordered output
+    channel.  They are registered as refiner buffers, and are therefore saved in
+    and restored from every Phase-2 checkpoint.  No spatial/test-period fitting
+    is performed by this schema.
+    """
+
+    enabled: bool = False
+    epsilon: float = 1.0e-6
+    fit_batches: int = 0  # 0 means the complete training loader
+
+    _KEYS = ("enabled", "epsilon", "fit_batches")
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "ResidualNormalizationConfig":
+        raw = _as_mapping(data)
+        _reject_unknown("refinement.residual_normalization", raw, cls._KEYS)
+        d = cls()
+        return cls(
+            enabled=_as_bool(
+                "refinement.residual_normalization", "enabled", raw.get("enabled"), d.enabled
+            ),
+            epsilon=_as_float(
+                "refinement.residual_normalization",
+                "epsilon",
+                raw.get("epsilon"),
+                d.epsilon,
+                minimum=1.0e-12,
+            ),
+            fit_batches=_as_int(
+                "refinement.residual_normalization",
+                "fit_batches",
+                raw.get("fit_batches"),
+                d.fit_batches,
+                minimum=0,
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {key: getattr(self, key) for key in self._KEYS}
+
+
+@dataclass(frozen=True)
+class AuxiliaryLossConfig:
+    """Optional losses applied to a mathematically valid clean-residual estimate.
+
+    The stochastic diffusion/flow objective always remains the base objective.
+    Every additional weight defaults to zero for backward compatibility.
+    """
+
+    reconstruction_weight: float = 0.0
+    reconstruction_loss: str = "huber"
+    bias_weight: float = 0.0
+    gradient_weight: float = 0.0
+    laplacian_weight: float = 0.0
+    multiscale_weight: float = 0.0
+    tail_weight: float = 0.0
+    tail_threshold: float = 2.0
+    variable_weights: tuple[float, ...] = ()
+
+    _KEYS = (
+        "reconstruction_weight",
+        "reconstruction_loss",
+        "bias_weight",
+        "gradient_weight",
+        "laplacian_weight",
+        "multiscale_weight",
+        "tail_weight",
+        "tail_threshold",
+        "variable_weights",
+    )
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "AuxiliaryLossConfig":
+        raw = _as_mapping(data)
+        _reject_unknown("refinement.auxiliary_loss", raw, cls._KEYS)
+        d = cls()
+        weights_raw = raw.get("variable_weights", ())
+        if weights_raw in (None, ""):
+            weights: tuple[float, ...] = ()
+        elif isinstance(weights_raw, (list, tuple)):
+            weights = tuple(float(value) for value in weights_raw)
+            if any(value <= 0.0 for value in weights):
+                raise ConfigValidationError(
+                    "refinement.auxiliary_loss.variable_weights must contain positive values."
+                )
+        else:
+            raise ConfigValidationError(
+                "refinement.auxiliary_loss.variable_weights must be a list in output-channel order."
+            )
+        sec = "refinement.auxiliary_loss"
+        return cls(
+            reconstruction_weight=_as_float(sec, "reconstruction_weight", raw.get("reconstruction_weight"), d.reconstruction_weight, minimum=0.0),
+            reconstruction_loss=_as_choice(sec, "reconstruction_loss", raw.get("reconstruction_loss"), d.reconstruction_loss, ("mse", "l1", "huber")),
+            bias_weight=_as_float(sec, "bias_weight", raw.get("bias_weight"), d.bias_weight, minimum=0.0),
+            gradient_weight=_as_float(sec, "gradient_weight", raw.get("gradient_weight"), d.gradient_weight, minimum=0.0),
+            laplacian_weight=_as_float(sec, "laplacian_weight", raw.get("laplacian_weight"), d.laplacian_weight, minimum=0.0),
+            multiscale_weight=_as_float(sec, "multiscale_weight", raw.get("multiscale_weight"), d.multiscale_weight, minimum=0.0),
+            tail_weight=_as_float(sec, "tail_weight", raw.get("tail_weight"), d.tail_weight, minimum=0.0),
+            tail_threshold=_as_float(sec, "tail_threshold", raw.get("tail_threshold"), d.tail_threshold, minimum=0.0),
+            variable_weights=weights,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        out = {key: getattr(self, key) for key in self._KEYS}
+        out["variable_weights"] = list(self.variable_weights)
+        return out
 
 
 @dataclass(frozen=True)
@@ -528,7 +646,13 @@ class RefinementConfig:
     ensemble_size: int = 1
     loss: str = "mse"
     seed: int | None = None
+    trainable_phase1_patterns: tuple[str, ...] = ()
+    correction_scale: float = 1.0
     conditioning: ConditioningConfig = field(default_factory=ConditioningConfig)
+    residual_normalization: ResidualNormalizationConfig = field(
+        default_factory=ResidualNormalizationConfig
+    )
+    auxiliary_loss: AuxiliaryLossConfig = field(default_factory=AuxiliaryLossConfig)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     flow_matching: FlowMatchingConfig = field(default_factory=FlowMatchingConfig)
     transformer: TransformerConfig = field(default_factory=TransformerConfig)
@@ -544,7 +668,11 @@ class RefinementConfig:
         "ensemble_size",
         "loss",
         "seed",
+        "trainable_phase1_patterns",
+        "correction_scale",
         "conditioning",
+        "residual_normalization",
+        "auxiliary_loss",
         "diffusion",
         "flow_matching",
         "transformer",
@@ -579,7 +707,11 @@ class RefinementConfig:
             "ensemble_size": self.ensemble_size,
             "loss": self.loss,
             "seed": self.seed,
+            "trainable_phase1_patterns": list(self.trainable_phase1_patterns),
+            "correction_scale": self.correction_scale,
             "conditioning": self.conditioning.to_dict(),
+            "residual_normalization": self.residual_normalization.to_dict(),
+            "auxiliary_loss": self.auxiliary_loss.to_dict(),
             "diffusion": self.diffusion.to_dict(),
             "flow_matching": self.flow_matching.to_dict(),
             "transformer": self.transformer.to_dict(),
@@ -894,12 +1026,31 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
 
     train_on_residual = _as_bool("refinement", "train_on_residual", raw.get("train_on_residual"), True)
     if not train_on_residual and enabled:
-        warnings.warn(
-            "refinement.train_on_residual=false makes Phase 2 predict the full "
-            "normalized target instead of the residual. This is a scientific "
-            "change, not an optimization.",
-            RuntimeWarning,
-            stacklevel=2,
+        raise ConfigValidationError(
+            "Active Phase 2 requires refinement.train_on_residual=true. The inference "
+            "contract always applies the generated field as one residual correction; "
+            "training an absolute target would add the deterministic prediction twice."
+        )
+
+    patterns_raw = raw.get("trainable_phase1_patterns", ())
+    if patterns_raw in (None, ""):
+        patterns: tuple[str, ...] = ()
+    elif isinstance(patterns_raw, (list, tuple)):
+        patterns = tuple(str(value).strip() for value in patterns_raw if str(value).strip())
+    else:
+        raise ConfigValidationError(
+            "refinement.trainable_phase1_patterns must be a list of parameter-name patterns."
+        )
+    if patterns and joint:
+        raise ConfigValidationError(
+            "Set either refinement.joint_finetuning=true (all Phase-1 parameters) or "
+            "trainable_phase1_patterns (selected components), not both."
+        )
+    if enabled and not freeze_phase1 and not joint:
+        raise ConfigValidationError(
+            "refinement.freeze_phase1=false requires refinement.joint_finetuning=true. "
+            "For selected fine-tuning, keep freeze_phase1=true and set "
+            "trainable_phase1_patterns."
         )
 
     ensemble_size = _as_int("refinement", "ensemble_size", raw.get("ensemble_size"), 1)
@@ -916,12 +1067,31 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         ensemble_size=ensemble_size,
         loss=_as_choice("refinement", "loss", raw.get("loss"), "mse", ("mse", "l1", "huber")),
         seed=seed,
+        trainable_phase1_patterns=patterns,
+        correction_scale=_as_float(
+            "refinement", "correction_scale", raw.get("correction_scale"), 1.0, minimum=0.0
+        ),
         conditioning=ConditioningConfig.from_mapping(raw.get("conditioning")),
+        residual_normalization=ResidualNormalizationConfig.from_mapping(
+            raw.get("residual_normalization")
+        ),
+        auxiliary_loss=AuxiliaryLossConfig.from_mapping(raw.get("auxiliary_loss")),
         diffusion=DiffusionConfig.from_mapping(raw.get("diffusion")),
         flow_matching=FlowMatchingConfig.from_mapping(raw.get("flow_matching")),
         transformer=TransformerConfig.from_mapping(raw.get("transformer")),
         unet=UNetRefinerConfig.from_mapping(raw.get("unet")),
     )
+
+    if (
+        cfg.is_active
+        and cfg.residual_normalization.enabled
+        and (cfg.joint_finetuning or cfg.trainable_phase1_patterns)
+    ):
+        raise ConfigValidationError(
+            "refinement.residual_normalization.enabled requires a completely "
+            "frozen Phase 1. Joint or selected-component fine-tuning changes the "
+            "residual distribution and would immediately stale fitted statistics."
+        )
 
     if cfg.is_active and cfg.type in _DIFFUSION_TYPES and raw.get("flow_matching"):
         warnings.warn(
@@ -938,6 +1108,35 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
             stacklevel=2,
         )
     return cfg
+
+
+def canonicalize_saved_refinement_config(
+    saved: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve legacy metadata for explicit offline inspection/migration.
+
+    Production schema-2 readers require the complete saved mapping and do not
+    use this helper: silently filling a missing field would weaken resume or
+    inference compatibility. Unknown saved fields still fail normal schema
+    validation.
+    """
+    raw = dict(saved)
+    raw.pop("checkpoint", None)
+    raw.pop("ensemble_size", None)
+    # Modern checkpoints store the fully resolved dataclass, including the
+    # inactive diffusion/flow subsection.  Those values are provenance, not a
+    # user attempting to configure the wrong objective, so canonical migration
+    # should not emit the interactive-config "ignored settings" warning.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"refinement\.(diffusion|flow_matching) settings are ignored.*",
+            category=RuntimeWarning,
+        )
+        resolved = resolve_refinement_config({"refinement": raw}).to_dict()
+    resolved.pop("checkpoint", None)
+    resolved.pop("ensemble_size", None)
+    return resolved
 
 
 def resolve_performance_config(config: Any) -> PerformanceConfig:

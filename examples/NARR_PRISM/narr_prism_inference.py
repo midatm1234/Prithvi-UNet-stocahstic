@@ -10,14 +10,24 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+import hashlib
 import os
 import subprocess
 import sys
 import time
-from datetime import date
+from contextlib import nullcontext
+from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 import torch
@@ -40,15 +50,18 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from granitewxc.utils.config import get_config
-from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.normalization import (
+    TARGET_VALID_MASK_CRITERION,
+    TARGET_VALID_MASK_MANIFEST_KEY,
+    TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY,
     apply_scalar_paths,
     assert_scalars_available,
     assert_target_grid_matches,
+    load_manifest,
+    load_target_valid_mask,
     log_case_context,
     log_scalar_summary,
     resolve_scalar_dir,
-    seam_gradient_ratio,
     targets_are_spatial,
 )
 from granitewxc.utils.prism_tiling import (
@@ -66,7 +79,6 @@ from granitewxc.utils.prism_grid import validate_prism_grid
 from narr_prism_dataset import NarrPrismDataset
 from narr_prism_utils import (
     case_output_dir,
-    expand_predictor_variables,
     get_case_name,
     load_yaml,
     narr_source_var,
@@ -78,6 +90,156 @@ from narr_prism_utils import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+TARGET_VALID_MASK_CONTENT_SHA256_ATTR = "target_valid_mask_content_sha256"
+TARGET_VALID_MASK_SHA256_ATTR = "target_valid_mask_sha256"
+TARGET_VALID_MASK_CRITERION_ATTR = "target_valid_mask_criterion"
+TARGET_VALID_MASK_SOURCE_SPLIT_ATTR = "target_valid_mask_source_split"
+TARGET_VALID_MASK_TRAINING_SOURCE_SIGNATURE_ATTR = (
+    "target_valid_mask_training_source_artifact_split_signature"
+)
+TARGET_VALID_MASK_GRID_FINGERPRINT_ATTR = (
+    "target_valid_mask_grid_fingerprint"
+)
+PREDICTION_SPLITS = ("validation", "inference")
+
+
+def _validate_prediction_split(split: str) -> str:
+    """Return a supported prediction split or fail before opening data."""
+    normalized = str(split).strip().lower()
+    if normalized not in PREDICTION_SPLITS:
+        raise ValueError(
+            f"split must be one of {PREDICTION_SPLITS}, got {split!r}"
+        )
+    return normalized
+
+
+def _split_output_root(output_root: str | Path, split: str) -> Path:
+    """Keep validation products in a directory distinct from final inference.
+
+    The historical inference directory is unchanged. Validation uses a
+    ``validation`` child unless the caller has already supplied a path scoped
+    to that split (optionally followed by ``case_name``).
+    """
+    split = _validate_prediction_split(split)
+    path = resolve_path(output_root)
+    if split == "inference":
+        return path
+    if path.name == split or path.parent.name == split:
+        return path
+    return path / split
+
+
+def _expected_split_dates(
+    cfg: Mapping[str, Any], split: str = "inference"
+) -> List[str]:
+    """Return every configured split date, inclusive, in canonical order."""
+    split = _validate_prediction_split(split)
+    start, end = parse_date_range_from_config(dict(cfg), split)
+    return [
+        str(start + timedelta(days=index))
+        for index in range((end - start).days + 1)
+    ]
+
+
+def _validate_dataset_dates(
+    cfg: Mapping[str, Any],
+    dates: Sequence[Any],
+    split: str = "inference",
+) -> List[Any]:
+    """Require exact ordered coverage of the inclusive configured split."""
+    split = _validate_prediction_split(split)
+    observed = [str(value)[:10] for value in dates]
+    expected = _expected_split_dates(cfg, split)
+    if observed != expected:
+        first_difference = next(
+            (
+                index
+                for index, pair in enumerate(
+                    zip(observed, expected, strict=False)
+                )
+                if pair[0] != pair[1]
+            ),
+            min(len(observed), len(expected)),
+        )
+        raise ValueError(
+            f"NarrPrismDataset(mode={split!r}) dates do not exactly match the "
+            f"inclusive YAML dates.{split} range: "
+            f"observed_count={len(observed)}, expected_count={len(expected)}, "
+            f"first_difference={first_difference}"
+        )
+    return list(dates)
+
+
+def _target_valid_mask_content_sha256(mask: np.ndarray) -> str:
+    """Hash canonical mask cells independently of their file container."""
+    values = np.ascontiguousarray(np.asarray(mask, dtype=np.uint8))
+    digest = hashlib.sha256()
+    digest.update(b"granitewxc-target-valid-mask-cells-v1\0")
+    digest.update(np.asarray(values.shape, dtype="<i8").tobytes())
+    digest.update(values.tobytes())
+    return digest.hexdigest()
+
+
+def _target_valid_mask_provenance(
+    config: Any, mask: np.ndarray
+) -> Dict[str, str]:
+    """Return NetCDF-safe provenance for an authenticated support mask."""
+    scalar_dir = resolve_scalar_dir(config, for_writing=False)
+    manifest = load_manifest(scalar_dir)
+    entry = (
+        manifest.get(TARGET_VALID_MASK_MANIFEST_KEY)
+        if isinstance(manifest, Mapping)
+        else None
+    )
+    if not isinstance(entry, Mapping):
+        raise ValueError(
+            f"{scalar_dir}: normalization manifest does not bind the training "
+            "target-valid-mask artifact"
+        )
+    required = {
+        "sha256": entry.get("sha256"),
+        "criterion": entry.get("criterion"),
+        "source_split": entry.get("source_split"),
+        "grid_fingerprint": entry.get("grid_fingerprint"),
+    }
+    missing = [
+        name
+        for name, value in required.items()
+        if not str(value or "").strip()
+    ]
+    if missing:
+        raise ValueError(
+            f"{scalar_dir}: target-valid-mask manifest entry lacks {missing}"
+        )
+    if required["criterion"] != TARGET_VALID_MASK_CRITERION:
+        raise ValueError(
+            f"{scalar_dir}: unsupported target-valid-mask criterion "
+            f"{required['criterion']!r}"
+        )
+    training_source_signature = entry.get(
+        TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY
+    )
+    # Raw-source scalar runs have no preprocessed split signature. Preserve
+    # that fact rather than writing an empty/ambiguous NetCDF attribute.
+    training_source_text = (
+        str(training_source_signature)
+        if training_source_signature is not None
+        else "not-applicable:raw-training-source-mode"
+    )
+    return {
+        TARGET_VALID_MASK_SHA256_ATTR: str(required["sha256"]),
+        TARGET_VALID_MASK_CONTENT_SHA256_ATTR: (
+            _target_valid_mask_content_sha256(mask)
+        ),
+        TARGET_VALID_MASK_CRITERION_ATTR: str(required["criterion"]),
+        TARGET_VALID_MASK_SOURCE_SPLIT_ATTR: str(required["source_split"]),
+        TARGET_VALID_MASK_TRAINING_SOURCE_SIGNATURE_ATTR: training_source_text,
+        TARGET_VALID_MASK_GRID_FINGERPRINT_ATTR: str(
+            required["grid_fingerprint"]
+        ),
+    }
+
 
 def _find_checkpoint(cfg: Dict[str, Any], explicit: Optional[str]) -> str:
     """Locate the model checkpoint to use for inference."""
@@ -627,7 +789,7 @@ def _load_native_predictor_diagnostic(
         }
 
 
-def _open_streaming_output(
+def _open_streaming_output(  # noqa: C901
     out_path: Path,
     target_variables: Sequence[str],
     target_lat: np.ndarray,
@@ -635,12 +797,68 @@ def _open_streaming_output(
     checkpoint_path: str,
     inference_dates: Sequence[date],
     case_name: str,
+    valid_mask: np.ndarray,
+    mask_provenance: Mapping[str, str],
+    split: str = "inference",
+    configured_split_dates: Optional[Sequence[Any]] = None,
 ) -> Any:
     """Create a NetCDF3 file that can be filled along time without buffering."""
     try:
         from scipy.io import netcdf_file
     except ImportError as exc:
         raise ImportError("scipy is required for streaming inference output") from exc
+
+    split = _validate_prediction_split(split)
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    expected_mask_shape = (len(target_lat), len(target_lon))
+    if valid_mask.shape != expected_mask_shape:
+        raise ValueError(
+            f"target valid mask {valid_mask.shape} != output grid "
+            f"{expected_mask_shape}"
+        )
+    required_mask_attrs = (
+        TARGET_VALID_MASK_SHA256_ATTR,
+        TARGET_VALID_MASK_CONTENT_SHA256_ATTR,
+        TARGET_VALID_MASK_CRITERION_ATTR,
+        TARGET_VALID_MASK_SOURCE_SPLIT_ATTR,
+        TARGET_VALID_MASK_TRAINING_SOURCE_SIGNATURE_ATTR,
+        TARGET_VALID_MASK_GRID_FINGERPRINT_ATTR,
+    )
+    missing_mask_attrs = [
+        name for name in required_mask_attrs if name not in mask_provenance
+    ]
+    if missing_mask_attrs:
+        raise ValueError(
+            "deterministic daily output lacks target-valid-mask provenance "
+            f"attributes: {missing_mask_attrs}"
+        )
+    computed_mask_digest = _target_valid_mask_content_sha256(valid_mask)
+    if (
+        str(mask_provenance[TARGET_VALID_MASK_CONTENT_SHA256_ATTR])
+        != computed_mask_digest
+    ):
+        raise ValueError(
+            "deterministic daily output target-valid-mask content digest does "
+            "not match the supplied mask cells"
+        )
+    if (
+        str(mask_provenance[TARGET_VALID_MASK_CRITERION_ATTR])
+        != TARGET_VALID_MASK_CRITERION
+    ):
+        raise ValueError("unsupported deterministic output mask criterion")
+    if str(mask_provenance[TARGET_VALID_MASK_SOURCE_SPLIT_ATTR]) != "training":
+        raise ValueError("deterministic output mask must come from training")
+    output_grid_fingerprint = validate_prism_grid(
+        target_lat, target_lon, context="NARR inference NetCDF"
+    ).fingerprint
+    if (
+        str(mask_provenance[TARGET_VALID_MASK_GRID_FINGERPRINT_ATTR])
+        != output_grid_fingerprint
+    ):
+        raise ValueError(
+            "deterministic output target-valid-mask grid fingerprint does not "
+            "match its output coordinates"
+        )
 
     if out_path.exists():
         out_path.unlink()
@@ -661,6 +879,12 @@ def _open_streaming_output(
     lat_var[:] = target_lat.astype(np.float64)
     lon_var[:] = target_lon.astype(np.float64)
 
+    mask_var = nc.createVariable("prism_valid_mask", "b", ("lat", "lon"))
+    mask_var[:] = valid_mask.astype(np.int8)
+    mask_var.long_name = "canonical PRISM valid-cell mask"
+    mask_var.flag_values = np.asarray([0, 1], dtype=np.int8)
+    mask_var.flag_meanings = "invalid valid"
+
     for var in target_variables:
         out_var = nc.createVariable(var, "f", ("time", "lat", "lon"))
         out_var.long_name = var
@@ -669,12 +893,20 @@ def _open_streaming_output(
 
     nc.description = "NARR-to-PRISM downscaling inference output"
     nc.case_name = case_name
-    nc.prism_grid_fingerprint = validate_prism_grid(
-        target_lat, target_lon, context="NARR inference NetCDF"
-    ).fingerprint
+    nc.prism_grid_fingerprint = output_grid_fingerprint
     nc.checkpoint = checkpoint_path
+    configured_dates = list(configured_split_dates or inference_dates)
+    if not configured_dates:
+        raise ValueError("configured_split_dates must not be empty")
+    nc.dataset_split = split
+    nc.split_start = str(configured_dates[0])
+    nc.split_end = str(configured_dates[-1])
+    # Retain historical attribute names for consumers of default inference
+    # products. ``dataset_split`` is authoritative for validation products.
     nc.inference_start = str(inference_dates[0])
     nc.inference_end = str(inference_dates[-1])
+    for name, value in mask_provenance.items():
+        setattr(nc, str(name), str(value))
     nc.flush()
     return nc
 
@@ -696,8 +928,10 @@ def run_inference(
     show_progress: bool = True,
     data_parallel: bool = True,
     selected_dates: Optional[Sequence[Any]] = None,
+    split: str = "inference",
+    include_observed_target_diagnostics: bool = False,
 ) -> Path:
-    """Execute inference over the YAML-defined date range and write daily NetCDF outputs.
+    """Execute prediction over one exact YAML split and write daily NetCDF outputs.
 
     The PRISM grid (~3105x7025) is far too large for a single forward pass, so
     each day is predicted tile-by-tile and stitched with a Hann blend window.
@@ -716,8 +950,21 @@ def run_inference(
     if xr is None:
         raise ImportError("xarray is required for inference")
 
+    split = _validate_prediction_split(split)
     data_cfg = cfg.get("data", {})
     inf_cfg = cfg.get("inference", {})
+    if include_observed_target_diagnostics and split != "validation":
+        raise ValueError(
+            "observed-target stage diagnostics are allowed only for the "
+            "validation split; final inference remains target-free"
+        )
+    if include_observed_target_diagnostics and not bool(
+        (inf_cfg.get("diagnostics", {}) or {}).get("enabled", False)
+    ):
+        raise ValueError(
+            "include_observed_target_diagnostics requires "
+            "inference.diagnostics.enabled=true"
+        )
     case_name = get_case_name(cfg)
     target_variables: List[str] = list(data_cfg.get("target_variables", []))
 
@@ -735,8 +982,10 @@ def run_inference(
 
     # Co-registered, raw-physical dataset (same class used for training). It
     # regrids NARR onto the PRISM grid on the fly and exposes the fine grid.
-    dataset = NarrPrismDataset(config_path, mode="inference")
-    all_inference_dates = list(dataset.dates)
+    dataset = NarrPrismDataset(
+        config_path, mode=split, load_observed_targets=False
+    )
+    all_inference_dates = _validate_dataset_dates(cfg, dataset.dates, split)
     dates_to_process = _select_inference_dates(all_inference_dates, selected_dates)
     if date_shard_count < 1:
         raise ValueError("date_shard_count must be >= 1")
@@ -784,7 +1033,8 @@ def run_inference(
     fine_h, fine_w = dataset.fine_shape
     n_vars = len(target_variables)
     print(
-        f"[inference] {len(inference_dates)}/{len(all_inference_dates)} configured dates; "
+        f"[inference] split={split} "
+        f"{len(inference_dates)}/{len(all_inference_dates)} configured dates; "
         f"selected={len(dates_to_process)}; "
         f"date_shard={date_shard_index}/{date_shard_count}; PRISM grid {fine_h}x{fine_w}"
     )
@@ -840,8 +1090,19 @@ def run_inference(
     candidate_tile_positions = plan.positions
     skip_empty_target_tiles = bool(data_cfg.get("skip_empty_target_tiles", True))
     min_valid_target_fraction = float(data_cfg.get("min_valid_target_fraction", 1.0e-4))
+    # Production inference is predictor-only. Its static support is a separately
+    # signed artifact derived from the configured training targets; finite
+    # neutral-filled target scalers and inference-period PRISM observations are
+    # both invalid substitutes.
+    target_valid_mask = load_target_valid_mask(
+        config,
+        role="NARR deterministic inference",
+        expected_shape=(fine_h, fine_w),
+    )
+    target_valid_mask_provenance = _target_valid_mask_provenance(
+        config, target_valid_mask
+    )
     if skip_empty_target_tiles and min_valid_target_fraction > 0.0:
-        target_valid_mask = dataset._load_target_valid_mask()
         tile_positions = [
             (lat0, lon0)
             for lat0, lon0 in candidate_tile_positions
@@ -849,7 +1110,6 @@ def run_inference(
             >= min_valid_target_fraction
         ]
     else:
-        target_valid_mask = None
         tile_positions = candidate_tile_positions
     if not tile_positions:
         raise ValueError("No inference tiles remain after target-mask filtering")
@@ -881,7 +1141,7 @@ def run_inference(
         "timing stages: preprocessing transfer forward postprocess write"
     )
 
-    output_path = case_output_dir(output_dir, case_name)
+    output_path = case_output_dir(_split_output_root(output_dir, split), case_name)
     output_path.mkdir(parents=True, exist_ok=True)
     print(f"[inference] case_name={case_name}")
     print(f"[inference] output_dir={output_path}")
@@ -894,6 +1154,18 @@ def run_inference(
         print(
             f"[inference] intermediate diagnostics enabled for first "
             f"{diagnostics_max_days} shard day(s): {diagnostics_dir}"
+        )
+    diagnostic_target_dataset: Optional[NarrPrismDataset] = None
+    if include_observed_target_diagnostics:
+        diagnostic_target_dataset = NarrPrismDataset(
+            config_path,
+            mode=split,
+            load_observed_targets=True,
+        )
+        _validate_dataset_dates(cfg, diagnostic_target_dataset.dates, split)
+        print(
+            "[inference] validation observations are isolated to stage "
+            "diagnostics and are not exposed to model prediction batches"
         )
 
     date_iter = enumerate(inference_dates)
@@ -1102,7 +1374,9 @@ def run_inference(
                 )
             pair_metrics: List[Dict[str, float]] = []
             for lat0 in lat_origins:
-                for left, right in zip(lon_origins[:-1], lon_origins[1:]):
+                for left, right in zip(
+                    lon_origins[:-1], lon_origins[1:], strict=True
+                ):
                     if (lat0, left) in tile_predictions and (lat0, right) in tile_predictions:
                         pair_metrics.append(
                             overlap_disagreement(
@@ -1111,7 +1385,9 @@ def run_inference(
                             )
                         )
             for lon0 in lon_origins:
-                for top, bottom in zip(lat_origins[:-1], lat_origins[1:]):
+                for top, bottom in zip(
+                    lat_origins[:-1], lat_origins[1:], strict=True
+                ):
                     if (top, lon0) in tile_predictions and (bottom, lon0) in tile_predictions:
                         pair_metrics.append(
                             overlap_disagreement(
@@ -1149,9 +1425,6 @@ def run_inference(
                     np.asarray(input_std[channel_indices], dtype=np.float32)[:, None, None]
                     + float(getattr(config, "input_scalers_epsilon", 1.0e-6))
                 )
-                truth = dataset._load_targets(
-                    sample_date, slice(None), slice(None)
-                ).cpu().numpy().astype(np.float32)
                 tile_order = list(tile_predictions)
                 diagnostic_payload: Dict[str, Any] = {
                     "date": np.asarray(date_string),
@@ -1166,11 +1439,21 @@ def run_inference(
                     ),
                     "tile_weight_sum": stitcher.weight.astype(np.float32),
                     "stitched_denormalized_output": prediction[0],
-                    "prism_target": truth,
-                    "inference_minus_prism": prediction[0] - truth,
                     "overlap_crossovers_lat": np.asarray(lat_crossovers, dtype=np.int32),
                     "overlap_crossovers_lon": np.asarray(lon_crossovers, dtype=np.int32),
                 }
+                if diagnostic_target_dataset is not None:
+                    truth = diagnostic_target_dataset._load_targets(
+                        sample_date, slice(None), slice(None)
+                    ).cpu().numpy().astype(np.float32)
+                    diagnostic_payload["prism_target"] = truth
+                    diagnostic_payload["inference_minus_prism"] = (
+                        prediction[0] - truth
+                    )
+                else:
+                    diagnostic_payload["target_free_inference"] = np.asarray(
+                        True
+                    )
                 if raw_tile_predictions:
                     diagnostic_payload["normalized_tile_predictions"] = np.stack(
                         [raw_tile_predictions[pos] for pos in tile_order]
@@ -1197,6 +1480,10 @@ def run_inference(
                 checkpoint_path,
                 [date_string],
                 case_name,
+                target_valid_mask,
+                target_valid_mask_provenance,
+                split,
+                all_inference_dates,
             )
             try:
                 out_nc.variables["time"][:] = _date_strings_to_epoch_days([date_string])
@@ -1231,6 +1518,8 @@ def run_parallel_inference(
     gpu_ids: Sequence[str],
     batch_size: int,
     device: str = "cuda",
+    split: str = "inference",
+    include_observed_target_diagnostics: bool = False,
 ) -> Path:
     """Run independent date shards in one subprocess per GPU.
 
@@ -1239,6 +1528,11 @@ def run_parallel_inference(
     worker sees one CUDA device, avoids scatter/gather, and writes a disjoint
     set of daily NetCDF files into the same case output directory.
     """
+    split = _validate_prediction_split(split)
+    if include_observed_target_diagnostics and split != "validation":
+        raise ValueError(
+            "observed-target stage diagnostics are allowed only for validation"
+        )
     cfg = load_yaml(config_path)
     case_name = get_case_name(cfg)
     # Fail fast with a clear, case-specific message before spawning workers if
@@ -1246,10 +1540,13 @@ def run_parallel_inference(
     # crash used to surface).
     log_case_context(cfg, "inference")
     assert_scalars_available(cfg, role="inference")
-    output_path = case_output_dir(output_dir, case_name)
+    split_output_dir = _split_output_root(output_dir, split)
+    output_path = case_output_dir(split_output_dir, case_name)
     output_path.mkdir(parents=True, exist_ok=True)
-    dataset = NarrPrismDataset(config_path, mode="inference")
-    total_dates = len(dataset.dates)
+    dataset = NarrPrismDataset(
+        config_path, mode=split, load_observed_targets=False
+    )
+    total_dates = len(_validate_dataset_dates(cfg, dataset.dates, split))
     del dataset
 
     script_path = Path(__file__).resolve()
@@ -1259,12 +1556,13 @@ def run_parallel_inference(
     if total_dates < n_workers:
         raise ValueError(
             f"Parallel inference has {total_dates} date(s) but {n_workers} worker(s). "
-            "Use fewer GPUs or expand dates.inference."
+            f"Use fewer GPUs or expand dates.{split}."
         )
 
     print(
         f"[parallel] launching {n_workers} inference workers over GPUs "
-        f"{','.join(gpu_ids)} for {total_dates} dates -> {output_path}",
+        f"{','.join(gpu_ids)} for split={split} {total_dates} dates -> "
+        f"{output_path}",
         flush=True,
     )
     procs: List[subprocess.Popen] = []
@@ -1285,7 +1583,7 @@ def run_parallel_inference(
                 "--checkpoint",
                 str(checkpoint_path),
                 "--output-dir",
-                str(output_dir),
+                str(split_output_dir),
                 "--batch-size",
                 str(batch_size),
                 "--device",
@@ -1296,7 +1594,11 @@ def run_parallel_inference(
                 str(n_workers),
                 "--no-data-parallel",
                 "--no-progress",
+                "--split",
+                split,
             ]
+            if include_observed_target_diagnostics:
+                cmd.append("--include-observed-target-diagnostics")
             print(
                 f"[parallel] worker {shard_idx}: GPU {gpu_id}, "
                 f"log: {log_path}, command: {' '.join(cmd)}",
@@ -1399,6 +1701,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint", default=None, help="Override checkpoint path")
     parser.add_argument("--output-dir", default=None, help="Override output directory")
+    parser.add_argument(
+        "--split",
+        choices=PREDICTION_SPLITS,
+        default="inference",
+        help=(
+            "YAML date split to predict; validation outputs are isolated in a "
+            "validation subdirectory"
+        ),
+    )
+    parser.add_argument(
+        "--include-observed-target-diagnostics",
+        action="store_true",
+        help=(
+            "validation only: include PRISM truth in explicitly enabled stage "
+            "diagnostics; prediction batches remain target-free"
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=1, help="Inference batch size")
     parser.add_argument("--device", default="cuda", help="Device (cuda or cpu)")
     parser.add_argument(
@@ -1421,7 +1740,6 @@ def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
     config = get_config(str(Path(args.config).resolve()))
-    case_name = get_case_name(cfg)
 
     # Scaler resolution + wiring + logging happen inside run_inference /
     # run_parallel_inference so the notebook (which calls those directly)
@@ -1430,7 +1748,7 @@ def main() -> None:
     output_root = args.output_dir or cfg.get("inference", {}).get(
         "output_dir", "./examples/NARR_PRISM/experiments/inference_output"
     )
-    output_dir = str(case_output_dir(output_root, case_name))
+    output_dir = str(_split_output_root(output_root, args.split))
 
     if args.parallel_gpus and args.date_shard_count == 1:
         gpu_ids = [gpu.strip() for gpu in args.parallel_gpus.split(",") if gpu.strip()]
@@ -1441,6 +1759,10 @@ def main() -> None:
             gpu_ids=gpu_ids,
             batch_size=args.batch_size,
             device=args.device,
+            split=args.split,
+            include_observed_target_diagnostics=(
+                args.include_observed_target_diagnostics
+            ),
         )
         return
 
@@ -1462,6 +1784,10 @@ def main() -> None:
         date_shard_count=args.date_shard_count,
         show_progress=not args.no_progress,
         data_parallel=not args.no_data_parallel,
+        split=args.split,
+        include_observed_target_diagnostics=(
+            args.include_observed_target_diagnostics
+        ),
     )
 
 

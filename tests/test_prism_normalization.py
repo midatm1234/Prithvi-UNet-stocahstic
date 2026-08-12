@@ -281,3 +281,66 @@ def test_training_source_artifact_contract_requires_exact_dates_and_aggregate(
             expected_dates=["2000-01-01", "2000-01-02"],
             role="test",
         )
+
+
+def test_signed_training_target_mask_round_trip_and_tamper_guard(
+    tmp_path: Path,
+) -> None:
+    config = _config("mask_case", tmp_path / "preprocessed", tmp_path / "legacy")
+    config.data.type = "narr_prism"
+    config.data.target_variables = ["tmax", "tmin"]
+    config.dates = {
+        "training": {"start": "1996-01-01", "end": "2013-12-31"}
+    }
+    scalar_dir = normalization.resolve_scalar_dir(config, for_writing=True)
+    _write_scalars(scalar_dir, spatial_targets=True)
+    expected = np.array(
+        [
+            [False, True, True, True],
+            [False, True, True, True],
+            [False, False, True, True],
+        ],
+        dtype=bool,
+    )
+    mask_path = normalization.target_valid_mask_path(scalar_dir)
+    np.save(mask_path, expected)
+    entry = normalization.build_target_valid_mask_manifest_entry(
+        mask_path,
+        cfg=config,
+    )
+    normalization.write_manifest(
+        scalar_dir,
+        case_name=config.case_name,
+        predictor_mode="global",
+        cfg=config,
+        train_date_range=["1996-01-01", "2013-12-31"],
+        extra={normalization.TARGET_VALID_MASK_MANIFEST_KEY: entry},
+    )
+
+    observed = normalization.load_target_valid_mask(
+        config,
+        role="test",
+        expected_shape=(3, 4),
+    )
+    np.testing.assert_array_equal(observed, expected)
+
+    tampered = expected.copy()
+    tampered[0, 0] = True
+    np.save(mask_path, tampered)
+    with pytest.raises(ValueError, match="sha256 mismatch"):
+        normalization.load_target_valid_mask(config, role="test")
+
+
+def test_training_target_mask_is_mandatory_for_production_consumers(
+    tmp_path: Path,
+) -> None:
+    config = _config("legacy_case", tmp_path / "preprocessed", tmp_path / "legacy")
+    config.data.type = "narr_prism"
+    config.data.target_variables = ["tmax", "tmin"]
+    config.dates = {
+        "training": {"start": "1996-01-01", "end": "2013-12-31"}
+    }
+    scalar_dir = normalization.resolve_scalar_dir(config, for_writing=True)
+    _write_scalars(scalar_dir, spatial_targets=True)
+    with pytest.raises(FileNotFoundError, match="output-scaler finiteness is not"):
+        normalization.load_target_valid_mask(config, role="production inference")

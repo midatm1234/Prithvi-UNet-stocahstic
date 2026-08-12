@@ -100,8 +100,18 @@ special-casing:
 | `divide_only` | `y / sigma` | `n*sigma` |
 | `log1p_zscore` | `(log1p(y) - mu) / sigma` | `expm1(n*sigma + mu)` |
 
-`y_norm` is the `x_pre_inverse` tensor Phase 1 already returns, so
-`decode(y_norm) == y_phys` exactly and the round trip introduces no drift.
+`y_norm` is `encode(y_phys)`, where `y_phys` is the *final* deterministic
+prediction. This is deliberately not assumed to equal the raw
+`x_pre_inverse`: the NARR--PRISM hurdle head returns an ungated amount latent
+but a wet/dry-gated physical precipitation field. Re-encoding the final field
+guarantees `decode(y_norm) == y_phys`, including dry pixels, so a zero residual
+is an exact no-op.
+
+When `residual_normalization.enabled` is true, the residual is additionally
+standardized one explicitly ordered output channel at a time. Mean/std are fit
+only by streaming the Phase-2 **training** loader with frozen Phase 1, stored as
+persistent refiner buffers, and inverted once before residual addition. A model
+cannot train or sample with enabled-but-unfitted statistics.
 
 **A normalized residual is never added to a field in physical units.**
 Inverse normalization, the precipitation inverse transform, non-negativity
@@ -121,11 +131,20 @@ along the channel axis and resampled/cropped to the target grid:
 | key | tensor |
 | --- | --- |
 | `deterministic_output` | Phase-1 prediction in normalized space |
-| `input_predictors` | `batch['x']` |
+| `input_predictors` | `batch['x']` after the exact Phase-1 input standardization |
 | `static_fields` | `batch['static_x']`, `batch['static_y']` |
 | `masks` | predictor validity mask (1 channel) |
+| `coordinates` | absolute normalized PRISM row/column channels |
 | `prithvi_features` | post-backbone convolution output |
 | `unet_features` | final UNet decoder activation |
+
+Every haloed conditioning field is cropped with the per-sample
+`__output_crop=(top,left,height,width)` metadata; a symmetric crop is only a
+legacy fallback. This prevents the historical 32-pixel NARR predictor shift.
+NARR already appends 16 explicit predictor-mask channels, so its YAML disables
+the redundant post-fill `isfinite(x)` mask (which would be all ones) and enables
+absolute coordinates to keep overlapping Transformer tiles geographically
+consistent.
 
 Only the enabled sources are computed — an unused Phase-1 feature map is never
 materialised. The **target is never part of the conditioning**
@@ -148,11 +167,15 @@ predictor/target lead time exists.
   `sample`. All three are inter-convertible through the schedule helpers, which
   is verified in `tests/test_refinement_performance.py`.
 * Loss: masked MSE/L1/Huber against the configured parameterisation, reduced in
-  float32.
-* Sampling: DDIM over `inference_steps` timesteps drawn from the *same* schedule.
-  `eta = 0` (default) gives the deterministic probability-flow path; `eta = 1`
-  recovers the ancestral DDPM update. The configured sampler is never silently
-  replaced with a faster approximation.
+  float32. Optional reconstruction, bias, gradient, Laplacian, multiscale and
+  tail terms are applied only after converting the network output to a valid
+  clean-residual estimate (`x0`), never directly to epsilon/velocity.
+* Sampling: generalized DDIM over `inference_steps` timesteps drawn from the
+  *same* schedule. `eta = 0` (default) is deterministic. With the complete,
+  consecutive training grid, `eta = 1` has the DDPM posterior variance; with a
+  strided inference grid it remains a stochastic DDIM transition rather than
+  an exact ancestral DDPM step. The configured sampler is never silently
+  replaced with a different approximation.
 * Optional `clip_sample` clamps the predicted clean residual to
   `+/- clip_sample_range` in normalized space.
 
@@ -174,7 +197,9 @@ Conditional (rectified) flow matching, following the Aurora
 * **Target distribution** `p1`: the conditional residual distribution.
 * **Path**: straight optimal-transport interpolation `x_t = (1-t)*x0 + t*r`.
 * **Velocity target**: `u_t = r - x0` (constant along each conditional path).
-* **Loss**: masked MSE between `v_theta(x_t, t, cond)` and `u_t`.
+* **Loss**: masked MSE between `v_theta(x_t, t, cond)` and `u_t`. Optional
+  clean-residual terms use the valid endpoint estimate
+  `x1_hat = x_t + (1-t)*v_theta`.
 * **Flow-time sampling**: `uniform`, or `logit_normal` (sigmoid of
   `N(mean, std)`, default `mean = -0.5`, `std = 1.2`) which concentrates
   training on informative mid-noise levels.
@@ -225,9 +250,10 @@ Guarantees (all covered by `tests/test_refinement_transformer.py`):
 Configurable: `patch_size` (shared or `[height, width]`), `embedding_dim`,
 `num_heads`, `num_blocks`, `mlp_ratio`, `dropout`, `positional_encoding`,
 `max_tokens_lat/lon`, `gradient_checkpointing`, `optimized_attention`.
-Validation rejects `embedding_dim % num_heads != 0`, odd head dimensions,
-malformed patch settings, and token grids larger than the learned positional
-tables.
+Validation rejects `embedding_dim % num_heads != 0`, sin/cos embedding widths
+that are not divisible by four, malformed patch settings, and token grids
+larger than the learned positional tables. Learned 2-D positions do not impose
+an unrelated head-dimension parity restriction.
 
 ---
 
@@ -251,6 +277,8 @@ model:
     freeze_phase1: true
     joint_finetuning: false     # must be requested explicitly
     train_on_residual: true
+    correction_scale: 1.0
+    trainable_phase1_patterns: []  # e.g. ["head.*"]; mutually exclusive with joint mode
     ensemble_size: 10
     loss: mse                   # mse | l1 | huber
     seed: 1234
@@ -260,15 +288,32 @@ model:
       input_predictors: true
       prithvi_features: false
       unet_features: false
-      static_fields: true
-      masks: true
+      static_fields: false
+      masks: false
+      coordinates: true
+
+    residual_normalization:
+      enabled: true
+      epsilon: 1.0e-6
+      fit_batches: 0        # 0 = complete training loader
+
+    auxiliary_loss:
+      reconstruction_weight: 0.10
+      reconstruction_loss: huber
+      bias_weight: 0.02
+      gradient_weight: 0.05
+      laplacian_weight: 0.01
+      multiscale_weight: 0.02
+      tail_weight: 0.02
+      tail_threshold: 2.0
+      variable_weights: [1.0, 1.0, 1.0]
 
     diffusion:                  # diffusion_* only
       training_timesteps: 1000
       inference_steps: 50
       prediction_type: epsilon  # epsilon | velocity | sample
       schedule: cosine          # cosine | linear | scaled_linear
-      eta: 0.0                  # 0 = DDIM, 1 = ancestral DDPM
+      eta: 0.0                  # 0 = deterministic; >0 = stochastic DDIM
       clip_sample: false
       clip_sample_range: 10.0
 
@@ -338,9 +383,14 @@ Validation guarantees:
   patch settings, `inference_steps > training_timesteps`, unsupported
   performance options and mutually incompatible settings all raise
   `ConfigValidationError` with an explicit message;
-* `joint_finetuning: true` conflicts with an explicit `freeze_phase1: true`;
+* `joint_finetuning: true` conflicts with an explicit `freeze_phase1: true` or
+  selected-component patterns; active `train_on_residual: false` is rejected
+  because inference would otherwise add an absolute target as a residual;
 * `phase1_cache.enabled` requires `freeze_phase1: true` and rejects joint
   fine-tuning;
+* fitted residual normalization requires a completely frozen Phase 1 and is
+  rejected for joint or selected-component fine-tuning because changing the
+  baseline would immediately stale those statistics;
 * scientific settings (`model.refinement`) and workflow settings (`performance`)
   are strictly separate, and performance settings never change architecture,
   loss, sampler, solver, ensemble size or evaluation data;
@@ -361,7 +411,13 @@ Validation guarantees:
 | `examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static_diffusion_unet.yaml` | CORDEX diffusion UNet |
 | `examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static_flow_matching_unet.yaml` | CORDEX flow-matching UNet |
 
-All existing case configurations remain usable unchanged.
+Existing deterministic model/training configurations remain usable. The
+NARR--PRISM production inference contract has one intentional artifact
+migration: recompute the original training-period scalars once to persist the
+authenticated `target_valid_mask.npy`, then regenerate held-out predictor
+products without embedded targets. Scaler values and the Phase-1 architecture
+do not change. Phase-2 schema-1 heads require retraining because their residual
+baseline semantics cannot be migrated losslessly.
 
 ---
 
@@ -373,7 +429,8 @@ All existing case configurations remain usable unchanged.
 under `refiner.`. The only migration needed for an existing deterministic
 checkpoint is that prefix, applied explicitly by
 `granitewxc.refinement.checkpoint.migrate_phase1_state_dict`, which also strips
-`module.` / `_orig_mod.` wrappers. `LEGACY_PHASE1_KEY_RENAMES` is the single
+`module.` / `_orig_mod.` wrappers and uniform Lightning roots such as `model.`.
+`LEGACY_PHASE1_KEY_RENAMES` is the single
 place where any future rename must be registered — never `strict=False`.
 
 ### Controlled loading
@@ -382,7 +439,7 @@ place where any future rename must be registered — never `strict=False`.
 any missing key that does **not** belong to `refiner.*`. `strict=False` is used
 only after that proof.
 
-### Verified parity
+### Historical parity record and current artifact status
 
 ```
 python examples/NARR_PRISM/narr_prism_refinement_parity.py \
@@ -391,14 +448,21 @@ python examples/NARR_PRISM/narr_prism_refinement_parity.py \
     --device cuda:0 --size 256
 ```
 
-Result on the checkpoint that is currently training
-(`narr_prism_California/last.ckpt`, epoch 17, fingerprint `4f9c5eb7...`,
-208 tensors, 208 renames, 0 missing / 0 unexpected / 0 mismatched):
+`examples/NARR_PRISM/refinement_parity.json` records a prior run against
+fingerprint `4f9c5eb7...` (208 tensors, 208 renames, 0 missing / unexpected /
+mismatched):
 
 | space | max abs diff | mean abs diff | max rel diff | verdict |
 | --- | --- | --- | --- | --- |
 | normalized (pre-Phase-2) | 0.0 | 0.0 | 0.0 | bitwise identical |
 | physical (post-decode) | 0.0 | 0.0 | 0.0 | bitwise identical |
+
+That record is historical evidence, not a current verification. In this
+checkout `examples/NARR_PRISM/{experiments,preprocessed,scalars_with_H}` are
+self-referential symlinks and no `last.ckpt` is mounted. Production commands now
+fail before model setup with a clear artifact error. When restored, Phase 2
+also runs `validate_prism_checkpoint_contract` before tensor loading; matching
+shapes alone cannot bypass variable/grid/scaler/date/topology checks.
 
 ### Checkpoint kinds
 
@@ -406,13 +470,33 @@ Result on the checkpoint that is currently training
 | --- | --- |
 | `phase1` | `phase1.*` only |
 | `refinement` | `refiner.*` only, plus the referenced Phase-1 path **and SHA-256 fingerprint** |
-| `combined` | both — portable, used for joint fine-tuning |
+| `combined` | both — used to resume joint or selected-component fine-tuning |
 
-Every payload carries: model state, optimizer, scheduler, gradient scaler,
+Every payload carries a Phase-2 schema and residual-semantics marker, model
+state, optimizer, scheduler, gradient scaler,
 epoch, global step, RNG states, the resolved configuration, the case name, the
-precision settings, the refinement type and the Phase-1 identity. Resume
-validates the Phase-1 fingerprint and refuses to continue against a different
-Phase 1. Checkpoints are written atomically (`os.replace`) by default.
+precision settings, the refinement type and the Phase-1 identity. New
+NARR--PRISM checkpoints also persist the effective optimizer, base/minimum LR,
+warmup, accumulation, clipping, cosine horizon, total epoch budget, and
+train/validation step limits. Schema-1 Phase-2 payloads are rejected because
+they were trained against the hurdle precipitation amount latent, whereas
+schema 2 uses `encode(final_phase1_physical)` and therefore has a different
+residual target. There is no lossless automatic weight migration; those
+refinement heads must be retrained. Resume compares the remaining fields plus
+the complete
+refinement/performance/precision contracts before loading state, validates the
+Phase-1 fingerprint, and treats configured epochs as a total budget rather than
+additional epochs. Incomplete schema-2 model, performance, precision, or
+optimizer/schedule metadata is rejected before state loading. Checkpoints are
+written atomically
+(`os.replace`) by default.
+
+The production NARR--PRISM inference entry point intentionally accepts only a
+refinement-only Phase-2 checkpoint plus the separately validated deterministic
+checkpoint. It rejects `combined` checkpoints so a fine-tuned Phase-1 cannot be
+silently substituted for the configured `last.ckpt`. Combined checkpoints are
+therefore a training/resume format until a separately audited joint-inference
+contract is added.
 
 ---
 
@@ -423,6 +507,17 @@ Phase 1. Checkpoints are written atomically (`os.replace`) by default.
 python examples/NARR_PRISM/narr_prism_finetune.py --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml
 
 # 2. Resume deterministic Phase-1 training (unchanged: resume_training in the YAML)
+
+# 2a. Persist/authenticate training-only output support. This recomputes the
+# existing scalers from the same 1996--2013 split and adds target_valid_mask.npy.
+python examples/NARR_PRISM/compute_scalars_narr_prism.py \
+    --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml
+
+# 2b. Build target-free 2016--2025 predictor products. Existing inference
+# products containing target_* fields must be regenerated under this contract.
+python examples/NARR_PRISM/preproc_narr_prism.py \
+    --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml \
+    --mode inference --overwrite
 
 # 3. Phase-2 training from an existing deterministic checkpoint (Phase 1 frozen)
 python examples/NARR_PRISM/narr_prism_refinement.py train \
@@ -435,23 +530,47 @@ python examples/NARR_PRISM/narr_prism_refinement.py train \
 # 5. Joint Phase-1 + Phase-2 fine-tuning: set in the YAML
 #    model.refinement.joint_finetuning: true
 
-# 6. Deterministic inference (unchanged)
+# 6. Deterministic inference (same Phase-1 weights; authenticated target-free IO)
 python examples/NARR_PRISM/narr_prism_inference.py --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml
+
+# 6a. Held-out 2014--2015 predictions for method selection. Validation files
+# are placed below <output>/validation/ so they cannot overwrite 2016--2025.
+# Even when validation daily products contain target_* variables, prediction
+# opens a predictor-only dataset. Truth is read separately by evaluation.
+python examples/NARR_PRISM/narr_prism_inference.py \
+    --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml \
+    --split validation --output-dir ./deterministic_daily
 
 # 7/8. Refined inference, one or many ensemble members
 python examples/NARR_PRISM/narr_prism_refinement.py infer \
     --config examples/NARR_PRISM/NARR_PRISM_flow_matching_unet.yaml \
     --refinement-checkpoint <refinement_checkpoints>/flow_matching_unet/best.ckpt \
-    --ensemble-size 10 --seed 1234 --output narr_refined.nc
+    --ensemble-size 10 --seed 1234 --output ./refined_daily
+
+# 8a. Use the same Phase-1/Phase-2 artifacts on held-out validation dates.
+python examples/NARR_PRISM/narr_prism_refinement.py infer \
+    --config examples/NARR_PRISM/NARR_PRISM_flow_matching_unet.yaml \
+    --refinement-checkpoint <refinement_checkpoints>/flow_matching_unet/best.ckpt \
+    --split validation --ensemble-size 10 --seed 1234 \
+    --output ./refined_daily
+
+# 8b. Compare methods only on the held-out validation split. The evaluator
+# rejects products whose dataset_split or full configured split bounds differ
+# from dates.validation. Optional --start/--end subsets must be supplied
+# together and remain inside that split.
+python examples/NARR_PRISM/evaluate_refinement.py \
+    --config examples/NARR_PRISM/NARR_PRISM_flow_matching_unet.yaml \
+    --split validation \
+    --phase1-dir ./deterministic_daily/validation \
+    --method flow=./refined_daily/validation \
+    --output-dir ./validation_metrics
 
 # 9. Inspect the resolved configuration
 python examples/NARR_PRISM/narr_prism_refinement.py describe --config <config>.yaml
 
-# Smoke test (all four refiners, minimal steps, nothing written)
-python examples/refinement_smoke_test.py \
-    --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml \
-    --checkpoint examples/NARR_PRISM/experiments/checkpoints/narr_prism_California/last.ckpt \
-    --device cuda:0 --size 128
+# Synthetic smoke test (all four real YAMLs; writes only requested diagnostics)
+python examples/NARR_PRISM/refinement_smoke.py \
+    --output-dir /tmp/narr_prism_refinement_smoke
 
 # Deterministic checkpoint parity
 python examples/NARR_PRISM/narr_prism_refinement_parity.py --config ... --checkpoint ...
@@ -468,8 +587,8 @@ trains the refiner on residuals.
 
 ## 11. Output
 
-`granitewxc.refinement.io` writes a single NetCDF file containing, per target
-variable:
+The generic `granitewxc.refinement.io` writer can write a single aggregate
+NetCDF containing, per target variable:
 
 `<var>` (deterministic), `<var>_residual` (normalized space), `<var>_refined`,
 `<var>_members` (with an explicit `member` dimension in draw order),
@@ -483,6 +602,22 @@ single pass and, by default, atomically.
 
 Ensemble mean and spread are accumulated in float32 and skip NaN (masked) cells
 so masked points never contaminate the statistics.
+
+Production NARR--PRISM inference instead writes one canonical-grid file for
+each exact date under
+`<root>/<case>/<case>_<type>_refined_YYYYMMDD.nc`. There, the exact names
+`ppt`, `tmax`, and `tmin` are always refined ensemble means; `_phase1`,
+`_member_NNN`, and `_ensemble_spread` suffixes identify the baseline, members,
+and spread. The predictor-only inference dataset never discovers or loads
+held-out PRISM targets. Its static domain mask is a separately persisted,
+signed boolean intersection of finite training-period targets in the explicit
+output order. Unsupported scaler cells are neutral-filled, so scaler finiteness
+is deliberately never used as a support mask.
+
+Historical PRISM rasters may omit `units`. The NARR YAMLs therefore carry the
+explicit `evaluation.truth_units` contract. The streaming evaluator validates
+all present source-unit attributes and records every file for which that exact
+configured convention was required; incompatible metadata always fails.
 
 ---
 
@@ -577,26 +712,29 @@ Invalidation rules:
 | `tests/test_refinement_performance.py` | serial-vs-batched ensembles, attention kernels, gradient checkpointing, schedules, cached-vs-online conditioning, masked loss |
 | `tests/test_refinement_io.py` | NetCDF products, dimensions, units, coordinates, masks, member ordering, lossless compression |
 
-Run them with `pytest tests/ -q`.
+Run them from the repository root in the project environment with
+`mamba run -n Prithvi python -m pytest -q`. Using `python -m pytest` is
+intentional: it keeps the repository root on `sys.path` for tests that import
+the example entry points.
 
 ---
 
 ## 15. Known limitations
 
-* Flow-matching training uses the raw normalized residual scale. If a target
-  variable has a very large normalized residual variance the velocity loss will
-  be correspondingly large; residual standardization (as in the Aurora
-  reference) is **not** enabled here because it changes the objective.
+* Residual standardization is enabled in the four NARR YAMLs and requires a
+  one-time frozen-Phase-1 pass over the training loader. This is deliberately
+  expensive and cannot be reproduced until the local training artifacts are
+  restored.
 * The Phase-2 trainer is single-process. DDP/FSDP wrapping of the refiner is not
   implemented; Phase-1 training keeps its existing FSDP path.
 * `torch.compile` and mixed precision are wired into the configuration but are
   off by default and have not been parity-validated for every case.
-* Tiled/halo inference for the Phase-2 refiners reuses the Phase-1 tiling of the
-  existing inference scripts; a dedicated tiled stochastic sampler (with
-  seam-consistent noise across tiles) is not implemented.
-* The `infer` subcommand writes index-based `time`/`lat`/`lon` coordinates when
-  the dataloader does not attach real coordinate arrays; the existing
-  deterministic inference script remains the reference for fully
-  georeferenced NetCDF output.
+* Production refinement inference uses the Phase-1 canonical tile/halo/blend
+  geometry and coordinate-aligned stateless noise. It writes one exact-date,
+  exact-grid file per day; `<var>` is the refined ensemble mean and
+  `<var>_phase1` is the deterministic baseline.
+* Full four-method 1996--2013 training and independent 2016--2025 scientific
+  evaluation remain to be run once checkpoint/scaler/preprocessed artifacts are
+  mounted. No scientific improvement is claimed from synthetic tests.
 * The Phase-1 conditioning cache stores dense tensors per sample; disk usage
   scales with the dataset and is the user's responsibility to size.

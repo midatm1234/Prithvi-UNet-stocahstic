@@ -177,7 +177,10 @@ def write_refined_netcdf(
                 int(chunk_sizes.get(dim, dataset.sizes[dim]))
                 for dim in variable.dims
             ]
-            spec["chunksizes"] = tuple(max(1, min(s, dataset.sizes[d])) for s, d in zip(sizes, variable.dims))
+            spec["chunksizes"] = tuple(
+                max(1, min(s, dataset.sizes[d]))
+                for s, d in zip(sizes, variable.dims, strict=True)
+            )
         if np.issubdtype(variable.dtype, np.floating):
             spec.setdefault("_FillValue", np.nan)
         if spec:

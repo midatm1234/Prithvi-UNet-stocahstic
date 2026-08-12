@@ -23,10 +23,13 @@ Residual reconstruction therefore is::
     refined_physical   = decode(refined_normalized)          # exactly once
     refined_physical   = apply_physical_constraints(...)     # exactly once
 
-``deterministic_normalized`` is the ``x_pre_inverse`` tensor returned by the
-Phase-1 model, i.e. the constrained normalized field that Phase 1 itself
-inverts.  Using it (rather than re-encoding the physical output) keeps the
-round trip exact and avoids inverting the network's softplus/exp output link.
+``deterministic_normalized`` is the final Phase-1 physical prediction encoded
+back into this target data space.  That distinction matters for occurrence /
+amount heads: NARR--PRISM's precipitation hurdle returns an ungated positive
+amount as ``x_pre_inverse`` but a wet/dry-gated physical prediction.  Encoding
+the final field guarantees ``decode(deterministic_normalized) == Phase1`` and
+therefore makes a zero residual an exact no-op.  This data transform does not
+invert or reapply the network's softplus/exp link.
 
 Non-negativity, masks and other physical constraints are applied *after*
 ``decode`` and are applied exactly once; they are never applied to a normalized

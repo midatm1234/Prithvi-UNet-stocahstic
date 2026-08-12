@@ -24,8 +24,10 @@ import torch
 from tqdm import tqdm
 
 from granitewxc.refinement.checkpoint import (
+    CHECKPOINT_SCHEMA_VERSION,
     CHECKPOINT_KIND_COMBINED,
     CHECKPOINT_KIND_REFINEMENT,
+    REFINEMENT_SEMANTICS_VERSION,
     build_refinement_checkpoint,
     load_refinement_state_dict,
     phase1_state_fingerprint,
@@ -58,6 +60,43 @@ def _move_batch(batch: Mapping[str, Any], device: torch.device, non_blocking: bo
     return moved
 
 
+def _flatten_contract(
+    value: Any, prefix: str = ""
+) -> dict[str, Any]:
+    """Flatten a nested resume contract for concise mismatch diagnostics."""
+    if isinstance(value, Mapping):
+        flattened: dict[str, Any] = {}
+        for key in sorted(value, key=str):
+            name = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(_flatten_contract(value[key], name))
+        return flattened
+    return {prefix: value}
+
+
+def _require_exact_contract(
+    label: str,
+    saved: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> None:
+    """Reject a resume when any persisted numerical/runtime setting differs."""
+    saved_flat = _flatten_contract(saved)
+    current_flat = _flatten_contract(current)
+    differences = []
+    for key in sorted(set(saved_flat) | set(current_flat)):
+        old = saved_flat.get(key, "<missing>")
+        new = current_flat.get(key, "<missing>")
+        if old != new:
+            differences.append(f"{key}: saved={old!r}, current={new!r}")
+    if differences:
+        detail = "; ".join(differences[:12])
+        if len(differences) > 12:
+            detail += f"; ... ({len(differences) - 12} more)"
+        raise RuntimeError(
+            f"Refinement checkpoint {label} does not match the current run; "
+            f"refusing an inexact resume ({detail})."
+        )
+
+
 class RefinementTrainer:
     """Minimal, explicit Phase-2 trainer.
 
@@ -87,6 +126,7 @@ class RefinementTrainer:
         gradient_accumulation_steps: int = 1,
         max_grad_norm: float | None = None,
         seed: int | None = None,
+        warmup_steps: int = 0,
         log_every: int = 20,
         logger: Callable[[str], None] = print,
     ) -> None:
@@ -98,10 +138,25 @@ class RefinementTrainer:
         self.checkpoint_dir = checkpoint_dir
         self.phase1_checkpoint = phase1_checkpoint
         self.resolved_config = dict(resolved_config or {})
+        # Schema-2 checkpoints always carry complete model/runtime semantics,
+        # even when a low-level caller omits the optional workflow mapping.
+        self.resolved_config.setdefault(
+            "refinement", model.refinement_config.to_dict()
+        )
+        self.resolved_config.setdefault(
+            "performance", model.performance_config.to_dict()
+        )
         self.case_name = case_name
         self.accum = max(1, int(gradient_accumulation_steps))
         self.max_grad_norm = max_grad_norm
         self.log_every = max(1, int(log_every))
+        self.warmup_steps = max(0, int(warmup_steps))
+        self._base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        if self.warmup_steps:
+            for group, base_lr in zip(
+                self.optimizer.param_groups, self._base_lrs, strict=True
+            ):
+                group["lr"] = base_lr / float(self.warmup_steps)
         self.log = logger
         self.state = RefinementTrainState()
 
@@ -146,7 +201,7 @@ class RefinementTrainer:
     def save(self, *, is_best: bool = False, kind: str | None = None, epoch_file: bool = True) -> str:
         kind = kind or (
             CHECKPOINT_KIND_COMBINED
-            if self.model.refinement_config.joint_finetuning
+            if not self.model.phase1_inference_only
             else CHECKPOINT_KIND_REFINEMENT
         )
         payload = self._payload(kind)
@@ -169,6 +224,94 @@ class RefinementTrainer:
     def resume(self, path: str, *, strict_phase1_reference: bool = True) -> RefinementTrainState:
         """Restore model, optimizer, scheduler, scaler, epoch, step and RNG."""
         payload = torch.load(path, map_location="cpu", weights_only=False)
+        schema = payload.get("checkpoint_schema_version")
+        semantics = payload.get("refinement_semantics_version")
+        if (
+            schema != CHECKPOINT_SCHEMA_VERSION
+            or semantics != REFINEMENT_SEMANTICS_VERSION
+        ):
+            raise RuntimeError(
+                "Phase-2 checkpoint predates the encoded-final-Phase1 "
+                "residual semantics and cannot be resumed safely: "
+                f"schema={schema!r}, semantics={semantics!r}; expected "
+                f"schema={CHECKPOINT_SCHEMA_VERSION}, "
+                f"semantics={REFINEMENT_SEMANTICS_VERSION!r}. Retrain or "
+                "explicitly migrate the refinement checkpoint."
+            )
+        saved_type = payload.get("refinement_type")
+        if saved_type and saved_type != self.model.refinement_config.type:
+            raise RuntimeError(
+                f"Refinement checkpoint type {saved_type!r} cannot resume a "
+                f"{self.model.refinement_config.type!r} model."
+            )
+        saved_refinement = (payload.get("resolved_config") or {}).get(
+            "refinement"
+        )
+        if not isinstance(saved_refinement, Mapping):
+            raise RuntimeError(
+                "Schema-2 refinement checkpoint lacks the complete "
+                "resolved_config.refinement contract."
+            )
+        current_refinement = self.model.refinement_config.to_dict()
+        # Paths and requested inference ensemble size may legitimately move;
+        # training/model semantics may not. Schema 2 was introduced with the
+        # current full mapping, so absent fields are not treated as defaults.
+        saved_refinement = dict(saved_refinement)
+        for mutable in ("checkpoint", "ensemble_size"):
+            saved_refinement.pop(mutable, None)
+            current_refinement.pop(mutable, None)
+        if saved_refinement != current_refinement:
+            raise RuntimeError(
+                "Refinement checkpoint configuration does not match the current "
+                "training/model configuration; refusing a partial or reinitialized resume."
+            )
+
+        # Schema-2 Phase-2 checkpoints persist the complete numerical training
+        # contract. Validate it before loading any model/optimizer state so a
+        # changed warmup, accumulation factor, cosine horizon, epoch budget or
+        # step limit cannot silently alter an interrupted trajectory.
+        saved_resolved = payload.get("resolved_config") or {}
+        saved_training = saved_resolved.get("training")
+        current_training = self.resolved_config.get("training")
+        if not isinstance(saved_training, Mapping):
+            raise RuntimeError(
+                "Schema-2 refinement checkpoint must contain a complete "
+                "resolved_config.training mapping."
+            )
+        elif not isinstance(current_training, Mapping):
+            raise RuntimeError(
+                "Refinement checkpoint records a training contract, but the current "
+                "trainer does not provide resolved_config.training; refusing an "
+                "unverifiable resume."
+            )
+        else:
+            _require_exact_contract(
+                "training contract", saved_training, current_training
+            )
+
+        saved_performance = saved_resolved.get("performance")
+        current_performance = self.model.performance_config.to_dict()
+        if not isinstance(saved_performance, Mapping):
+            raise RuntimeError(
+                "Schema-2 refinement checkpoint must contain a complete "
+                "resolved_config.performance mapping."
+            )
+        else:
+            _require_exact_contract(
+                "performance contract", saved_performance, current_performance
+            )
+
+        saved_precision = payload.get("precision")
+        current_precision = self.model.performance_config.precision.to_dict()
+        if not isinstance(saved_precision, Mapping):
+            raise RuntimeError(
+                "Schema-2 refinement checkpoint must contain complete precision "
+                "metadata."
+            )
+        else:
+            _require_exact_contract(
+                "precision contract", saved_precision, current_precision
+            )
         phase1_state = {
             k[len("phase1.") :]: v
             for k, v in self.model.state_dict().items()
@@ -231,7 +374,10 @@ class RefinementTrainer:
         total, count = 0.0, 0
         self.optimizer.zero_grad(set_to_none=True)
 
-        n = limit_steps if limit_steps > 0 else (len(loader) if hasattr(loader, "__len__") else None)
+        available = len(loader) if hasattr(loader, "__len__") else None
+        n = min(limit_steps, available) if limit_steps > 0 and available is not None else (
+            limit_steps if limit_steps > 0 else available
+        )
         ep_label = f"Ep {epoch+1:03d} train"
         bar = tqdm(total=n, desc=ep_label, unit="batch", ascii=" #", ncols=100, leave=True)
         for step, batch in enumerate(loader):
@@ -245,13 +391,23 @@ class RefinementTrainer:
                 bar.close()
                 raise RuntimeError(f"Non-finite refinement loss at step {step}: {loss.item()}")
 
-            scaled = loss / self.accum
+            # Scale by the actual accumulation group size. The final partial
+            # group must not be discarded or underweighted (important for smoke
+            # tests and tiny-overfit runs where batches < accumulation steps).
+            if n is not None:
+                group_start = (step // self.accum) * self.accum
+                group_size = min(self.accum, n - group_start)
+            else:
+                group_size = self.accum
+            scaled = loss / max(1, group_size)
             if self.scaler is not None and self.scaler.is_enabled():
                 self.scaler.scale(scaled).backward()
             else:
                 scaled.backward()
 
-            if (step + 1) % self.accum == 0:
+            group_boundary = (step + 1) % self.accum == 0
+            final_known_batch = n is not None and (step + 1) == n
+            if group_boundary or final_known_batch:
                 if self.max_grad_norm:
                     if self.scaler is not None and self.scaler.is_enabled():
                         self.scaler.unscale_(self.optimizer)
@@ -264,9 +420,15 @@ class RefinementTrainer:
                 else:
                     self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
-                if self.scheduler is not None:
-                    self.scheduler.step()
                 self.state.global_step += 1
+                if self.state.global_step < self.warmup_steps:
+                    factor = float(self.state.global_step + 1) / float(self.warmup_steps)
+                    for group, base_lr in zip(
+                        self.optimizer.param_groups, self._base_lrs, strict=True
+                    ):
+                        group["lr"] = base_lr * factor
+                elif self.scheduler is not None:
+                    self.scheduler.step()
 
             total += float(loss.detach())
             count += 1
@@ -278,6 +440,36 @@ class RefinementTrainer:
                 )
                 bar.refresh()
         bar.close()
+        # Iterable loaders without __len__ cannot announce the final group. If
+        # one remains, rescale its gradients from /accum to /actual_count and
+        # flush it once rather than silently losing the update.
+        if n is None and count % self.accum:
+            remainder = count % self.accum
+            factor = float(self.accum) / float(remainder)
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(factor)
+            if self.max_grad_norm:
+                if self.scaler is not None and self.scaler.is_enabled():
+                    self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.model.parameters() if p.requires_grad], self.max_grad_norm
+                )
+            if self.scaler is not None and self.scaler.is_enabled():
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.state.global_step += 1
+            if self.state.global_step < self.warmup_steps:
+                factor = float(self.state.global_step + 1) / float(self.warmup_steps)
+                for group, base_lr in zip(
+                    self.optimizer.param_groups, self._base_lrs, strict=True
+                ):
+                    group["lr"] = base_lr * factor
+            elif self.scheduler is not None:
+                self.scheduler.step()
         return total / max(1, count)
 
     @torch.no_grad()

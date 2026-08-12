@@ -22,7 +22,8 @@ from granitewxc.utils.prism_grid import load_canonical_grid
 
 
 CONTRACT_KEY = "prism_pipeline_contract"
-CONTRACT_SCHEMA_VERSION = 4
+CONTRACT_SCHEMA_VERSION = 5
+_LEGACY_CONTRACT_SCHEMA_VERSION = 4
 PRISM_DATA_TYPES = {"narr_prism", "merra_prism"}
 
 
@@ -258,6 +259,12 @@ def build_prism_checkpoint_contract(config: Any) -> dict[str, Any] | None:
             "training_source_artifact_split_signature": manifest.get(
                 normalization.TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY
             ),
+            # The separately signed training-target support artifact is the
+            # only valid source for the static NARR output mask. Neutral-filled
+            # spatial scalers cannot encode land/ocean support.
+            "target_valid_mask": manifest.get(
+                normalization.TARGET_VALID_MASK_MANIFEST_KEY
+            ),
         },
         "channels": {
             "input_vars": input_vars,
@@ -388,10 +395,22 @@ def validate_prism_checkpoint_contract(
         )
     if not isinstance(observed, Mapping):
         raise ValueError(f"[{role}] invalid {CONTRACT_KEY}: expected a mapping")
-    if observed.get("schema_version") != CONTRACT_SCHEMA_VERSION:
+    observed_schema = observed.get("schema_version")
+    if observed_schema == _LEGACY_CONTRACT_SCHEMA_VERSION:
+        # Schema 4 predates the separately signed support mask. Preserve use of
+        # an otherwise exact Phase-1 checkpoint: production inference still
+        # independently requires/authenticates the new scalar-side artifact.
+        legacy_expected = _primitive(expected)
+        legacy_expected["schema_version"] = _LEGACY_CONTRACT_SCHEMA_VERSION
+        legacy_expected["coordinates_and_artifacts"].pop(
+            "target_valid_mask", None
+        )
+        if dict(observed) == legacy_expected:
+            return dict(observed)
+    if observed_schema != CONTRACT_SCHEMA_VERSION:
         raise ValueError(
             f"[{role}] unsupported checkpoint PRISM contract schema "
-            f"{observed.get('schema_version')!r}"
+            f"{observed_schema!r}"
         )
 
     if dict(observed) != expected:

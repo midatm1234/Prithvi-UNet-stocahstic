@@ -105,13 +105,33 @@ def test_checkpoint_contract_round_trip_and_case_mismatch(tmp_path):
     config = _config(tmp_path)
     contract = build_prism_checkpoint_contract(config)
     assert contract is not None
-    assert contract["schema_version"] == CONTRACT_SCHEMA_VERSION == 4
+    assert contract["schema_version"] == CONTRACT_SCHEMA_VERSION == 5
     checkpoint = {CONTRACT_KEY: contract}
     assert validate_prism_checkpoint_contract(config, checkpoint, role="test") == contract
 
     wrong_case = _config(tmp_path, case_name="other_case")
     with pytest.raises(ValueError, match="case_name"):
         validate_prism_checkpoint_contract(wrong_case, checkpoint, role="test")
+
+
+def test_checkpoint_contract_accepts_exact_schema4_phase1_without_mask(
+    tmp_path,
+) -> None:
+    """An existing Phase-1 remains usable once the scalar-side mask is added."""
+    config = _config(tmp_path)
+    current = build_prism_checkpoint_contract(config)
+    legacy = json.loads(json.dumps(current))
+    legacy["schema_version"] = 4
+    legacy["coordinates_and_artifacts"].pop("target_valid_mask")
+    assert validate_prism_checkpoint_contract(
+        config, {CONTRACT_KEY: legacy}, role="test"
+    ) == legacy
+
+    legacy["channels"]["output_vars"] = ["tmax", "ppt"]
+    with pytest.raises(ValueError, match="unsupported|mismatch"):
+        validate_prism_checkpoint_contract(
+            config, {CONTRACT_KEY: legacy}, role="test"
+        )
 
 
 def test_contract_rejects_same_shape_channel_and_behavior_changes(tmp_path):
@@ -188,7 +208,7 @@ def test_checkpoint_contract_binds_training_source_artifact_split(tmp_path):
     scalar_dir = normalization.resolve_scalar_dir(config, for_writing=True)
     scalar_dir.mkdir(parents=True)
 
-    def write_source_manifest(daily_signatures):
+    def write_source_manifest(daily_signatures, *, mask_sha="d" * 64):
         manifest = {
             "scalers": {},
             "predictor_preprocessing_signature": "b" * 64,
@@ -198,6 +218,14 @@ def test_checkpoint_contract_binds_training_source_artifact_split(tmp_path):
             normalization.TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY: (
                 split_source_artifact_signature(daily_signatures)
             ),
+            normalization.TARGET_VALID_MASK_MANIFEST_KEY: {
+                "filename": normalization.TARGET_VALID_MASK_FILENAME,
+                "shape": [3, 4],
+                "dtype": "bool",
+                "sha256": mask_sha,
+                "source_split": "training",
+                "target_variables": ["ppt", "tmax"],
+            },
         }
         (scalar_dir / normalization.MANIFEST_NAME).write_text(
             json.dumps(manifest), encoding="utf-8"
@@ -212,8 +240,11 @@ def test_checkpoint_contract_binds_training_source_artifact_split(tmp_path):
     assert source_split == split_source_artifact_signature(
         {"2000-01-01": "a" * 64}
     )
+    assert contract["coordinates_and_artifacts"]["target_valid_mask"][
+        "sha256"
+    ] == "d" * 64
 
-    write_source_manifest({"2000-01-01": "c" * 64})
+    write_source_manifest({"2000-01-01": "c" * 64}, mask_sha="e" * 64)
     with pytest.raises(ValueError, match="coordinates_and_artifacts"):
         validate_prism_checkpoint_contract(
             config, {CONTRACT_KEY: contract}, role="test"

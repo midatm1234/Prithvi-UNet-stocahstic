@@ -7,9 +7,8 @@ Subcommands
     configured Phase-2 refiner on residuals. Resumable.
 
 ``infer``
-    Run deterministic and refined ensemble inference and write a NetCDF file
-    containing the deterministic prediction, the predicted residual, every
-    ensemble member, the ensemble mean and the ensemble spread.
+    Run deterministic and refined ensemble inference over the exact configured
+    inference dates and write one canonical-grid NetCDF file per day.
 
 ``describe``
     Print the fully resolved configuration and model summary without running
@@ -29,13 +28,14 @@ Examples::
     python examples/NARR_PRISM/narr_prism_refinement.py infer \
         --config examples/NARR_PRISM/NARR_PRISM_flow_matching_unet.yaml \
         --refinement-checkpoint .../refinement_checkpoints/flow_matching_unet/best.ckpt \
-        --ensemble-size 10 --output /tmp/narr_refined.nc
+        --ensemble-size 10 --output /tmp/narr_refined
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -50,9 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from granitewxc.refinement import TwoPhaseDownscalingModel  # noqa: E402
 from granitewxc.refinement.checkpoint import (  # noqa: E402
     load_phase1_state_dict,
-    load_refinement_state_dict,
     phase1_state_fingerprint,
-    validate_phase1_reference,
 )
 from granitewxc.refinement.config import (  # noqa: E402
     resolve_performance_config,
@@ -65,8 +63,11 @@ from granitewxc.utils.normalization import (  # noqa: E402
     assert_scalars_available,
     log_case_context,
 )
+from granitewxc.utils.prism_checkpoint import (  # noqa: E402
+    validate_prism_checkpoint_contract,
+)
 from narr_prism_training import create_finetune_model, get_dataloaders  # noqa: E402
-from narr_prism_utils import get_case_name  # noqa: E402
+from narr_prism_utils import get_case_name, load_yaml  # noqa: E402
 
 
 def _resolve(path: str | os.PathLike) -> str:
@@ -87,6 +88,58 @@ def _phase1_checkpoint(config, override: str | None) -> str | None:
     return _resolve(path) if path else None
 
 
+def _refinement_checkpoint(config, override: str | None) -> str | None:
+    """Resolve a Phase-2 checkpoint, preferring an explicit CLI override."""
+    if override:
+        return _resolve(override)
+    refinement_cfg = getattr(config.model, "refinement", None) or {}
+    if isinstance(refinement_cfg, dict):
+        path = refinement_cfg.get("checkpoint")
+    else:
+        path = getattr(refinement_cfg, "checkpoint", None)
+    return _resolve(path) if path else None
+
+
+def _require_checkpoint_path(path: str | None, *, label: str) -> str:
+    """Return an accessible regular checkpoint file or fail before model setup.
+
+    ``Path.exists`` can hide useful context for dangling/recursive symlinks, so
+    the file is also opened read-only. This catches the historical NARR_PRISM
+    self-referential ``experiments`` symlink with a clear artifact error.
+    """
+    if not path:
+        raise FileNotFoundError(
+            f"{label} checkpoint is required. Set it in the YAML or pass the "
+            f"corresponding CLI checkpoint option."
+        )
+    candidate = Path(path).expanduser()
+    try:
+        accessible = candidate.is_file()
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"{label} checkpoint is not accessible: {candidate} ({exc})"
+        ) from exc
+    if not accessible:
+        if candidate.is_symlink():
+            try:
+                candidate.resolve(strict=True)
+            except OSError as exc:
+                raise FileNotFoundError(
+                    f"{label} checkpoint is not accessible: {candidate} ({exc})"
+                ) from exc
+        raise FileNotFoundError(
+            f"{label} checkpoint is not a regular file: {candidate}"
+        )
+    try:
+        with candidate.open("rb"):
+            pass
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"{label} checkpoint is not accessible: {candidate} ({exc})"
+        ) from exc
+    return str(candidate.resolve())
+
+
 def build_model(config, config_path: str, phase1_checkpoint: str | None, device: torch.device):
     """Build the two-phase model and load the deterministic Phase-1 weights."""
     log_case_context(config, "refinement")
@@ -98,10 +151,20 @@ def build_model(config, config_path: str, phase1_checkpoint: str | None, device:
     phase1 = create_finetune_model(config, verbose=True)
     model = TwoPhaseDownscalingModel(phase1, refinement=refinement, performance=performance)
 
+    if refinement.is_active:
+        phase1_checkpoint = _require_checkpoint_path(
+            phase1_checkpoint, label="Phase-1 deterministic"
+        )
+
     fingerprint = None
     if phase1_checkpoint:
         print(f"[refinement] loading Phase-1 checkpoint (read-only): {phase1_checkpoint}")
         checkpoint = torch.load(phase1_checkpoint, map_location="cpu", mmap=True, weights_only=False)
+        # Validate channel ordering, dates, grid/scaler hashes, transforms and
+        # architecture semantics before a single checkpoint tensor is applied.
+        validate_prism_checkpoint_contract(
+            config, checkpoint, role="NARR refinement Phase-1 load"
+        )
         report = load_phase1_state_dict(model, checkpoint)
         print(f"[refinement] Phase-1 load: {report.summary()}")
         unexplained = [k for k in report.missing if not k.startswith("refiner.")]
@@ -111,8 +174,6 @@ def build_model(config, config_path: str, phase1_checkpoint: str | None, device:
             {k[len("phase1.") :]: v for k, v in model.state_dict().items() if k.startswith("phase1.")}
         )
         print(f"[refinement] Phase-1 fingerprint: {fingerprint}")
-    else:
-        print("[refinement] WARNING: no Phase-1 checkpoint provided; Phase 1 is randomly initialised")
 
     model.to(device)
     return model, fingerprint
@@ -136,28 +197,69 @@ def _to_device(batch, device):
 def cmd_train(args) -> int:
     config = get_config(args.config)
     device = torch.device(args.device)
-    phase1_checkpoint = _phase1_checkpoint(config, args.phase1_checkpoint)
-    model, fingerprint = build_model(config, args.config, phase1_checkpoint, device)
-
-    if not model.refinement_config.is_active:
+    if not resolve_refinement_config(config).is_active:
         raise SystemExit(
             "This configuration has no active refinement section. Use the "
             "deterministic trainer (narr_prism_finetune.py) instead."
         )
+    phase1_checkpoint = _require_checkpoint_path(
+        _phase1_checkpoint(config, args.phase1_checkpoint),
+        label="Phase-1 deterministic",
+    )
+    model, fingerprint = build_model(config, args.config, phase1_checkpoint, device)
 
     train_loader, val_loader = get_dataloaders(args.config, config)
     probe = _to_device(_first_batch(train_loader), device)
     model.initialize_from_batch(probe)
     model.to(device)
+    residual_norm = model.refinement_config.residual_normalization
+    if residual_norm.enabled and not args.resume:
+        fit_limit = int(residual_norm.fit_batches)
+        print(
+            "[refinement] fitting ordered per-variable residual normalization "
+            f"on the Phase-2 training loader (max_batches={fit_limit or 'all'})"
+        )
+        metadata = model.fit_residual_normalizer(
+            train_loader,
+            device=device,
+            max_batches=fit_limit or None,
+        )
+        print(f"[refinement] residual normalization: {json.dumps(metadata, indent=2)}")
     print(f"[refinement] {json.dumps(model.describe()['refinement'], indent=2)}")
-    print(f"[refinement] refiner parameters: {model.describe()['refiner_parameters']:,}")
+    summary = model.describe()
+    print(
+        "[refinement] checkpoint/model summary: "
+        f"deterministic_loaded_fingerprint={fingerprint} "
+        f"new_refinement_keys={len(summary['new_refinement_keys'])} "
+        f"frozen_parameters={summary['frozen_parameters']:,} "
+        f"trainable_parameters={summary['trainable_parameters']:,}"
+    )
 
     trainable = model.trainable_parameters()
-    optimizer = torch.optim.AdamW(trainable, lr=float(getattr(config, "learning_rate", 1e-4)))
+    learning_rate = float(getattr(config, "learning_rate", 1e-4))
+    min_learning_rate = float(getattr(config, "min_lr", 1e-6))
+    warmup_steps = int(getattr(config, "warm_up_steps", 0) or 0)
+    max_grad_norm = float(getattr(config, "max_grad_norm", 0.0)) or None
+    optimizer = torch.optim.AdamW(trainable, lr=learning_rate)
     epochs = int(args.num_epochs or getattr(config, "num_epochs", 1))
-    steps = max(1, min(len(train_loader), int(getattr(config, "limit_steps_train", 0) or len(train_loader))))
+    limit_steps_train = int(
+        args.limit_steps or getattr(config, "limit_steps_train", 0) or 0
+    )
+    limit_steps_valid = int(getattr(config, "limit_steps_valid", 0) or 0)
+    steps = max(
+        1,
+        min(
+            len(train_loader),
+            limit_steps_train or len(train_loader),
+        ),
+    )
+    accumulation = int(getattr(config, "gradient_accumulation_steps", 1))
+    optimizer_steps = max(1, math.ceil(steps / max(1, accumulation)))
+    scheduler_t_max = max(1, epochs * optimizer_steps)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, epochs * steps), eta_min=float(getattr(config, "min_lr", 1e-6))
+        optimizer,
+        T_max=scheduler_t_max,
+        eta_min=min_learning_rate,
     )
     scaler = torch.amp.GradScaler(
         device.type, enabled=(device.type == "cuda" and model.performance_config.precision.mode != "fp32")
@@ -179,13 +281,31 @@ def cmd_train(args) -> int:
         resolved_config={
             "refinement": model.refinement_config.to_dict(),
             "performance": model.performance_config.to_dict(),
+            "training": {
+                "contract_version": 1,
+                "optimizer": "torch.optim.AdamW",
+                "base_learning_rate": learning_rate,
+                "min_learning_rate": min_learning_rate,
+                "scheduler": "torch.optim.lr_scheduler.CosineAnnealingLR",
+                "scheduler_t_max": scheduler_t_max,
+                "warmup_steps": warmup_steps,
+                "gradient_accumulation_steps": accumulation,
+                "max_grad_norm": max_grad_norm,
+                "epochs": epochs,
+                "limit_steps_train": limit_steps_train,
+                "limit_steps_valid": limit_steps_valid,
+                "effective_train_batches_per_epoch": steps,
+                "optimizer_steps_per_epoch": optimizer_steps,
+                "total_optimizer_steps": epochs * optimizer_steps,
+            },
             "case_name": get_case_name(config),
             "config_path": os.path.abspath(args.config),
         },
         case_name=get_case_name(config),
-        gradient_accumulation_steps=int(getattr(config, "gradient_accumulation_steps", 1)),
-        max_grad_norm=float(getattr(config, "max_grad_norm", 0.0)) or None,
+        gradient_accumulation_steps=accumulation,
+        max_grad_norm=max_grad_norm,
         seed=model.refinement_config.seed,
+        warmup_steps=warmup_steps,
     )
     if fingerprint:
         trainer._phase1_fingerprint = fingerprint
@@ -194,12 +314,22 @@ def cmd_train(args) -> int:
         resume_path = args.resume if isinstance(args.resume, str) else os.path.join(checkpoint_dir, "last.ckpt")
         trainer.resume(resume_path)
 
+    # ``epochs`` is the total run budget, not a number of extra epochs.  An
+    # interrupted run therefore completes only the remaining epochs after the
+    # scheduler/optimizer state has been restored.
+    epochs_remaining = max(0, epochs - trainer.state.epoch)
+    if args.resume:
+        print(
+            "[refinement] resume epoch budget: "
+            f"completed={trainer.state.epoch} total={epochs} "
+            f"remaining={epochs_remaining}"
+        )
     trainer.fit(
         train_loader,
         val_loader,
-        num_epochs=epochs,
-        limit_steps_train=int(args.limit_steps or getattr(config, "limit_steps_train", 0) or 0),
-        limit_steps_valid=int(getattr(config, "limit_steps_valid", 0) or 0),
+        num_epochs=epochs_remaining,
+        limit_steps_train=limit_steps_train,
+        limit_steps_valid=limit_steps_valid,
         save_every=int(args.save_every),
     )
     return 0
@@ -208,87 +338,53 @@ def cmd_train(args) -> int:
 def cmd_infer(args) -> int:
     config = get_config(args.config)
     device = torch.device(args.device)
-    phase1_checkpoint = _phase1_checkpoint(config, args.phase1_checkpoint)
-    model, _ = build_model(config, args.config, phase1_checkpoint, device)
-
-    _, val_loader = get_dataloaders(args.config, config)
-    probe = _to_device(_first_batch(val_loader), device)
-    model.initialize_from_batch(probe)
-    model.to(device).eval()
-
-    if args.refinement_checkpoint:
-        payload = torch.load(args.refinement_checkpoint, map_location="cpu", weights_only=False)
-        phase1_state = {
-            k[len("phase1.") :]: v for k, v in model.state_dict().items() if k.startswith("phase1.")
-        }
-        validate_phase1_reference(payload, phase1_state, strict=not args.allow_phase1_mismatch)
-        load_refinement_state_dict(model, payload)
-        print(f"[refinement] loaded Phase-2 weights from {args.refinement_checkpoint}")
-
-    ensemble_size = int(
-        args.ensemble_size if args.ensemble_size is not None else model.refinement_config.ensemble_size
+    refinement = resolve_refinement_config(config)
+    if not refinement.is_active:
+        raise SystemExit("infer requires an active model.refinement configuration")
+    phase1_checkpoint = _require_checkpoint_path(
+        _phase1_checkpoint(config, args.phase1_checkpoint),
+        label="Phase-1 deterministic",
     )
-    seed = args.seed if args.seed is not None else model.refinement_config.seed
-
-    deterministic, residual, members, mean, spread, truth = [], [], [], [], [], []
-    limit = int(args.limit_batches or 0)
-    for index, batch in enumerate(val_loader):
-        if limit and index >= limit:
-            break
-        batch = _to_device(batch, device)
-        out = model.predict(batch, ensemble_size=ensemble_size, seed=seed)
-        deterministic.append(out.deterministic.cpu())
-        if out.residual is not None:
-            residual.append(out.residual.cpu())
-        if out.members is not None:
-            members.append(out.members.cpu())
-            mean.append(out.ensemble_mean.cpu())
-            if out.ensemble_spread is not None:
-                spread.append(out.ensemble_spread.cpu())
-        if "y" in batch:
-            truth.append(batch["y"].cpu())
-
-    if not args.output:
-        print(f"[refinement] processed {len(deterministic)} batches (no --output given)")
-        return 0
-
-    from granitewxc.refinement.io import build_refined_dataset, write_refined_netcdf
-
-    variables = list(config.data.output_vars)
-    deterministic_t = torch.cat(deterministic, dim=0)
-    n_time, _, n_lat, n_lon = deterministic_t.shape
-    coords = {
-        "time": list(range(n_time)),
-        "lat": list(range(n_lat)),
-        "lon": list(range(n_lon)),
-    }
-    dataset = build_refined_dataset(
-        variables=variables,
-        coords=coords,
-        deterministic=deterministic_t,
-        residual=torch.cat(residual, dim=0) if residual else None,
-        members=torch.cat(members, dim=0) if members else None,
-        ensemble_mean=torch.cat(mean, dim=0) if mean else None,
-        ensemble_spread=torch.cat(spread, dim=0) if spread else None,
-        refined=torch.cat(mean, dim=0) if mean else None,
-        truth=torch.cat(truth, dim=0) if truth else None,
-        attrs={
-            "case_name": get_case_name(config),
-            "refinement_type": model.refinement_config.type,
-            "ensemble_size": ensemble_size,
-            "seed": -1 if seed is None else int(seed),
-            "phase1_checkpoint": phase1_checkpoint or "",
-        },
+    refinement_checkpoint = _require_checkpoint_path(
+        _refinement_checkpoint(config, args.refinement_checkpoint),
+        label="Phase-2 refinement",
     )
-    io_cfg = model.performance_config.io
-    path = write_refined_netcdf(
-        dataset,
-        args.output,
-        compression=io_cfg.netcdf_compression,
-        compression_level=io_cfg.netcdf_compression_level,
-        chunk_sizes={"time": 1, "member": 1},
+    model, phase1_fingerprint = build_model(
+        config, args.config, phase1_checkpoint, device
     )
-    print(f"[refinement] wrote {path}")
+
+    cfg = load_yaml(args.config)
+    output = args.output
+    if not output:
+        base = cfg.get("inference", {}).get(
+            "refinement_output_dir",
+            cfg.get("inference", {}).get("output_dir", "./refinement_inference_output"),
+        )
+        output = str(Path(_resolve(base)) / f"refinement_{refinement.type}")
+
+    from narr_prism_refinement_inference import run_refined_inference
+
+    result = run_refined_inference(
+        config_path=args.config,
+        cfg=cfg,
+        config=config,
+        model=model,
+        phase1_checkpoint=phase1_checkpoint,
+        phase1_fingerprint=phase1_fingerprint,
+        refinement_checkpoint=refinement_checkpoint,
+        output_dir=output,
+        device=device,
+        ensemble_size=(
+            args.ensemble_size
+            if args.ensemble_size is not None
+            else refinement.ensemble_size
+        ),
+        base_seed=args.seed if args.seed is not None else refinement.seed,
+        batch_size=max(1, int(args.batch_size)),
+        limit_days=max(0, int(args.limit_days or 0)),
+        split=args.split,
+    )
+    print(f"[refinement] daily refined outputs saved -> {result}")
     return 0
 
 
@@ -321,9 +417,25 @@ def main() -> int:
     infer.add_argument("--refinement-checkpoint", default=None)
     infer.add_argument("--ensemble-size", type=int, default=None)
     infer.add_argument("--seed", type=int, default=None)
-    infer.add_argument("--limit-batches", type=int, default=0)
-    infer.add_argument("--output", default=None)
-    infer.add_argument("--allow-phase1-mismatch", action="store_true")
+    infer.add_argument(
+        "--limit-days",
+        "--limit-batches",
+        dest="limit_days",
+        type=int,
+        default=0,
+        help="optional number of leading inference dates (legacy alias: --limit-batches)",
+    )
+    infer.add_argument("--batch-size", type=int, default=1, help="tile batch size")
+    infer.add_argument("--output", default=None, help="daily NetCDF output root directory")
+    infer.add_argument(
+        "--split",
+        choices=("validation", "inference"),
+        default="inference",
+        help=(
+            "YAML date split to predict; validation outputs are isolated in a "
+            "validation subdirectory"
+        ),
+    )
     infer.set_defaults(func=cmd_infer)
 
     describe = sub.add_parser("describe", parents=[common], help="print the resolved configuration")

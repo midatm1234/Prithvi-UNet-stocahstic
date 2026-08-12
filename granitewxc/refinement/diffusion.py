@@ -75,6 +75,8 @@ class _BaseDiffusionRefiner(ResidualRefiner):
         valid_mask: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> dict[str, torch.Tensor]:
+        self._require_residual_normalization()
+        residual_target = self.apply_valid_mask(residual_target, valid_mask)
         batch = residual_target.shape[0]
         device = residual_target.device
         if generator is not None and generator.device != torch.device(device):
@@ -85,13 +87,36 @@ class _BaseDiffusionRefiner(ResidualRefiner):
             timesteps = torch.randint(
                 0, self.num_train_timesteps, (batch,), generator=generator, device=device
             )
-        noise = self._randn(tuple(residual_target.shape), device, residual_target.dtype, generator)
+        noise = self._randn(
+            tuple(residual_target.shape),
+            device,
+            residual_target.dtype,
+            generator,
+        )
+        noise = self.apply_valid_mask(noise, valid_mask)
 
         noisy = self.schedule.add_noise(residual_target, noise, timesteps)
         target = self.schedule.training_target(self.prediction_type, residual_target, noise, timesteps)
         prediction = self.net(noisy, conditioning, self._embed_time(timesteps))
-        loss = masked_loss(prediction, target, valid_mask, self.loss_kind)
-        return {"loss": loss, "timesteps": timesteps, "prediction": prediction}
+        variable_weights = self.config.auxiliary_loss.variable_weights or None
+        objective = masked_loss(
+            prediction, target, valid_mask, self.loss_kind, variable_weights
+        )
+        clean_estimate = self.schedule.to_clean(
+            self.prediction_type, prediction, noisy, timesteps
+        )
+        auxiliary = self.auxiliary_losses(clean_estimate, residual_target, valid_mask)
+        loss = objective + auxiliary["auxiliary_loss"]
+        return {
+            "loss": loss,
+            "stochastic_objective": objective,
+            **auxiliary,
+            "timesteps": timesteps,
+            "clean_residual": residual_target,
+            "noised_residual": noisy,
+            "estimated_clean_residual": clean_estimate,
+            "prediction": prediction,
+        }
 
     # -- sampling --------------------------------------------------------
     @torch.no_grad()
@@ -101,12 +126,16 @@ class _BaseDiffusionRefiner(ResidualRefiner):
         *,
         generator: torch.Generator | None = None,
         num_steps: int | None = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self._require_residual_normalization()
         steps = int(num_steps if num_steps is not None else self.num_inference_steps)
         shape = self.residual_shape(conditioning)
         device, dtype = conditioning.device, conditioning.dtype
 
-        x = self._randn(shape, device, dtype, generator)
+        x = self.apply_valid_mask(
+            self._randn(shape, device, dtype, generator), valid_mask
+        )
         timesteps = self.schedule.inference_timesteps(steps, device)
         alphas_cumprod = self.schedule.alphas_cumprod.to(device=device, dtype=torch.float32)
 
@@ -124,8 +153,10 @@ class _BaseDiffusionRefiner(ResidualRefiner):
             prev_index = timesteps[idx + 1] if idx + 1 < steps else None
             a_prev = alphas_cumprod[prev_index] if prev_index is not None else torch.ones((), device=device)
 
-            # DDIM update: eta=0 gives the deterministic probability-flow path,
-            # eta=1 recovers the ancestral DDPM update.
+            # Generalized DDIM update: eta=0 is deterministic.  With a full
+            # consecutive timestep grid eta=1 agrees with the DDPM posterior
+            # variance; on a strided grid it is a stochastic DDIM update, not
+            # an exact ancestral DDPM transition.
             sigma = self.eta * torch.sqrt(
                 ((1 - a_prev) / (1 - a_t).clamp(min=1e-12)) * (1 - a_t / a_prev.clamp(min=1e-12))
             )
@@ -134,21 +165,31 @@ class _BaseDiffusionRefiner(ResidualRefiner):
             x = a_prev.sqrt().to(dtype) * x0 + dir_coeff.to(dtype) * eps
             if float(sigma) > 0 and prev_index is not None:
                 x = x + sigma.to(dtype) * self._randn(shape, device, dtype, generator)
+            x = self.apply_valid_mask(x, valid_mask)
         return x
 
     @torch.no_grad()
-    def deterministic_residual(self, conditioning: torch.Tensor) -> torch.Tensor:
+    def deterministic_residual(
+        self,
+        conditioning: torch.Tensor,
+        *,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """One-step posterior mean from pure noise at the largest timestep.
 
         This is a cheap diagnostic, not a substitute for the configured
         multi-step sampler.
         """
+        self._require_residual_normalization()
         shape = self.residual_shape(conditioning)
         device, dtype = conditioning.device, conditioning.dtype
         x = torch.zeros(shape, device=device, dtype=dtype)
         t = torch.full((shape[0],), self.num_train_timesteps - 1, device=device, dtype=torch.long)
         model_out = self.net(x, conditioning, self._embed_time(t))
-        return self.schedule.to_clean(self.prediction_type, model_out, x, t)
+        clean = self.schedule.to_clean(
+            self.prediction_type, model_out, x, t
+        )
+        return self.apply_valid_mask(clean, valid_mask)
 
 
 @register_refiner("diffusion_unet")

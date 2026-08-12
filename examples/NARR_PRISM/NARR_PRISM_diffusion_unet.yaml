@@ -6,7 +6,7 @@
 # diffusion timestep and the flow interpolation time below are mathematical
 # process variables, not physical timestamps.
 #
-# Generated from examples/NARR_PRISM/NARR_PRISM_subdomain.yaml; the source file is unchanged.
+# Phase-1 data/model settings mirror examples/NARR_PRISM/NARR_PRISM_subdomain.yaml.
 
 data:
   type: narr_prism
@@ -157,6 +157,16 @@ dates:
   inference:
     start: '2016-01-01'
     end: '2025-12-31'
+evaluation:
+  truth_units:
+    ppt: mm/day
+    tmax: degC
+    tmin: degC
+preprocess:
+  save_train_targets: true
+  save_val_targets: true
+  save_inference_targets: false
+  inference_include_observed_targets_for_eval: false
 normalization:
   predictor_method: standardize
   predictor_mode: global
@@ -260,13 +270,29 @@ model:
     freeze_phase1: true
     joint_finetuning: false
     train_on_residual: true
+    correction_scale: 1.0
     conditioning:
       deterministic_output: true
       input_predictors: true
       prithvi_features: false
       unet_features: false
-      static_fields: true
-      masks: true
+      static_fields: false  # elevation and its validity mask are already explicit x channels
+      masks: false          # 16 configured predictor-mask channels; avoid an all-ones duplicate
+      coordinates: true     # absolute PRISM-grid indices stay consistent across overlapping tiles
+    residual_normalization:
+      enabled: true
+      epsilon: 1.0e-06
+      fit_batches: 0        # fit all 1996-2013 training residuals; never validation/inference
+    auxiliary_loss:
+      reconstruction_weight: 0.10
+      reconstruction_loss: huber
+      bias_weight: 0.02
+      gradient_weight: 0.05
+      laplacian_weight: 0.01
+      multiscale_weight: 0.02
+      tail_weight: 0.02
+      tail_threshold: 2.0
+      variable_weights: [1.0, 1.0, 1.0]  # ppt, tmax, tmin
     ensemble_size: 10
     loss: mse
     seed: 1234

@@ -33,7 +33,7 @@ from granitewxc.refinement.config import Phase1CachePerfConfig, config_fingerpri
 __all__ = ["CACHE_SCHEMA_VERSION", "Phase1CacheKey", "Phase1ConditioningCache"]
 
 #: Bump whenever the on-disk layout or the semantics of a cached tensor change.
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 _MANIFEST_NAME = "manifest.json"
 

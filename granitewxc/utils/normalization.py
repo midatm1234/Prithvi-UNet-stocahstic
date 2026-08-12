@@ -46,6 +46,13 @@ from granitewxc.utils.predictands import (
 SCALAR_NAMES = ("inputs_mean", "inputs_std", "targets_mean", "targets_std")
 MANIFEST_NAME = "normalization_manifest.json"
 MANIFEST_SCHEMA_VERSION = 3
+TARGET_VALID_MASK_NAME = "target_valid_mask"
+TARGET_VALID_MASK_FILENAME = f"{TARGET_VALID_MASK_NAME}.npy"
+TARGET_VALID_MASK_MANIFEST_KEY = TARGET_VALID_MASK_NAME
+TARGET_VALID_MASK_CRITERION = (
+    "all configured target variables have at least one finite training-period "
+    "observation at the grid cell"
+)
 TRAINING_SOURCE_ARTIFACT_SIGNATURES_KEY = (
     "training_source_artifact_signatures"
 )
@@ -396,6 +403,213 @@ def log_case_context(cfg: Any, role: str, *, logger=print) -> Dict[str, str]:
 def scalar_paths(directory: Path | str) -> Dict[str, Path]:
     directory = Path(directory)
     return {name: directory / f"{name}.npy" for name in SCALAR_NAMES}
+
+
+def target_valid_mask_path(directory_or_config: Path | str | Any) -> Path:
+    """Return the case-scoped training-target support-mask path.
+
+    A path/string denotes a scalar directory directly.  Any other value is
+    treated as a config and resolved through the same case-scoped scalar
+    directory contract as the normalization arrays.
+    """
+    if isinstance(directory_or_config, (str, os.PathLike, Path)):
+        directory = Path(directory_or_config)
+    else:
+        directory = resolve_scalar_dir(directory_or_config, for_writing=False)
+    return directory / TARGET_VALID_MASK_FILENAME
+
+
+def build_target_valid_mask_manifest_entry(
+    path: Path | str,
+    *,
+    cfg: Any,
+    training_source_artifact_split_signature: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the signed manifest entry for a training-derived support mask.
+
+    This helper intentionally does not derive the mask.  The NARR scalar pass
+    derives it while iterating the configured training targets, then calls this
+    function only after persisting the boolean array.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Target-valid-mask artifact does not exist: {path}")
+    mask = np.load(path, allow_pickle=False)
+    if mask.dtype != np.bool_ or mask.ndim != 2:
+        raise ValueError(
+            f"{path} must contain a two-dimensional boolean array, got "
+            f"dtype={mask.dtype}, shape={mask.shape}"
+        )
+    data = _get(cfg, "data", {}) or {}
+    variables = [
+        str(value)
+        for value in _as_list(
+            _get(data, "output_vars", _get(data, "target_variables", []))
+        )
+    ]
+    if not variables:
+        raise ValueError(
+            "Cannot bind target_valid_mask without an explicit configured output order"
+        )
+    train_range = _configured_training_range(cfg)
+    if train_range is None:
+        raise ValueError(
+            "Cannot bind target_valid_mask without dates.training.start/end"
+        )
+
+    from granitewxc.utils.prism_grid import load_canonical_grid
+
+    canonical_grid = load_canonical_grid(case_preprocess_dir(cfg), required=False)
+    if canonical_grid is not None and tuple(mask.shape) != tuple(canonical_grid.shape):
+        raise ValueError(
+            f"Target-valid-mask grid {mask.shape} does not match the canonical "
+            f"PRISM grid {canonical_grid.shape}"
+        )
+    return {
+        "filename": TARGET_VALID_MASK_FILENAME,
+        "shape": list(mask.shape),
+        "dtype": "bool",
+        "sha256": sha256_file(path),
+        "valid_cells": int(mask.sum()),
+        "total_cells": int(mask.size),
+        "source_split": "training",
+        "train_date_range": train_range,
+        "target_variables": variables,
+        "criterion": TARGET_VALID_MASK_CRITERION,
+        "grid_fingerprint": (
+            canonical_grid.fingerprint if canonical_grid is not None else None
+        ),
+        TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY: (
+            None
+            if training_source_artifact_split_signature is None
+            else str(training_source_artifact_split_signature)
+        ),
+    }
+
+
+def load_target_valid_mask(
+    cfg: Any,
+    *,
+    role: str,
+    expected_shape: Optional[Iterable[int]] = None,
+) -> np.ndarray:
+    """Load and authenticate the static, training-derived joint target mask.
+
+    Neutral target scaler fills are finite by design and therefore cannot
+    distinguish ocean/outside-domain cells.  Production consumers must use
+    this separately persisted artifact and must fail when a legacy scalar set
+    does not provide it.
+    """
+    directory = resolve_scalar_dir(cfg, for_writing=False)
+    path = directory / TARGET_VALID_MASK_FILENAME
+    manifest_path = directory / MANIFEST_NAME
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"[{role}] required training-derived target support mask is missing: "
+            f"{path}. Re-run compute_scalars_narr_prism.py with the same YAML; "
+            "output-scaler finiteness is not a valid land/support mask."
+        )
+    manifest = load_manifest(directory)
+    if manifest is None:
+        raise FileNotFoundError(
+            f"[{role}] cannot authenticate {path} without {manifest_path}"
+        )
+    entry = manifest.get(TARGET_VALID_MASK_MANIFEST_KEY)
+    if not isinstance(entry, Mapping):
+        raise ValueError(
+            f"[{role}] {manifest_path} does not bind {TARGET_VALID_MASK_FILENAME}; "
+            "recompute NARR-PRISM scalars from the configured training split"
+        )
+
+    mask = np.load(path, allow_pickle=False)
+    if mask.dtype != np.bool_ or mask.ndim != 2:
+        raise ValueError(
+            f"[{role}] {path} must be a two-dimensional boolean mask, got "
+            f"dtype={mask.dtype}, shape={mask.shape}"
+        )
+    expected_entry_shape = tuple(int(value) for value in entry.get("shape", []))
+    if expected_entry_shape != tuple(mask.shape):
+        raise ValueError(
+            f"[{role}] target-valid-mask shape mismatch: manifest="
+            f"{expected_entry_shape}, file={mask.shape}"
+        )
+    if entry.get("dtype") != "bool":
+        raise ValueError(
+            f"[{role}] target-valid-mask manifest dtype must be 'bool', got "
+            f"{entry.get('dtype')!r}"
+        )
+    observed_sha = sha256_file(path)
+    expected_sha = entry.get("sha256")
+    if expected_sha != observed_sha:
+        raise ValueError(
+            f"[{role}] target-valid-mask sha256 mismatch: file="
+            f"{observed_sha[:12]}, manifest={str(expected_sha)[:12]}"
+        )
+    if entry.get("source_split") != "training":
+        raise ValueError(
+            f"[{role}] target-valid-mask source_split must be 'training'"
+        )
+    if entry.get("criterion") != TARGET_VALID_MASK_CRITERION:
+        raise ValueError(
+            f"[{role}] unsupported target-valid-mask derivation criterion "
+            f"{entry.get('criterion')!r}"
+        )
+    configured_range = _configured_training_range(cfg)
+    if configured_range is None or entry.get("train_date_range") != configured_range:
+        raise ValueError(
+            f"[{role}] target-valid-mask training range mismatch: manifest="
+            f"{entry.get('train_date_range')!r}, config={configured_range!r}"
+        )
+    data = _get(cfg, "data", {}) or {}
+    configured_variables = [
+        str(value)
+        for value in _as_list(
+            _get(data, "output_vars", _get(data, "target_variables", []))
+        )
+    ]
+    if entry.get("target_variables") != configured_variables:
+        raise ValueError(
+            f"[{role}] target-valid-mask variable-order mismatch: manifest="
+            f"{entry.get('target_variables')!r}, config={configured_variables!r}"
+        )
+    source_signature = manifest.get(
+        TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY
+    )
+    if entry.get(TRAINING_SOURCE_ARTIFACT_SPLIT_SIGNATURE_KEY) != source_signature:
+        raise ValueError(
+            f"[{role}] target-valid-mask training-source signature does not "
+            "match the scalar manifest"
+        )
+
+    from granitewxc.utils.prism_grid import load_canonical_grid
+
+    canonical_grid = load_canonical_grid(case_preprocess_dir(cfg), required=False)
+    if canonical_grid is not None:
+        if tuple(mask.shape) != tuple(canonical_grid.shape):
+            raise ValueError(
+                f"[{role}] target-valid-mask grid {mask.shape} does not match "
+                f"canonical PRISM grid {canonical_grid.shape}"
+            )
+        if entry.get("grid_fingerprint") != canonical_grid.fingerprint:
+            raise ValueError(
+                f"[{role}] target-valid-mask canonical-grid fingerprint mismatch"
+            )
+    if expected_shape is not None:
+        shape = tuple(int(value) for value in expected_shape)
+        if tuple(mask.shape) != shape:
+            raise ValueError(
+                f"[{role}] target-valid-mask grid {mask.shape} does not match "
+                f"requested output grid {shape}"
+            )
+    if int(entry.get("valid_cells", -1)) != int(mask.sum()) or int(
+        entry.get("total_cells", -1)
+    ) != int(mask.size):
+        raise ValueError(
+            f"[{role}] target-valid-mask cell counts disagree with the signed file"
+        )
+    if not bool(mask.any()):
+        raise ValueError(f"[{role}] target-valid-mask contains no valid output cells")
+    return np.asarray(mask, dtype=bool)
 
 
 # ---------------------------------------------------------------------------

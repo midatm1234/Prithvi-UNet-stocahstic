@@ -27,6 +27,8 @@ from typing import Any, Iterable, Mapping
 import torch
 
 __all__ = [
+    "CHECKPOINT_SCHEMA_VERSION",
+    "REFINEMENT_SEMANTICS_VERSION",
     "CHECKPOINT_KIND_PHASE1",
     "CHECKPOINT_KIND_REFINEMENT",
     "CHECKPOINT_KIND_COMBINED",
@@ -45,9 +47,14 @@ __all__ = [
 CHECKPOINT_KIND_PHASE1 = "phase1"
 CHECKPOINT_KIND_REFINEMENT = "refinement"
 CHECKPOINT_KIND_COMBINED = "combined"
+CHECKPOINT_SCHEMA_VERSION = 2
+REFINEMENT_SEMANTICS_VERSION = (
+    "phase1-final-physical-encoded-residual-v2"
+)
 
 #: Wrapper prefixes historically produced by DDP / FSDP / ``torch.compile``.
 _WRAPPER_PREFIXES = ("module.", "_orig_mod.")
+_UNIFORM_ROOT_PREFIXES = ("model.", "lightning_module.", "network.")
 
 #: Explicit legacy -> current Phase-1 key renames. Empty today: the NARR_PRISM
 #: deterministic architecture is byte-compatible with this branch. Any future
@@ -84,7 +91,10 @@ def extract_model_state(checkpoint: Any) -> dict[str, torch.Tensor]:
         checkpoint = checkpoint[0]
     state = checkpoint
     if isinstance(checkpoint, Mapping):
-        for key in ("model", "state_dict", "model_state_dict", "phase1"):
+        # Prefer the conventional tensor envelopes over a generic top-level
+        # ``model`` mapping, which some Lightning checkpoints use for saved
+        # hyperparameters rather than weights.
+        for key in ("state_dict", "model_state_dict", "model", "phase1"):
             if key in checkpoint and isinstance(checkpoint[key], Mapping):
                 state = checkpoint[key]
                 break
@@ -97,17 +107,30 @@ def extract_model_state(checkpoint: Any) -> dict[str, torch.Tensor]:
 
 def strip_wrapper_prefixes(state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Remove ``module.`` / ``_orig_mod.`` wrapper prefixes (possibly nested)."""
-    out: dict[str, torch.Tensor] = {}
-    for key, value in state.items():
-        new_key = key
-        changed = True
-        while changed:
-            changed = False
+    out = {str(key): value for key, value in state.items()}
+    # Alternate wrapper and uniform semantic roots to a fixed point: real
+    # stacks may produce model.module._orig_mod.<key> in either nesting order.
+    changed = True
+    while out and changed:
+        changed = False
+        stripped_wrappers: dict[str, torch.Tensor] = {}
+        for key, value in out.items():
+            new_key = key
             for prefix in _WRAPPER_PREFIXES:
                 if new_key.startswith(prefix):
                     new_key = new_key[len(prefix) :]
                     changed = True
-        out[new_key] = value
+                    break
+            stripped_wrappers[new_key] = value
+        out = stripped_wrappers
+        # Strip semantic roots only when they are uniform across the complete
+        # collection; per-key stripping could corrupt a legitimate submodule
+        # named ``model``.
+        for prefix in _UNIFORM_ROOT_PREFIXES:
+            if all(key.startswith(prefix) for key in out):
+                out = {key[len(prefix) :]: value for key, value in out.items()}
+                changed = True
+                break
     return out
 
 
@@ -146,6 +169,8 @@ def phase1_state_fingerprint(state: Mapping[str, torch.Tensor]) -> str:
     """
     digest = hashlib.sha256()
     normalized = strip_wrapper_prefixes(state)
+    if normalized and all(key.startswith("phase1.") for key in normalized):
+        normalized = {key[len("phase1.") :]: value for key, value in normalized.items()}
     for key in sorted(normalized):
         value = normalized[key]
         if not torch.is_tensor(value):
@@ -362,7 +387,8 @@ def build_refinement_checkpoint(
 
     payload: dict[str, Any] = {
         "checkpoint_kind": kind,
-        "checkpoint_schema_version": 1,
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "refinement_semantics_version": REFINEMENT_SEMANTICS_VERSION,
         "model": model_state,
         "epoch": int(epoch),
         "global_step": int(global_step),
@@ -374,6 +400,9 @@ def build_refinement_checkpoint(
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         },
     }
+    refiner = getattr(model, "refiner", None)
+    if refiner is not None and hasattr(refiner, "residual_normalization_metadata"):
+        payload["residual_normalization"] = refiner.residual_normalization_metadata()
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
     if scheduler is not None:

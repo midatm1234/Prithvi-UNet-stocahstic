@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
+from fnmatch import fnmatch
 from typing import Any, Mapping
 
 import torch
@@ -75,12 +76,42 @@ class TwoPhaseOutput:
 
     valid_mask: torch.Tensor | None = None
     losses: dict[str, torch.Tensor] = field(default_factory=dict)
+    diagnostics: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items() if v is not None}
 
 
-def _align_to(tensor: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+def _crop_rows(output_crop: object | None, batch_size: int) -> list[tuple[int, int, int, int]]:
+    if output_crop is None:
+        return []
+    if torch.is_tensor(output_crop):
+        rows = output_crop.detach().cpu().reshape(-1, 4).tolist()
+    elif isinstance(output_crop, (list, tuple)):
+        if len(output_crop) == 4 and not isinstance(output_crop[0], (list, tuple, torch.Tensor)):
+            rows = [output_crop]
+        else:
+            rows = [
+                row.detach().cpu().reshape(-1).tolist() if torch.is_tensor(row) else row
+                for row in output_crop
+            ]
+    else:
+        raise ValueError(f"Unsupported __output_crop type {type(output_crop).__name__}.")
+    rows = [tuple(int(value) for value in row) for row in rows]
+    if len(rows) == 1 and batch_size > 1:
+        rows *= batch_size
+    if len(rows) != batch_size or any(len(row) != 4 for row in rows):
+        raise ValueError(
+            "__output_crop must provide (top,left,height,width) once or per batch item."
+        )
+    return rows
+
+
+def _align_to(
+    tensor: torch.Tensor,
+    size: tuple[int, int],
+    output_crop: object | None = None,
+) -> torch.Tensor:
     """Resample a conditioning field onto the target grid when shapes differ.
 
     PRISM predictors are already co-registered to the target grid but padded to
@@ -91,8 +122,33 @@ def _align_to(tensor: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     if tuple(tensor.shape[-2:]) == tuple(size):
         return tensor
     h, w = tensor.shape[-2], tensor.shape[-1]
+    rows = _crop_rows(output_crop, int(tensor.shape[0]))
+    if rows:
+        parts = []
+        usable = True
+        for sample, (top, left, height, width) in enumerate(rows):
+            if (
+                height != size[0]
+                or width != size[1]
+                or top < 0
+                or left < 0
+                or top + height > h
+                or left + width > w
+            ):
+                usable = False
+                break
+            parts.append(
+                tensor[sample : sample + 1, ..., top : top + height, left : left + width]
+            )
+        if usable:
+            return torch.cat(parts, dim=0)
     if h >= size[0] and w >= size[1]:
-        return tensor[..., : size[0], : size[1]]
+        # Symmetric halo/context without explicit metadata is centered. NARR
+        # always supplies __output_crop; this is the safe fallback for legacy
+        # datasets and avoids the historical top-left spatial shift.
+        top = (h - size[0]) // 2
+        left = (w - size[1]) // 2
+        return tensor[..., top : top + size[0], left : left + size[1]]
     return F.interpolate(tensor, size=size, mode="bilinear", align_corners=False)
 
 
@@ -149,17 +205,45 @@ class TwoPhaseDownscalingModel(nn.Module):
 
     def _apply_phase1_freeze(self) -> None:
         """Freeze Phase 1 when Phase 2 is trained on top of it."""
-        self.phase1_frozen = bool(
-            self.refinement_config.is_active and self.refinement_config.freeze_phase1
-        )
-        if self.phase1_frozen:
+        self.phase1_partially_trainable: tuple[str, ...] = ()
+        if not self.refinement_config.is_active:
+            self.phase1_frozen = False
+            self.phase1_inference_only = False
+            return
+        if self.refinement_config.joint_finetuning:
             for param in self.phase1.parameters():
-                param.requires_grad_(False)
+                param.requires_grad_(True)
+            self.phase1_frozen = False
+            self.phase1_inference_only = False
+            return
+
+        patterns = self.refinement_config.trainable_phase1_patterns
+        matched: list[str] = []
+        for name, param in self.phase1.named_parameters():
+            selected = any(fnmatch(name, pattern) for pattern in patterns)
+            param.requires_grad_(selected)
+            if selected:
+                matched.append(name)
+        if patterns and not matched:
+            raise ConfigValidationError(
+                "No Phase-1 parameter matched refinement.trainable_phase1_patterns "
+                f"{list(patterns)}."
+            )
+        self.phase1_partially_trainable = tuple(matched)
+        self.phase1_frozen = not bool(matched)
+        self.phase1_inference_only = self.phase1_frozen
+        # Frozen and selected-component modes keep Phase 1 in eval mode. Selected
+        # parameters still receive gradients, while running statistics/dropout do
+        # not drift in all the other frozen components.
+        if self.refinement_config.freeze_phase1:
+            for param in self.phase1.parameters():
+                if not matched:
+                    param.requires_grad_(False)
             self.phase1.eval()
 
     def train(self, mode: bool = True):  # noqa: D102 - torch API
         super().train(mode)
-        if self.phase1_frozen:
+        if self.phase1_frozen or self.phase1_partially_trainable:
             # A frozen Phase 1 must stay in eval() so dropout / normalization
             # layers cannot perturb the deterministic conditioning.
             self.phase1.eval()
@@ -221,7 +305,7 @@ class TwoPhaseDownscalingModel(nn.Module):
             setter(self._requested_features)
 
         work_batch = dict(batch)
-        if self.phase1_frozen:
+        if self.phase1_inference_only:
             with torch.no_grad():
                 physical, normalized = self.phase1(work_batch, return_pre_inverse=True)
             physical = physical.detach()
@@ -229,17 +313,71 @@ class TwoPhaseDownscalingModel(nn.Module):
         else:
             physical, normalized = self.phase1(work_batch, return_pre_inverse=True)
 
+        # The Phase-1 pre-inverse tensor is not always the inverse image of its
+        # final physical prediction. In particular, the precipitation hurdle
+        # returns an ungated positive-amount latent but a wet/dry-gated physical
+        # field. Canonicalize the baseline in target data space so a zero
+        # residual reconstructs Phase 1 exactly for every output head.
+        offset = batch.get("__output_scaler_offset", batch.get("__scaler_offset"))
+        normalized = self.target_space.encode(physical, scaler_offset=offset)
+        if self.phase1_inference_only:
+            normalized = normalized.detach()
+
         features: dict[str, torch.Tensor] = {}
         getter = getattr(self.phase1, "get_last_phase1_features", None)
         if self._requested_features and callable(getter):
             features = {
-                name: (tensor.detach() if self.phase1_frozen else tensor)
+                name: (tensor.detach() if self.phase1_inference_only else tensor)
                 for name, tensor in getter().items()
             }
         clearer = getattr(self.phase1, "clear_last_phase1_features", None)
         if callable(clearer):
             clearer()
         return physical, normalized, features
+
+    def _normalized_predictors(
+        self, batch: Mapping[str, torch.Tensor], dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Reuse the exact Phase-1 predictor standardization contract."""
+        x = batch["x"].to(dtype)
+        resolver = getattr(self.phase1, "_resolve_input_scalers", None)
+        timestamps = int(getattr(self.phase1, "n_input_timestamps", 1))
+        if not callable(resolver) or x.shape[1] % timestamps:
+            return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        batch_size, _, height, width = x.shape
+        legacy_offset = batch.get("__scaler_offset")
+        input_offset = batch.get("__input_scaler_offset", legacy_offset)
+        mu, sigma = resolver(x, scaler_offset=input_offset)
+        epsilon = getattr(self.phase1, "input_scalers_epsilon", 1.0e-6)
+        x_time = x.view(batch_size, timestamps, -1, height, width)
+        scaled = (x_time - mu.unsqueeze(1)) / (sigma.unsqueeze(1) + epsilon)
+        scaled = scaled.reshape_as(x)
+        return torch.nan_to_num(scaled, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _coordinate_conditioning(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """Absolute output-grid coordinates, stable across overlapping tiles."""
+        batch_size, _, height, width = reference.shape
+        offset = batch.get("__output_scaler_offset", batch.get("__scaler_offset"))
+        if offset is None:
+            offsets = torch.zeros(batch_size, 2, device=reference.device, dtype=torch.long)
+        else:
+            offsets = torch.as_tensor(offset, device=reference.device, dtype=torch.long)
+            if offsets.ndim == 1:
+                offsets = offsets.unsqueeze(0).expand(batch_size, -1)
+        scaler_shape = tuple(getattr(self.phase1, "output_scalers_sigma").shape[-2:])
+        full_height = scaler_shape[0] if scaler_shape[0] > 1 else height
+        full_width = scaler_shape[1] if scaler_shape[1] > 1 else width
+        y_local = torch.arange(height, device=reference.device, dtype=reference.dtype)
+        x_local = torch.arange(width, device=reference.device, dtype=reference.dtype)
+        y = offsets[:, 0, None, None].to(reference.dtype) + y_local[None, :, None]
+        x = offsets[:, 1, None, None].to(reference.dtype) + x_local[None, None, :]
+        y = y.expand(batch_size, height, width) / max(full_height - 1, 1)
+        x = x.expand(batch_size, height, width) / max(full_width - 1, 1)
+        return torch.stack((2.0 * y - 1.0, 2.0 * x - 1.0), dim=1)
 
     # ------------------------------------------------------------------
     # Conditioning
@@ -260,20 +398,20 @@ class TwoPhaseDownscalingModel(nn.Module):
         size = tuple(deterministic_normalized.shape[-2:])
         parts: list[torch.Tensor] = []
         dtype = deterministic_normalized.dtype
+        output_crop = batch.get("__output_crop")
 
         if cond_cfg.deterministic_output:
             parts.append(deterministic_normalized)
 
         if cond_cfg.input_predictors and "x" in batch:
-            x = batch["x"].to(dtype)
-            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-            parts.append(_align_to(x, size))
+            x = self._normalized_predictors(batch, dtype)
+            parts.append(_align_to(x, size, output_crop))
 
         if cond_cfg.static_fields:
             for key in ("static_x", "static_y"):
                 if key in batch and batch[key] is not None:
                     static = torch.nan_to_num(batch[key].to(dtype), nan=0.0)
-                    parts.append(_align_to(static, size))
+                    parts.append(_align_to(static, size, output_crop))
 
         if cond_cfg.masks:
             # Predictor validity only. The target mask is never used as
@@ -286,7 +424,10 @@ class TwoPhaseDownscalingModel(nn.Module):
                     dtype=dtype,
                     device=deterministic_normalized.device,
                 )
-            parts.append(_align_to(mask, size))
+            parts.append(_align_to(mask, size, output_crop))
+
+        if cond_cfg.coordinates:
+            parts.append(self._coordinate_conditioning(batch, deterministic_normalized))
 
         features = features or {}
         if cond_cfg.prithvi_features:
@@ -296,7 +437,7 @@ class TwoPhaseDownscalingModel(nn.Module):
                     "refinement.conditioning.prithvi_features is enabled but Phase 1 "
                     "did not return a 'prithvi' feature map."
                 )
-            parts.append(_align_to(feat.to(dtype), size))
+            parts.append(_align_to(feat.to(dtype), size, output_crop))
         if cond_cfg.unet_features:
             feat = features.get("unet")
             if feat is None:
@@ -304,7 +445,7 @@ class TwoPhaseDownscalingModel(nn.Module):
                     "refinement.conditioning.unet_features is enabled but Phase 1 "
                     "did not return a 'unet' feature map."
                 )
-            parts.append(_align_to(feat.to(dtype), size))
+            parts.append(_align_to(feat.to(dtype), size, output_crop))
 
         if not parts:  # pragma: no cover - guarded by ConditioningConfig
             raise ConfigValidationError("No conditioning inputs were enabled.")
@@ -370,24 +511,40 @@ class TwoPhaseDownscalingModel(nn.Module):
             physical, normalized, cond = self._prepare(batch)
 
         offset = batch.get("__output_scaler_offset", batch.get("__scaler_offset"))
-        if self.refinement_config.train_on_residual:
-            target, valid = self.target_space.residual_target(
-                batch["y"], normalized, scaler_offset=offset
-            )
-        else:
-            valid = torch.isfinite(batch["y"])
-            filled = torch.where(valid, batch["y"], torch.zeros_like(batch["y"]))
-            target = self.target_space.encode(filled, scaler_offset=offset)
-
-        losses = self.refiner.training_loss(
-            target.to(cond.dtype), cond, valid.to(cond.device), generator=generator
+        target, valid = self.target_space.residual_target(
+            batch["y"], normalized, scaler_offset=offset
         )
+
+        training_target = self.refiner.normalize_residual(target.to(cond.dtype))
+        # Standardization maps the explicit zero fill at invalid cells to
+        # ``-mean/std``. Reapply the validity mask before forward noising/path
+        # construction so oceans/missing pixels cannot leak into neighboring
+        # valid predictions through convolutions or shared Transformer patches.
+        training_target = torch.where(
+            valid.to(device=training_target.device, dtype=torch.bool),
+            training_target,
+            torch.zeros_like(training_target),
+        )
+        losses = self.refiner.training_loss(
+            training_target, cond, valid.to(cond.device), generator=generator
+        )
+        scalar_losses = {
+            key: value
+            for key, value in losses.items()
+            if torch.is_tensor(value) and value.ndim == 0
+        }
+        diagnostics = {
+            key: value.detach()
+            for key, value in losses.items()
+            if torch.is_tensor(value) and value.ndim > 0
+        }
         return TwoPhaseOutput(
             deterministic=physical,
             deterministic_normalized=normalized,
             residual_target=target,
             valid_mask=valid,
-            losses={"loss": losses["loss"]},
+            losses=scalar_losses,
+            diagnostics=diagnostics,
         )
 
     @torch.no_grad()
@@ -413,8 +570,8 @@ class TwoPhaseDownscalingModel(nn.Module):
         """
         physical, normalized, cond = self._prepare(batch)
         offset = batch.get("__output_scaler_offset", batch.get("__scaler_offset"))
-        target_mask = None
-        if "y" in batch:
+        target_mask = batch.get("__target_valid_mask")
+        if target_mask is None and "y" in batch:
             target_mask = torch.isfinite(batch["y"])
 
         out = TwoPhaseOutput(
@@ -463,15 +620,26 @@ class TwoPhaseDownscalingModel(nn.Module):
             source = ChunkNoiseSource(chunk_generators, batch_size)
             if members == 1:
                 with self.refiner.use_noise_source(source):
-                    res = self.refiner.sample(cond)
+                    res = self.refiner.sample_target_space(
+                        cond, valid_mask=target_mask
+                    )
+                res = res * float(self.refinement_config.correction_scale)
                 residuals.append(res.unsqueeze(1))
             else:
                 # Replicate the (identical) conditioning across members so a
                 # single batched network call produces `members` independent
                 # draws. Member order is preserved by the reshape below.
                 cond_rep = cond.repeat_interleave(members, dim=0)
+                mask_rep = (
+                    target_mask.repeat_interleave(members, dim=0)
+                    if target_mask is not None
+                    else None
+                )
                 with self.refiner.use_noise_source(source):
-                    res = self.refiner.sample(cond_rep)
+                    res = self.refiner.sample_target_space(
+                        cond_rep, valid_mask=mask_rep
+                    )
+                res = res * float(self.refinement_config.correction_scale)
                 res = res.reshape(batch_size, members, *res.shape[1:])
                 residuals.append(res)
             drawn += members
@@ -526,19 +694,97 @@ class TwoPhaseDownscalingModel(nn.Module):
     # Introspection
     # ------------------------------------------------------------------
     def trainable_parameters(self) -> list[nn.Parameter]:
-        if self.refiner is None or not self.refinement_config.freeze_phase1:
-            return [p for p in self.parameters() if p.requires_grad]
-        return [p for p in self.refiner.parameters() if p.requires_grad]
+        return [p for p in self.parameters() if p.requires_grad]
+
+    @torch.no_grad()
+    def fit_residual_normalizer(
+        self,
+        loader,
+        *,
+        device: torch.device | str | None = None,
+        max_batches: int | None = None,
+    ) -> dict[str, Any]:
+        """Fit per-variable residual statistics on the supplied training loader.
+
+        This operation is deliberately unavailable when Phase 1 is trainable:
+        changing the deterministic baseline would immediately stale the fitted
+        residual distribution.
+        """
+        if self.refiner is not None and not self.refiner.residual_normalization_enabled:
+            return self.refiner.residual_normalization_metadata()
+        if not self.phase1_inference_only:
+            raise RuntimeError(
+                "Residual normalization can only be fitted with a frozen Phase 1."
+            )
+        if device is None:
+            try:
+                device = next(self.phase1.parameters()).device
+            except StopIteration:
+                device = torch.device("cpu")
+        device = torch.device(device)
+        sums = torch.zeros(self.target_space.num_channels, dtype=torch.float64, device=device)
+        squares = torch.zeros_like(sums)
+        counts = torch.zeros(self.target_space.num_channels, dtype=torch.int64, device=device)
+        seen = 0
+        for batch in loader:
+            if max_batches is not None and max_batches > 0 and seen >= max_batches:
+                break
+            moved = {
+                key: value.to(device) if torch.is_tensor(value) else value
+                for key, value in batch.items()
+            }
+            _, baseline, features = self.run_phase1(moved)
+            cond = self.build_conditioning(moved, baseline, features)
+            self.initialize_refiner(cond.shape[1])
+            offset = moved.get("__output_scaler_offset", moved.get("__scaler_offset"))
+            residual, valid = self.target_space.residual_target(
+                moved["y"], baseline, scaler_offset=offset
+            )
+            values = residual.double()
+            valid_d = valid.double()
+            axes = (0, 2, 3)
+            sums += (values * valid_d).sum(dim=axes)
+            squares += (values.square() * valid_d).sum(dim=axes)
+            counts += valid.sum(dim=axes)
+            seen += 1
+        if self.refiner is None or seen == 0:
+            raise RuntimeError("Cannot fit residual normalization: training loader was empty.")
+        if bool((counts <= 0).any()):
+            raise RuntimeError(
+                "Cannot fit residual normalization: at least one output channel has no valid training cells."
+            )
+        means = sums / counts.double()
+        variances = (squares / counts.double() - means.square()).clamp(min=0.0)
+        std = variances.sqrt().clamp(min=self.refiner.residual_normalization_epsilon)
+        self.refiner.set_residual_normalization(means.float(), std.float(), counts)
+        return self.refiner.residual_normalization_metadata()
 
     def describe(self) -> dict[str, Any]:
         return {
             "refinement": self.refinement_config.to_dict(),
             "performance": self.performance_config.to_dict(),
             "phase1_frozen": self.phase1_frozen,
+            "phase1_partially_trainable": list(self.phase1_partially_trainable),
             "phase1_features": list(self._requested_features),
             "phase1_parameters": sum(p.numel() for p in self.phase1.parameters()),
             "refiner_parameters": (
                 sum(p.numel() for p in self.refiner.parameters()) if self.refiner is not None else 0
+            ),
+            "frozen_parameters": sum(
+                p.numel() for p in self.parameters() if not p.requires_grad
+            ),
+            "trainable_parameters": sum(
+                p.numel() for p in self.parameters() if p.requires_grad
+            ),
+            "new_refinement_keys": (
+                sorted(f"refiner.{key}" for key in self.refiner.state_dict())
+                if self.refiner is not None
+                else []
+            ),
+            "residual_normalization": (
+                self.refiner.residual_normalization_metadata()
+                if self.refiner is not None
+                else None
             ),
         }
 

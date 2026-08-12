@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
-
 import pytest
 
 from granitewxc.refinement.config import (
@@ -65,11 +63,21 @@ def test_invalid_transformer_head_combination_raises():
         )
 
 
-def test_odd_head_dim_raises():
-    with pytest.raises(ConfigValidationError, match="head dimension"):
+def test_learned_positions_allow_odd_head_dimension():
+    cfg = resolve_refinement_config(
+        {"refinement": {"type": "diffusion_transformer",
+                        "transformer": {"embedding_dim": 12, "num_heads": 4,
+                                        "positional_encoding": "learned_2d"}}}
+    )
+    assert cfg.transformer.embedding_dim == 12
+
+
+def test_sincos_positions_require_embedding_divisible_by_four():
+    with pytest.raises(ConfigValidationError, match="divisible by 4"):
         resolve_refinement_config(
             {"refinement": {"type": "diffusion_transformer",
-                            "transformer": {"embedding_dim": 12, "num_heads": 4}}}
+                            "transformer": {"embedding_dim": 6, "num_heads": 3,
+                                            "positional_encoding": "sincos_2d"}}}
         )
 
 
@@ -172,11 +180,30 @@ def test_no_lead_time_field_is_accepted_anywhere():
                 resolve_performance_config({"performance": {"lead_time_hours": 24}})
 
 
-def test_train_on_residual_false_warns():
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        cfg = resolve_refinement_config(
+def test_train_on_residual_false_is_rejected_for_active_phase2():
+    with pytest.raises(ConfigValidationError, match="train_on_residual=true"):
+        resolve_refinement_config(
             {"refinement": {"type": "diffusion_unet", "train_on_residual": False}}
         )
-    assert cfg.train_on_residual is False
-    assert any("train_on_residual" in str(w.message) for w in caught)
+
+
+@pytest.mark.parametrize(
+    "phase1_update",
+    (
+        {"joint_finetuning": True},
+        {"trainable_phase1_patterns": ["head.*"]},
+    ),
+)
+def test_residual_normalization_requires_completely_frozen_phase1(
+    phase1_update,
+):
+    with pytest.raises(ConfigValidationError, match="completely frozen"):
+        resolve_refinement_config(
+            {
+                "refinement": {
+                    "type": "diffusion_unet",
+                    **phase1_update,
+                    "residual_normalization": {"enabled": True},
+                }
+            }
+        )

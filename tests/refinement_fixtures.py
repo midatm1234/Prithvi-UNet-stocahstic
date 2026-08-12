@@ -75,11 +75,19 @@ class TinyPhase1(nn.Module):
         )
         self._capture_features: tuple[str, ...] = ()
         self._last_phase1_features: dict[str, torch.Tensor] = {}
+        self.n_input_timestamps = 1
+        self.input_scalers_epsilon = 1.0e-6
 
     # -- Phase-1 contract -------------------------------------------------
     def _resolve_output_scalers(self, reference, scaler_offset=None):
         mu = self.output_scalers_mu.to(device=reference.device, dtype=reference.dtype)
         sigma = self.output_scalers_sigma.to(device=reference.device, dtype=reference.dtype)
+        return mu, sigma
+
+    def _resolve_input_scalers(self, reference, scaler_offset=None):
+        channels = reference.shape[1]
+        mu = torch.zeros(1, channels, 1, 1, device=reference.device, dtype=reference.dtype)
+        sigma = torch.ones_like(mu)
         return mu, sigma
 
     def set_feature_capture(self, names):

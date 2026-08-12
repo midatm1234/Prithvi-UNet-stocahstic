@@ -8,7 +8,6 @@ scalars.
 from __future__ import annotations
 
 import os
-import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -143,6 +142,7 @@ class NarrPrismDataset(Dataset):
         target_variables: Optional[Sequence[str]] = None,
         scalars_dir: Optional[PathLike] = None,
         dtype: torch.dtype = torch.float32,
+        load_observed_targets: Optional[bool] = None,
     ) -> None:
         if xr is None:
             raise ImportError("xarray is required for NarrPrismDataset")
@@ -150,6 +150,33 @@ class NarrPrismDataset(Dataset):
         self.cfg = load_yaml(config_path)
         self.mode = mode
         self.dtype = dtype
+        preprocess_cfg = self.cfg.get("preprocess", {}) or {}
+        if mode == "training":
+            configured_targets = bool(
+                preprocess_cfg.get("save_train_targets", True)
+            )
+        elif mode == "validation":
+            configured_targets = bool(
+                preprocess_cfg.get("save_val_targets", True)
+            )
+        elif mode == "inference":
+            configured_targets = bool(
+                preprocess_cfg.get("save_inference_targets", False)
+                or preprocess_cfg.get(
+                    "inference_include_observed_targets_for_eval", False
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported dataset mode: {mode}")
+        self._load_observed_targets = (
+            configured_targets
+            if load_observed_targets is None
+            else bool(load_observed_targets)
+        )
+        if mode == "training" and not self._load_observed_targets:
+            raise ValueError(
+                "load_observed_targets=False is not valid for training"
+            )
 
         data_cfg = self.cfg.get("data", {})
         self.use_preprocessed = bool(data_cfg.get("use_preprocessed", False))
@@ -186,14 +213,21 @@ class NarrPrismDataset(Dataset):
         self._preprocessed_target_names = [
             prism_preprocessed.target_name(var) for var in self.target_vars
         ]
-        self._preprocessed_include_targets = True
+        # A validation product may legitimately contain target_* variables
+        # while a prediction-only reader intentionally ignores them.  Keep the
+        # on-disk product contract separate from the variables this Dataset is
+        # allowed to read so model selection cannot condition on observations.
+        self._preprocessed_include_targets = configured_targets
         self._preprocessed_include_elevation = bool(
             data_cfg.get("static_elevation_file")
         )
         self._preprocessed_required_variables = [
             *self._preprocessed_predictor_names,
-            *self._preprocessed_target_names,
         ]
+        if self._load_observed_targets:
+            self._preprocessed_required_variables.extend(
+                self._preprocessed_target_names
+            )
         if self._preprocessed_include_elevation:
             self._preprocessed_required_variables.append("static_elevation")
 
@@ -227,35 +261,47 @@ class NarrPrismDataset(Dataset):
             )
         else:
             self.predictor_dir = resolve_path(data_cfg["predictor_dir"])
-            self.target_dir = resolve_path(data_cfg["target_dir"])
-            validate_target_variables(self.target_dir, self.target_vars)
             narr_files = discover_narr_files(
                 self.predictor_dir,
                 self.start_date,
                 self.end_date,
                 self.predictor_vars,
             )
-            prism_files = discover_all_prism_targets(
-                self.target_dir, self.target_vars, self.start_date, self.end_date
-            )
             self._predictor_map = {d: p for d, p in narr_files}
-            for var, file_list in prism_files.items():
-                self._target_maps[var] = {d: p for d, p in file_list}
-            target_date_lists = {
-                var: list(dm.keys()) for var, dm in self._target_maps.items()
-            }
-            self._dates = align_dates(
-                list(self._predictor_map.keys()), target_date_lists
-            )
+            if self._load_observed_targets:
+                self.target_dir = resolve_path(data_cfg["target_dir"])
+                validate_target_variables(self.target_dir, self.target_vars)
+                prism_files = discover_all_prism_targets(
+                    self.target_dir,
+                    self.target_vars,
+                    self.start_date,
+                    self.end_date,
+                )
+                for var, file_list in prism_files.items():
+                    self._target_maps[var] = {d: p for d, p in file_list}
+                target_date_lists = {
+                    var: list(dm.keys())
+                    for var, dm in self._target_maps.items()
+                }
+                self._dates = align_dates(
+                    list(self._predictor_map.keys()), target_date_lists
+                )
+            else:
+                # Predictor-only production inference must not discover, open,
+                # or align against 2016--2025 PRISM observations.  The exact
+                # canonical output geometry is restored below from the signed
+                # Phase-1 preprocessing contract.
+                self._dates = list(self._predictor_map.keys())
             validate_dates_exist(
                 self._dates, list(self._predictor_map.keys()), "predictor"
             )
-            for var in self.target_vars:
-                validate_dates_exist(
-                    self._dates,
-                    list(self._target_maps[var].keys()),
-                    f"target ({var})",
-                )
+            if self._load_observed_targets:
+                for var in self.target_vars:
+                    validate_dates_exist(
+                        self._dates,
+                        list(self._target_maps[var].keys()),
+                        f"target ({var})",
+                    )
 
         # ------------------------------------------------------------------
         # Fine (PRISM) target grid. Predictors are regridded onto THIS grid so
@@ -282,7 +328,7 @@ class NarrPrismDataset(Dataset):
                     data_type="narr_prism",
                     predictor_variables=self.predictor_vars,
                     target_variables=self.target_vars,
-                    include_targets=True,
+                    include_targets=self._preprocessed_include_targets,
                     regrid_method=str(data_cfg.get("regrid_method", "bilinear")),
                     canonical_grid_fingerprint=canonical_grid.fingerprint,
                     static_elevation_required=self._preprocessed_include_elevation,
@@ -321,7 +367,7 @@ class NarrPrismDataset(Dataset):
                 self._predictor_preprocessing_signature,
                 role=f"NARR {mode} dataset",
             )
-        else:
+        elif self._load_observed_targets:
             self._full_fine_lat, self._full_fine_lon = self._load_fine_grid()
             spatial_subset = data_cfg.get("spatial_subset", {}) or {}
             subset_enabled = bool(spatial_subset.get("enabled", False))
@@ -351,6 +397,20 @@ class NarrPrismDataset(Dataset):
                 source=str(first_grid_source),
                 context="NARR dataset target grid",
             )
+        else:
+            # A target-free raw-predictor run is only safe when Phase 1 already
+            # persisted the exact PRISM grid.  Never infer that grid from
+            # held-out observations during production inference.
+            canonical_grid = prism_grid_contract.load_canonical_grid(
+                self._case_preprocess_dir, required=True
+            )
+            assert canonical_grid is not None
+            self._canonical_grid = canonical_grid
+            self._full_fine_lat = canonical_grid.lat
+            self._full_fine_lon = canonical_grid.lon
+            self._domain_lat_slice = slice(None)
+            self._domain_lon_slice = slice(None)
+            subset_enabled = False
         self.fine_lat = self._canonical_grid.lat
         self.fine_lon = self._canonical_grid.lon
         self.fine_shape: Tuple[int, int] = (len(self.fine_lat), len(self.fine_lon))
@@ -418,7 +478,9 @@ class NarrPrismDataset(Dataset):
         ).lower() == "windowed_local":
             overlap = tuple(
                 core - stride
-                for core, stride in zip(self.crop_size, self.training_tile_stride)
+                for core, stride in zip(
+                    self.crop_size, self.training_tile_stride, strict=True
+                )
             )
             training_plan = TilePlan.build(
                 self.fine_shape,
@@ -619,6 +681,12 @@ class NarrPrismDataset(Dataset):
 
     def _load_target_valid_mask(self) -> np.ndarray:
         """Return cells where every configured target variable is finite."""
+        if not self._load_observed_targets:
+            raise RuntimeError(
+                "This NARR inference dataset was opened without observed "
+                "targets; load the persisted, signed training-period target "
+                "support mask from the case-scoped scalar directory."
+            )
         if self._target_valid_mask is not None:
             return self._target_valid_mask
 
@@ -672,14 +740,37 @@ class NarrPrismDataset(Dataset):
 
         sample_date = self._dates[date_index]
         lat_slice, lon_slice = self._select_crop(tile_index)
-        y = self._load_targets(sample_date, lat_slice, lon_slice)
+        if self._load_observed_targets:
+            y = self._load_targets(sample_date, lat_slice, lon_slice)
+        else:
+            lat0, lon0 = self._slice_start(lat_slice), self._slice_start(
+                lon_slice
+            )
+            lat1 = (
+                self.fine_shape[0]
+                if lat_slice.stop is None
+                else int(lat_slice.stop)
+            )
+            lon1 = (
+                self.fine_shape[1]
+                if lon_slice.stop is None
+                else int(lon_slice.stop)
+            )
+            y = torch.zeros(
+                (len(self.target_vars), lat1 - lat0, lon1 - lon0),
+                dtype=self.dtype,
+            )
 
         # Random PRISM crops can land entirely over missing ocean/outside-CONUS
         # pixels. The loss masks those safely, but such samples provide no
         # learning signal and used to trigger zero-RMSE edge cases. During
         # training, retry a few crop windows until at least a tiny target
         # fraction is finite.
-        if self.random_crop and self.min_valid_target_fraction > 0.0:
+        if (
+            self._load_observed_targets
+            and self.random_crop
+            and self.min_valid_target_fraction > 0.0
+        ):
             valid_fraction = float(torch.isfinite(y).to(torch.float32).mean().item())
             attempts = 1
             while (
@@ -937,6 +1028,11 @@ class NarrPrismDataset(Dataset):
         with zeros (which would be confused with real ppt=0 dry cells and with
         real cold temperatures).
         """
+        if not self._load_observed_targets:
+            raise RuntimeError(
+                "This NARR prediction split was intentionally opened without "
+                "observed target_* variables"
+            )
         arrays: List[np.ndarray] = []
         if self.use_preprocessed:
             path = self._preprocessed_map[sample_date]
@@ -974,6 +1070,10 @@ class NarrPrismDataset(Dataset):
     @property
     def dates(self) -> List[Any]:
         return list(self._dates)
+
+    @property
+    def has_observed_targets(self) -> bool:
+        return self._load_observed_targets
 
     @property
     def predictor_preprocessing_signature(self) -> Optional[str]:
