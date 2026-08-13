@@ -362,8 +362,9 @@ performance:                    # workflow only - never changes the science
     phase1: false
     refinement: false
   phase1_cache:
-    enabled: false
-    path: null
+    # NARR--PRISM production setting. Other workflows may leave this disabled.
+    enabled: true
+    path: ./examples/NARR_PRISM/experiments/phase1_residual_cache
     include_deterministic_output: true
     include_prithvi_features: false
     include_unet_features: false
@@ -457,12 +458,16 @@ mismatched):
 | normalized (pre-Phase-2) | 0.0 | 0.0 | 0.0 | bitwise identical |
 | physical (post-decode) | 0.0 | 0.0 | 0.0 | bitwise identical |
 
-That record is historical evidence, not a current verification. In this
-checkout `examples/NARR_PRISM/{experiments,preprocessed,scalars_with_H}` are
-self-referential symlinks and no `last.ckpt` is mounted. Production commands now
-fail before model setup with a clear artifact error. When restored, Phase 2
-also runs `validate_prism_checkpoint_contract` before tensor loading; matching
-shapes alone cannot bypass variable/grid/scaler/date/topology checks.
+That record remains historical evidence rather than verification of the current
+checkpoint. The local artifact portal now resolves
+`examples/NARR_PRISM/{experiments,preprocessed,scalars_with_H}` to the durable
+external root `/data2/granite-wxc-artifacts/NARR_PRISM`. The recovered
+`last.ckpt` has file SHA-256
+`1d352491ab32a4069696673f504edcd9c67d48325e83dcf3b042fe3d3eb80efa`
+and deterministic tensor fingerprint
+`84c8509ce161f049d8999e5d44b43b83d36cc316a579d052df1bd0f6173a31c7`.
+Phase 2 runs `validate_prism_checkpoint_contract` before tensor loading;
+matching shapes alone cannot bypass variable/grid/scaler/date/topology checks.
 
 ### Checkpoint kinds
 
@@ -675,28 +680,62 @@ Notes:
 
 ## 13. Phase-1 conditioning cache
 
-Enabled with `performance.phase1_cache`. One file per sample under
-`<path>/<digest>/`, where `<digest>` covers:
+The production NARR--PRISM integration uses
+`examples/NARR_PRISM/narr_prism_phase1_cache.py`. It runs the authenticated
+deterministic `last.ckpt` once for the 1996--2013 training and 2014--2015
+validation dates. One atomic NetCDF is written per date beneath the immutable
+directory `<performance.phase1_cache.path>/<contract-digest-prefix>/`.
 
-Phase-1 checkpoint fingerprint, Phase-1 architecture, case name, dataset split,
-predictor definitions, target definitions, pressure levels, normalization
-configuration, preprocessing configuration, spatial domain, grid shape and the
-cache-schema version.
+Each daily file contains the canonical full grid and ordered `ppt`, `tmax`,
+`tmin` channels for:
 
-Each entry stores the sample identifier, timestamp, coordinates, the
-deterministic normalized output, the requested Prithvi/UNet features, masks and
-metadata.
+* `deterministic_physical`;
+* `deterministic_normalized`, obtained by encoding the final blended physical
+  Phase-1 field exactly once;
+* `residual_target_normalized = encode(PRISM) - deterministic_normalized`;
+* the channel-wise residual-valid mask and static PRISM support mask; and
+* exact date, split, coordinates and cache-contract identity.
 
-Invalidation rules:
+The manifest binds the exact checkpoint-file SHA-256 and tensor-state
+fingerprint, Phase-1 semantic contract, ordered predictors and targets,
+normalization/scaler signatures, grid, preprocessing, dates, mask, tile core,
+stride, halo and blend settings. It remains `incomplete` until the exact daily
+inventory is validated. Finalization computes one set of per-channel residual
+mean/std/count values from the training split only, with training-tile overlap
+multiplicity. The 2014--2015 validation and 2016--2025 inference periods never
+fit these statistics.
 
-* any change to the fields above changes the digest, hence a different directory;
-* a manifest that disagrees with the current run raises `RuntimeError`;
-* a schema-version change raises;
-* an entry whose stored digest disagrees with the expected one raises;
-* `validate_cache: true` (default) compares cached tensors with a live frozen
-  Phase-1 pass and fails above `validate_tolerance`;
-* the cache is **never** usable with `joint_finetuning: true` or an unfrozen
-  Phase 1 — the configuration validator rejects that combination.
+Build the shared cache once (change the GPU list to the visible devices), then
+validate it and train any or all of the four heads:
+
+```bash
+PHASE1_CKPT=examples/NARR_PRISM/experiments/checkpoints/narr_prism_California/last.ckpt
+
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_phase1_cache.py build \
+  --config examples/NARR_PRISM/NARR_PRISM_diffusion_transformer.yaml \
+  --checkpoint "$PHASE1_CKPT" --parallel-gpus 0,1,2,3
+
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_phase1_cache.py validate \
+  --cache examples/NARR_PRISM/experiments/phase1_residual_cache
+
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_refinement.py train \
+  --config examples/NARR_PRISM/NARR_PRISM_diffusion_transformer.yaml \
+  --phase1-checkpoint "$PHASE1_CKPT" --device cuda:0
+```
+
+Interrupted builds are resumable: valid completed dates are skipped. Training
+fails closed if the manifest is missing, incomplete or incompatible. On a
+fresh run, manifest statistics are installed directly and the old complete
+live-loader normalization scan is skipped. On resume, checkpoint statistics
+are restored first and then required to match the manifest. A configurable
+small live parity sample (four tiles by default) compares cached baselines and
+residuals with the frozen model before training. Date-grouped sampling and a
+per-worker daily reader ensure that all same-day tiles share one NetCDF open;
+Phase 1 is not executed during refinement epochs.
+
+`granitewxc.refinement.cache.Phase1ConditioningCache`, the older generic
+one-`.pt`-entry API, remains available to library callers and parity tests. It
+is not the cache consumed by the NARR--PRISM production trainer.
 
 ---
 
@@ -710,6 +749,10 @@ Invalidation rules:
 | `tests/test_refinement_timestamps.py` | predictor/target timestamp identity, no offset, no forecast index, process time is internal |
 | `tests/test_refinement_checkpoint.py` | key migration, strict loading, refinement-only checkpoints, Phase-1 identity, full resume |
 | `tests/test_refinement_performance.py` | serial-vs-batched ensembles, attention kernels, gradient checkpointing, schedules, cached-vs-online conditioning, masked loss |
+| `examples/NARR_PRISM/test_narr_prism_phase1_cache.py` | atomic daily files, content hashes, completion/finalization, repair, sharding, build locks and worker cleanup |
+| `tests/test_narr_prism_phase1_cache_training.py` | daily cache reader locality, manifest statistics, fail-closed loading and live parity |
+| `tests/test_narr_prism_cached_target_io.py` | opt-in one-day target caching, exact tile crops and unchanged direct-I/O fallback |
+| `tests/test_prism_training_metadata.py` | date-grouped tile sampling, distributed length and metadata preservation |
 | `tests/test_refinement_io.py` | NetCDF products, dimensions, units, coordinates, masks, member ordering, lossless compression |
 
 Run them from the repository root in the project environment with
@@ -721,10 +764,9 @@ the example entry points.
 
 ## 15. Known limitations
 
-* Residual standardization is enabled in the four NARR YAMLs and requires a
-  one-time frozen-Phase-1 pass over the training loader. This is deliberately
-  expensive and cannot be reproduced until the local training artifacts are
-  restored.
+* Residual standardization is enabled in the four NARR YAMLs. Its one-time
+  Phase-1 work is now performed by the resumable shared daily cache builder,
+  not repeated by each refinement run.
 * The Phase-2 trainer is single-process. DDP/FSDP wrapping of the refiner is not
   implemented; Phase-1 training keeps its existing FSDP path.
 * `torch.compile` and mixed precision are wired into the configuration but are
@@ -733,8 +775,10 @@ the example entry points.
   geometry and coordinate-aligned stateless noise. It writes one exact-date,
   exact-grid file per day; `<var>` is the refined ensemble mean and
   `<var>_phase1` is the deterministic baseline.
-* Full four-method 1996--2013 training and independent 2016--2025 scientific
-  evaluation remain to be run once checkpoint/scaler/preprocessed artifacts are
-  mounted. No scientific improvement is claimed from synthetic tests.
-* The Phase-1 conditioning cache stores dense tensors per sample; disk usage
-  scales with the dataset and is the user's responsibility to size.
+* The checkpoint, scalers, preprocessing products and deterministic 2016--2025
+  daily outputs are available through the external artifact portal. Full
+  four-method 1996--2013 training and independent Phase-2 scientific evaluation
+  remain to be run. No scientific improvement is claimed from mechanics tests.
+* The 7,305 daily training/validation cache files contain about 285 GiB of
+  arrays before NetCDF compression. Actual disk use depends on compression and
+  must be sized before the one-time build.

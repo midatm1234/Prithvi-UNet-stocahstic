@@ -143,6 +143,8 @@ class NarrPrismDataset(Dataset):
         scalars_dir: Optional[PathLike] = None,
         dtype: torch.dtype = torch.float32,
         load_observed_targets: Optional[bool] = None,
+        cache_predictor_days: bool = False,
+        cache_target_days: bool = False,
     ) -> None:
         if xr is None:
             raise ImportError("xarray is required for NarrPrismDataset")
@@ -150,6 +152,19 @@ class NarrPrismDataset(Dataset):
         self.cfg = load_yaml(config_path)
         self.mode = mode
         self.dtype = dtype
+        # Opt-in, per-process one-day predictor cache. Date-grouped Phase-2
+        # sampling enables this so every worker reads/regrids a daily predictor
+        # product once rather than once per spatial tile. Ordinary Phase-1 and
+        # random-crop workflows retain their existing I/O semantics.
+        self.cache_predictor_days = bool(cache_predictor_days)
+        self._cached_predictor_date: str | None = None
+        self._cached_predictor_day: Optional[torch.Tensor] = None
+        # Opt-in, per-process one-day physical-target cache. This is used by
+        # date-grouped Phase-2 cache training only; ordinary dataset readers
+        # continue to open just the requested crop.
+        self.cache_target_days = bool(cache_target_days)
+        self._cached_target_date: str | None = None
+        self._cached_target_day: Optional[torch.Tensor] = None
         preprocess_cfg = self.cfg.get("preprocess", {}) or {}
         if mode == "training":
             configured_targets = bool(
@@ -538,6 +553,11 @@ class NarrPrismDataset(Dataset):
 
         # Random crops for ordinary training; tiled training enumerates fixed windows.
         self.random_crop = mode == "training" and self._tile_slices is None
+        # A random-crop retry can change the selected window within one
+        # __getitem__ call. Preserve that established direct-I/O path exactly;
+        # the date-grouped Phase-2 loader requires deterministic tiles anyway.
+        if self.random_crop:
+            self.cache_target_days = False
 
         # NOTE: the dataset deliberately does NOT z-score x or y. The model
         # normalizes inputs and denormalizes outputs internally via its
@@ -572,6 +592,11 @@ class NarrPrismDataset(Dataset):
                 # half for neutral NaN-fill (mask means are 0).
                 n_data = len(self.predictor_vars) + 1  # + elevation
                 self._fill_means = np.asarray(im[:n_data], dtype=np.float32)
+        if self.cache_predictor_days and self._fill_means is None:
+            raise RuntimeError(
+                "cache_predictor_days requires authenticated input means so "
+                "full-day loading and direct tile loading have identical NaN fills"
+            )
 
         # Load static elevation ON THE PRISM GRID (appended as the last input
         # channel) so it is co-registered with the regridded predictors.
@@ -741,7 +766,7 @@ class NarrPrismDataset(Dataset):
         sample_date = self._dates[date_index]
         lat_slice, lon_slice = self._select_crop(tile_index)
         if self._load_observed_targets:
-            y = self._load_targets(sample_date, lat_slice, lon_slice)
+            y = self._load_target_crop(sample_date, lat_slice, lon_slice)
         else:
             lat0, lon0 = self._slice_start(lat_slice), self._slice_start(
                 lon_slice
@@ -778,7 +803,7 @@ class NarrPrismDataset(Dataset):
                 and attempts < self.max_crop_retries
             ):
                 lat_slice, lon_slice = self._select_crop()
-                y = self._load_targets(sample_date, lat_slice, lon_slice)
+                y = self._load_target_crop(sample_date, lat_slice, lon_slice)
                 valid_fraction = float(torch.isfinite(y).to(torch.float32).mean().item())
                 attempts += 1
 
@@ -794,7 +819,9 @@ class NarrPrismDataset(Dataset):
             (output_h, output_w),
             self.training_halo,
         )
-        x = self._load_predictor(sample_date, input_lat_slice, input_lon_slice)
+        x = self._load_predictor_crop(
+            sample_date, input_lat_slice, input_lon_slice
+        )
         x = pad_spatial_context(x, halo_padding, pad_mode="reflect")
         expected_input_shape = (
             output_h + 2 * self.training_halo[0],
@@ -1015,6 +1042,40 @@ class NarrPrismDataset(Dataset):
         """
         return self._load_predictor(sample_date, slice(None), slice(None))
 
+    def _load_predictor_crop(
+        self,
+        sample_date: Any,
+        lat_slice: slice = slice(None),
+        lon_slice: slice = slice(None),
+    ) -> torch.Tensor:
+        """Load a predictor crop, optionally slicing a one-day worker cache.
+
+        The cached tensor is already regridded, ordered, mean-filled and mask-
+        augmented by :meth:`_load_predictor_day`. Slicing it is therefore
+        numerically identical to loading the same crop directly when the
+        authenticated input means are present.
+        """
+        if not getattr(self, "cache_predictor_days", False):
+            return self._load_predictor(sample_date, lat_slice, lon_slice)
+        date_key = str(sample_date)
+        if (
+            self._cached_predictor_day is None
+            or self._cached_predictor_date != date_key
+        ):
+            full_day = self._load_predictor_day(sample_date)
+            if tuple(full_day.shape[-2:]) != tuple(self.fine_shape):
+                raise ValueError(
+                    "Full-day predictor cache has shape "
+                    f"{tuple(full_day.shape[-2:])}; expected {tuple(self.fine_shape)}"
+                )
+            self._cached_predictor_date = date_key
+            self._cached_predictor_day = full_day
+        # Clone so an unpadded interior sample does not retain a view whose
+        # storage aliases the entire daily field after DataLoader collation.
+        return self._cached_predictor_day[
+            ..., lat_slice, lon_slice
+        ].clone()
+
     def _load_targets(
         self,
         sample_date: Any,
@@ -1064,6 +1125,36 @@ class NarrPrismDataset(Dataset):
 
         stacked = np.stack(arrays, axis=0)
         return torch.from_numpy(stacked).to(self.dtype)
+
+    def _load_target_crop(
+        self,
+        sample_date: Any,
+        lat_slice: slice = slice(None),
+        lon_slice: slice = slice(None),
+    ) -> torch.Tensor:
+        """Load a physical target crop from an optional one-day worker cache.
+
+        Cached Phase-2 sampling groups every tile for a date. Loading all
+        configured target channels once and slicing here avoids reopening the
+        same daily NetCDF for each tile without changing values, units, NaNs,
+        channel order, or crop coordinates.
+        """
+        if not getattr(self, "cache_target_days", False):
+            return self._load_targets(sample_date, lat_slice, lon_slice)
+        date_key = str(sample_date)
+        if self._cached_target_day is None or self._cached_target_date != date_key:
+            full_day = self._load_targets(sample_date)
+            expected_shape = (len(self.target_vars), *self.fine_shape)
+            if tuple(full_day.shape) != expected_shape:
+                raise ValueError(
+                    "Full-day target cache has shape "
+                    f"{tuple(full_day.shape)}; expected {expected_shape}"
+                )
+            self._cached_target_date = date_key
+            self._cached_target_day = full_day
+        # Clone so a crop handed to DataLoader collation does not retain a
+        # view whose storage aliases the complete daily target tensor.
+        return self._cached_target_day[..., lat_slice, lon_slice].clone()
 
     # Metadata helpers
     # ------------------------------------------------------------------

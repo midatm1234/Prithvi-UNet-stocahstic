@@ -385,6 +385,10 @@ class RefinementTrainer:
         progress_bar: Any | None = None,
     ) -> float:
         self.model.train()
+        sampler = getattr(loader, "sampler", None)
+        set_epoch = getattr(sampler, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
         total, count = 0.0, 0
         self.optimizer.zero_grad(set_to_none=True)
 

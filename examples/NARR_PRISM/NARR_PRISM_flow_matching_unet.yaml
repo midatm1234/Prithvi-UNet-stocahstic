@@ -492,12 +492,17 @@ performance:
     phase1: false
     refinement: false
   phase1_cache:
-    enabled: false
-    path: null
+    # One authenticated deterministic/residual cache is shared by every
+    # Phase-2 head because their Phase-1 data, grid and target-space contracts
+    # are identical. Training fails closed if this cache is absent/incomplete.
+    enabled: true
+    path: ./examples/NARR_PRISM/experiments/phase1_residual_cache
     include_deterministic_output: true
     include_prithvi_features: false
     include_unet_features: false
     validate_cache: true
+    validate_samples: 4
+    validate_tolerance: 1.0e-5
   ensemble:
     batch_members: true
     chunk_size: auto

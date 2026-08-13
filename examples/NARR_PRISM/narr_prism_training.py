@@ -12,11 +12,10 @@ from __future__ import annotations
 import math
 import os
 import socket
-import subprocess
 import sys
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -50,7 +49,7 @@ except ModuleNotFoundError:
         return rmse_loss
 
 from granitewxc.models.model import get_finetune_model_UNET
-from granitewxc.utils.config import ExperimentConfig, get_config
+from granitewxc.utils.config import ExperimentConfig
 from granitewxc.utils.normalization import (
     apply_scalar_paths,
     assert_scalars_available,
@@ -197,10 +196,16 @@ class _WrappedDataset(torch.utils.data.Dataset):
         base: NarrPrismDataset,
         num_static_channels: int = 0,
         pad_multiple: int = 32,
+        phase1_cache_reader: Any | None = None,
+        cache_split: str | None = None,
     ) -> None:
         self.base = base
         self.num_static_channels = num_static_channels
         self.pad_multiple = pad_multiple
+        self.phase1_cache_reader = phase1_cache_reader
+        self.cache_split = cache_split
+        if self.phase1_cache_reader is not None and not self.cache_split:
+            raise ValueError("cache_split is required with a Phase-1 cache reader")
         self._static_y: Optional[torch.Tensor] = None
         if num_static_channels > 0 and base._elevation is not None:
             elev = torch.from_numpy(base._elevation.astype("float32"))
@@ -220,12 +225,57 @@ class _WrappedDataset(torch.utils.data.Dataset):
         # F.pad pads from last dim inward: (left, right, top, bottom)
         return torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def _attach_phase1_cache(
+        self, wrapped: Dict[str, Any], source: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.phase1_cache_reader is None:
+            return wrapped
+        if "date" not in source:
+            raise KeyError("Cached Phase-2 training requires a sample date")
+        offset = source.get("__output_scaler_offset", source.get("__scaler_offset"))
+        if offset is None or not torch.is_tensor(offset) or offset.numel() != 2:
+            raise ValueError(
+                "Cached Phase-2 training requires a two-value output scaler offset"
+            )
+        y0, x0 = (int(value) for value in offset.reshape(-1).tolist())
+        height, width = (int(value) for value in source["y"].shape[-2:])
+        cached = self.phase1_cache_reader.load_crop(
+            self.cache_split,
+            source["date"],
+            y0,
+            x0,
+            height,
+            width,
+        )
+        required = (
+            "__phase1_normalized",
+            "__residual_target_normalized",
+            "__residual_valid_mask",
+        )
+        missing = [key for key in required if key not in cached]
+        if missing:
+            raise RuntimeError(
+                f"Phase-1 residual cache reader did not return required keys: {missing}"
+            )
+        expected_shape = tuple(source["y"].shape)
+        for key in required:
+            value = cached[key]
+            if not torch.is_tensor(value) or tuple(value.shape) != expected_shape:
+                observed = tuple(value.shape) if torch.is_tensor(value) else None
+                raise ValueError(
+                    f"Cached field {key} has shape {observed}; expected {expected_shape}"
+                )
+        wrapped.update(cached)
+        return wrapped
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.base[idx]
         x_full = sample["x"]  # (C_dyn [+ num_static], H_in, W_in)
         tile_metadata = {
             key: sample[key]
             for key in (
+                "date",
+                "tile_index",
                 "__scaler_offset",
                 "__input_scaler_offset",
                 "__output_scaler_offset",
@@ -244,14 +294,70 @@ class _WrappedDataset(torch.utils.data.Dataset):
                 "static_y": self._static_y,
             }
             wrapped.update(tile_metadata)
-            return wrapped
+            return self._attach_phase1_cache(wrapped, sample)
 
         wrapped = {
             "x": self._pad_to_multiple(x_full),
             "y": sample["y"],
         }
         wrapped.update(tile_metadata)
-        return wrapped
+        return self._attach_phase1_cache(wrapped, sample)
+
+
+class _DateGroupedTileSampler(torch.utils.data.Sampler[int]):
+    """Shuffle dates reproducibly while keeping every date's tiles together.
+
+    Daily cache arrays can then remain in a tiny per-worker LRU for all tiles
+    of one date instead of reopening a 1024 x 1024 NetCDF after a global random
+    shuffle. Tile order is independently shuffled within each date.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_dates: int,
+        tiles_per_date: int,
+        seed: int,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        self.num_dates = int(num_dates)
+        self.tiles_per_date = int(tiles_per_date)
+        self.seed = int(seed)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.epoch = 0
+        if self.num_dates < 1 or self.tiles_per_date < 1:
+            raise ValueError("Date-grouped sampling requires dates and tiles")
+        if self.world_size < 1 or not 0 <= self.rank < self.world_size:
+            raise ValueError("Invalid date-grouped sampler rank/world size")
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        dates = torch.randperm(self.num_dates, generator=generator).tolist()
+        # Match DistributedSampler's equal-length contract so synchronized
+        # ranks cannot hang when the number of dates is not divisible by the
+        # world size. Padding duplicates complete date groups, never individual
+        # tiles, which preserves the daily-file locality guarantee.
+        dates_per_rank = math.ceil(self.num_dates / self.world_size)
+        total_dates = dates_per_rank * self.world_size
+        if total_dates > len(dates):
+            padding = total_dates - len(dates)
+            dates.extend((dates * math.ceil(padding / len(dates)))[:padding])
+        dates = dates[self.rank : total_dates : self.world_size]
+        for date_index in dates:
+            tiles = torch.randperm(
+                self.tiles_per_date, generator=generator
+            ).tolist()
+            base_index = date_index * self.tiles_per_date
+            for tile_index in tiles:
+                yield base_index + tile_index
+
+    def __len__(self) -> int:
+        return math.ceil(self.num_dates / self.world_size) * self.tiles_per_date
 
 
 def _build_dataloader(
@@ -263,8 +369,14 @@ def _build_dataloader(
     distributed: bool,
     rank: int,
     world_size: int,
+    phase1_cache_reader: Any | None = None,
 ) -> DataLoader:
-    base = NarrPrismDataset(config_path, mode=mode)
+    base = NarrPrismDataset(
+        config_path,
+        mode=mode,
+        cache_predictor_days=phase1_cache_reader is not None,
+        cache_target_days=phase1_cache_reader is not None,
+    )
     num_static = int(getattr(getattr(config, "model", object()), "num_static_channels", 0))
     # Compute required padding multiple: mask_unit_size × patch_size
     mask_unit = getattr(config, "mask_unit_size", [16, 16])
@@ -272,10 +384,36 @@ def _build_dataloader(
     pad_multiple = (mask_unit[0] if isinstance(mask_unit, list) else mask_unit) * (
         patch_sz[0] if isinstance(patch_sz, list) else patch_sz
     )
-    dataset = _WrappedDataset(base, num_static_channels=num_static, pad_multiple=pad_multiple)
+    dataset = _WrappedDataset(
+        base,
+        num_static_channels=num_static,
+        pad_multiple=pad_multiple,
+        phase1_cache_reader=phase1_cache_reader,
+        cache_split=mode if phase1_cache_reader is not None else None,
+    )
 
     sampler = None
-    if distributed:
+    if phase1_cache_reader is not None and shuffle:
+        tile_slices = getattr(base, "_tile_slices", None)
+        if not tile_slices:
+            raise ValueError(
+                "Phase-1 cache training requires deterministic tiled spatial sampling"
+            )
+        refinement_cfg = getattr(getattr(config, "model", object()), "refinement", {})
+        seed = (
+            refinement_cfg.get("seed", 1234)
+            if isinstance(refinement_cfg, dict)
+            else getattr(refinement_cfg, "seed", 1234)
+        )
+        sampler = _DateGroupedTileSampler(
+            num_dates=len(base.dates),
+            tiles_per_date=len(tile_slices),
+            seed=int(seed),
+            rank=rank,
+            world_size=world_size,
+        )
+        shuffle = False
+    elif distributed:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
         shuffle = False
 
@@ -296,6 +434,7 @@ def get_dataloaders(
     config: ExperimentConfig,
     rank: int = 0,
     world_size: int = 1,
+    phase1_cache_reader: Any | None = None,
 ) -> Tuple[DataLoader, DataLoader]:
     distributed = world_size > 1
     dates_cfg = getattr(config, "dates", {}) or {}
@@ -321,10 +460,12 @@ def get_dataloaders(
     train_loader = _build_dataloader(
         config_path, config, "training",
         shuffle=True, distributed=distributed, rank=rank, world_size=world_size,
+        phase1_cache_reader=phase1_cache_reader,
     )
     val_loader = _build_dataloader(
         config_path, config, validation_mode,
         shuffle=False, distributed=distributed, rank=rank, world_size=world_size,
+        phase1_cache_reader=phase1_cache_reader,
     )
     return train_loader, val_loader
 

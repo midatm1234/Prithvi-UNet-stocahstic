@@ -1,6 +1,6 @@
 # NARR–PRISM Phase-2 stochastic-refinement audit
 
-Date: 2026-08-12
+Date: 2026-08-13
 Repository branch audited: `Prithvi-UNet-stochastic_refinement`
 Environment used for every Python/test command: `Prithvi`
 
@@ -369,7 +369,7 @@ figures with shared comparison scales.
 
 ```bash
 mamba run -n Prithvi python -m pytest -q
-# 430 passed, 2 warnings in 312.69s
+# 738 passed, 1 warning in 305.36s (0:05:05)
 
 mamba run -n Prithvi python -m pytest -q \
   tests/test_refinement_evaluation.py \
@@ -482,8 +482,30 @@ For this bounded mechanics check only, residual statistics were fitted to that
 single batch and were not saved. The evidence JSON is explicitly marked
 `scientific_validation=false` (SHA-256
 `0594964adc88faf2f60dbb7182ba5977e82d48d9dcf4cc267e2eb5f8829ef6e0`).
-Production training still fits residual normalization over the complete
-1996–2013 loader before optimization.
+
+The current daily-cache implementation was additionally checked against a
+fresh, full 22-tile Phase-1 pass for real date 1996-01-01 on `cuda:1`. The
+stitched cached versus live maximum absolute differences were
+`3.71933e-05` in physical space, `4.70877e-06` for the normalized baseline,
+and `3.93391e-06` for the normalized residual; masks matched exactly, invalid
+residuals were exactly zero, and normalized reconstruction was bitwise equal to
+`baseline + residual`. The cached Diffusion Transformer initialization,
+normalizer installation and training step then completed with a finite loss
+while an assertion proved that they made zero Phase-1 calls. This one-day
+mechanics/parity record is explicitly `scientific_validation=false`; its JSON
+SHA-256 is
+`fd92fe45d9c7ee8b2b11c7bd861c1e69a6036f0d83c5a61523168f84884af996`.
+
+Production no longer repeats Phase 1 across the complete 1996--2013 loader for
+every head. The one-time, resumable `narr_prism_phase1_cache.py` workflow writes
+authenticated daily deterministic and normalized residual fields for the
+1996--2013 training and 2014--2015 validation splits. Finalization fits ordered
+per-variable mean/std/count metadata from training residuals only. Fresh
+refinement runs install those statistics and skip the live normalization scan;
+resume restores checkpoint statistics and verifies them against the manifest.
+Date-grouped tile sampling and a per-worker daily-file cache then train every
+head without a Phase-1 forward during epochs. A small configurable live parity
+check remains at startup and is not a normalization epoch.
 
 Additional tests cover residual sign, exact zero-residual reconstruction,
 normalization inversion, invalid masks, finite gradients, output dimensions,
@@ -495,13 +517,21 @@ and evaluation provenance rejection.
 
 ### Available real Phase-1 metrics
 
-The existing 2016–2025 comparison notebook contains historical Phase-1
-aggregates. They were not treated as newly measured evidence in this audit
-because those daily Phase-1 prediction files were deleted in the artifact
-incident and the old notebook cache identity was too weak. Predictor-only
-inference inputs are fully regenerated, but the deterministic prediction
-command in the production section must recreate those outputs. The historical
-aggregates are recorded only as baseline context:
+The 2016–2025 deterministic daily products have been regenerated from
+`NARR_PRISM_subdomain.yaml` and the recovered checkpoint. The external output
+directory
+`examples/NARR_PRISM/experiments/inference_output/narr_prism_California`
+contains exactly 3,653 NetCDF files from 2016-01-01 through 2025-12-31, with no
+missing, extra, duplicate or malformed dates. The complete inventory audit at
+`examples/NARR_PRISM/artifacts/recovery_provenance/2026-08-12/inference_output_audit.json`
+records the config SHA-256
+`ac333c4368d82a6afb37935557929a154b8f6c264af623a4512bada7277a5c63`
+and checkpoint SHA-256
+`1d352491ab32a4069696673f504edcd9c67d48325e83dcf3b042fe3d3eb80efa`;
+the audit JSON SHA-256 is
+`5cd45da99c2ba51596c98568d9aa99dd1d62316f0a4d9a8a5ea76c412c5e34a2`.
+The following aggregates remain historical notebook values and were not
+recomputed as part of the cache implementation audit:
 
 | Variable | Phase-1 mean | PRISM mean | Mean bias | Mean cellwise RMSE |
 | --- | ---: | ---: | ---: | ---: |
@@ -534,6 +564,11 @@ NARR–PRISM workflow:
 - `narr_prism_inference.py` (target-free deterministic daily inference,
   authenticated support masks, and isolated validation/inference splits);
 - `narr_prism_refinement.py`;
+- `narr_prism_phase1_cache.py` (one-time daily Phase-1/residual builder,
+  immutable manifest, training-only normalization statistics, validation and
+  resumable multi-GPU date sharding);
+- `narr_prism_training.py` (cache crop injection and reproducible date-grouped
+  tile sampling);
 - `narr_prism_refinement_inference.py`;
 - `evaluate_refinement.py`;
 - `refinement_smoke.py`;
@@ -548,6 +583,10 @@ Documentation and tests:
 - `tests/test_refinement_phase2_contract.py`;
 - `tests/test_narr_prism_refinement_inference.py`;
 - `tests/test_narr_prism_refinement_notebook.py`;
+- `examples/NARR_PRISM/test_narr_prism_phase1_cache.py`;
+- `tests/test_narr_prism_phase1_cache_training.py`;
+- `tests/test_narr_prism_cached_target_io.py`;
+- `tests/test_prism_training_metadata.py` (daily locality/sampler coverage);
 - `tests/test_narr_prism_target_free.py`;
 - `tests/test_refinement_evaluation.py`;
 - `tests/test_refinement_evaluation_cli.py`;
@@ -582,6 +621,15 @@ mamba run -n Prithvi python -m granitewxc.utils.prism_source_rebind \
   examples/NARR_PRISM/artifacts/recovery_provenance/2026-08-12/normalization_manifest_historical.json \
   examples/NARR_PRISM/preprocessed/narr_prism_California/scalars/normalization_manifest.json \
   examples/NARR_PRISM/artifacts/recovery_provenance/2026-08-12/source_rebind_contract.json
+
+# Build/resume this cache once. Its deterministic/scaler/grid/date contract is
+# shared by all four refinement heads. Match the GPU list to visible devices.
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_phase1_cache.py build \
+  --config examples/NARR_PRISM/NARR_PRISM_diffusion_transformer.yaml \
+  --checkpoint "$PHASE1_CKPT" --parallel-gpus 0,1,2,3
+
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_phase1_cache.py validate \
+  --cache examples/NARR_PRISM/experiments/phase1_residual_cache
 
 mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_refinement.py train \
   --config examples/NARR_PRISM/NARR_PRISM_diffusion_unet.yaml \

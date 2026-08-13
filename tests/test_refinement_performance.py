@@ -98,7 +98,9 @@ def test_gradient_checkpointing_matches_eager_gradients():
 
     eager(x, cond, t).sum().backward()
     checkpointed(x, cond, t).sum().backward()
-    for (name, a), (_, b) in zip(eager.named_parameters(), checkpointed.named_parameters()):
+    for (name, a), (_, b) in zip(
+        eager.named_parameters(), checkpointed.named_parameters(), strict=True
+    ):
         assert torch.allclose(a.grad, b.grad, atol=1e-5, rtol=1e-5), name
 
 
@@ -247,6 +249,34 @@ def test_cached_conditioning_is_refused_when_phase1_is_trainable():
     batch["__phase1_normalized"] = torch.zeros_like(batch["y"])
     with pytest.raises(RuntimeError, match="Phase 1 is trainable"):
         model.training_step(batch)
+
+
+def test_complete_daily_cache_skips_phase1_for_init_scan_and_training(monkeypatch):
+    batch = make_batch(height=16, width=16, nan_fraction=0.1)
+    reference = build("flow_matching_unet", batch)
+    _, baseline, _ = reference.run_phase1(batch)
+    residual, valid = reference.target_space.residual_target(batch["y"], baseline)
+    cached = dict(batch)
+    cached["__phase1_normalized"] = baseline.detach()
+    cached["__residual_target_normalized"] = residual.detach()
+    cached["__residual_valid_mask"] = valid.detach()
+
+    model = build(
+        "flow_matching_unet",
+        residual_normalization={"enabled": True, "epsilon": 1.0e-6},
+    )
+
+    def unexpected_phase1(*_args, **_kwargs):
+        raise AssertionError("complete cached batch unexpectedly ran Phase 1")
+
+    monkeypatch.setattr(model, "run_phase1", unexpected_phase1)
+    model.initialize_from_batch(cached)
+    metadata = model.fit_residual_normalizer([cached])
+    assert metadata["fitted"] is True
+    output = model.training_step(
+        cached, generator=torch.Generator().manual_seed(4)
+    )
+    assert torch.isfinite(output.losses["loss"])
 
 
 # ---------------------------------------------------------------------------

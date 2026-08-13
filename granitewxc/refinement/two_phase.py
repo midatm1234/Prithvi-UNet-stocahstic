@@ -306,11 +306,16 @@ class TwoPhaseDownscalingModel(nn.Module):
         self._refiner_built = True
 
     def initialize_from_batch(self, batch: Mapping[str, torch.Tensor]) -> "TwoPhaseDownscalingModel":
-        """Run one Phase-1 pass to discover the conditioning width and build Phase 2."""
+        """Discover the conditioning width and build Phase 2.
+
+        A complete precomputed batch bypasses Phase 1 here as well as in the
+        training loop, so lazy head initialization has no hidden deterministic
+        forward.
+        """
         if not self.refinement_config.is_active:
             return self
         with torch.no_grad():
-            _, normalized, features = self.run_phase1(batch)
+            _, normalized, features = self._phase1_from_batch(batch)
             cond = self.build_conditioning(batch, normalized, features)
         self.initialize_refiner(cond.shape[1])
         return self
@@ -360,6 +365,97 @@ class TwoPhaseDownscalingModel(nn.Module):
         if callable(clearer):
             clearer()
         return physical, normalized, features
+
+    def _phase1_from_batch(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Return cached Phase-1 state when supplied, otherwise run Phase 1.
+
+        ``__phase1_normalized`` is the target-space encoding of the final
+        physical prediction, including precipitation occurrence gating. It
+        must never be the Phase-1 head's ungated pre-inverse latent.
+        """
+        cached = batch.get("__phase1_normalized")
+        if cached is None:
+            return self.run_phase1(batch)
+        if not self.phase1_frozen:
+            raise RuntimeError(
+                "Cached Phase-1 conditioning cannot be used while Phase 1 is trainable."
+            )
+        if not torch.is_tensor(cached) or cached.ndim != 4:
+            raise ValueError(
+                "batch['__phase1_normalized'] must be a [B,C,H,W] tensor."
+            )
+        if int(cached.shape[1]) != self.target_space.num_channels:
+            raise ValueError(
+                "Cached Phase-1 output channel count does not match the ordered "
+                f"target contract ({cached.shape[1]} != {self.target_space.num_channels})."
+            )
+        if not bool(torch.isfinite(cached).all()):
+            raise ValueError("Cached Phase-1 normalized output contains NaN or infinity.")
+        normalized = cached.detach()
+        offset = batch.get("__output_scaler_offset", batch.get("__scaler_offset"))
+        physical = self.target_space.decode(normalized, scaler_offset=offset).detach()
+        features = {
+            name: batch[f"__phase1_feature_{name}"].detach()
+            for name in self._requested_features
+            if f"__phase1_feature_{name}" in batch
+        }
+        return physical, normalized, features
+
+    def _residual_target_from_batch(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        deterministic_normalized: torch.Tensor,
+        *,
+        scaler_offset=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a validated cached residual or construct it from the target."""
+        cached = batch.get("__residual_target_normalized")
+        if cached is None:
+            return self.target_space.residual_target(
+                batch["y"], deterministic_normalized, scaler_offset=scaler_offset
+            )
+        if batch.get("__phase1_normalized") is None:
+            raise RuntimeError(
+                "A cached residual requires the matching __phase1_normalized baseline."
+            )
+        if not torch.is_tensor(cached) or cached.shape != deterministic_normalized.shape:
+            cached_shape = tuple(cached.shape) if torch.is_tensor(cached) else None
+            raise ValueError(
+                "Cached residual shape must exactly match the deterministic baseline: "
+                f"{cached_shape} != {tuple(deterministic_normalized.shape)}."
+            )
+        target_valid = torch.isfinite(batch["y"])
+        supplied_valid = batch.get("__residual_valid_mask")
+        if supplied_valid is None:
+            valid = target_valid
+        else:
+            try:
+                valid = torch.broadcast_to(
+                    supplied_valid.to(device=cached.device, dtype=torch.bool),
+                    cached.shape,
+                )
+            except RuntimeError as exc:
+                raise ValueError(
+                    "Cached residual validity mask cannot broadcast to the residual shape."
+                ) from exc
+            if not torch.equal(valid, target_valid.to(valid.device)):
+                raise ValueError(
+                    "Cached residual validity mask differs from the current training target."
+                )
+        residual = cached.to(deterministic_normalized).detach()
+        if not bool(torch.isfinite(residual).all()):
+            raise ValueError("Cached normalized residual contains NaN or infinity.")
+        invalid_values = residual.masked_select(~valid.to(residual.device))
+        if invalid_values.numel() and not bool((invalid_values == 0).all()):
+            raise ValueError(
+                "Cached normalized residual must be exactly zero at invalid cells."
+            )
+        return (
+            torch.where(valid.to(residual.device), residual, torch.zeros_like(residual)),
+            valid,
+        )
 
     def _normalized_predictors(
         self, batch: Mapping[str, torch.Tensor], dtype: torch.dtype
@@ -489,7 +585,7 @@ class TwoPhaseDownscalingModel(nn.Module):
         return self.phase1(batch)
 
     def _prepare(self, batch: Mapping[str, torch.Tensor]):
-        physical, normalized, features = self.run_phase1(batch)
+        physical, normalized, features = self._phase1_from_batch(batch)
         if not self.refinement_config.is_active:
             return physical, normalized, None
         cond = self.build_conditioning(batch, normalized, features)
@@ -515,30 +611,11 @@ class TwoPhaseDownscalingModel(nn.Module):
         if "y" not in batch:
             raise KeyError("training_step() requires the ground truth under batch['y'].")
 
-        cached = batch.get("__phase1_normalized")
-        if cached is not None:
-            if not self.phase1_frozen:
-                raise RuntimeError(
-                    "Cached Phase-1 conditioning cannot be used while Phase 1 is trainable."
-                )
-            normalized = cached
-            physical = self.target_space.decode(
-                normalized, scaler_offset=batch.get("__output_scaler_offset")
-            )
-            features = {
-                name: batch[f"__phase1_feature_{name}"]
-                for name in self._requested_features
-                if f"__phase1_feature_{name}" in batch
-            }
-            cond = self.build_conditioning(batch, normalized, features)
-            self.initialize_refiner(cond.shape[1])
-            cond = cond.to(next(self.refiner.parameters()).dtype)
-        else:
-            physical, normalized, cond = self._prepare(batch)
+        physical, normalized, cond = self._prepare(batch)
 
         offset = batch.get("__output_scaler_offset", batch.get("__scaler_offset"))
-        target, valid = self.target_space.residual_target(
-            batch["y"], normalized, scaler_offset=offset
+        target, valid = self._residual_target_from_batch(
+            batch, normalized, scaler_offset=offset
         )
 
         training_target = self.refiner.normalize_residual(target.to(cond.dtype))
@@ -776,14 +853,14 @@ class TwoPhaseDownscalingModel(nn.Module):
                     key: value.to(device) if torch.is_tensor(value) else value
                     for key, value in batch.items()
                 }
-                _, baseline, features = self.run_phase1(moved)
+                _, baseline, features = self._phase1_from_batch(moved)
                 cond = self.build_conditioning(moved, baseline, features)
                 self.initialize_refiner(cond.shape[1])
                 offset = moved.get(
                     "__output_scaler_offset", moved.get("__scaler_offset")
                 )
-                residual, valid = self.target_space.residual_target(
-                    moved["y"], baseline, scaler_offset=offset
+                residual, valid = self._residual_target_from_batch(
+                    moved, baseline, scaler_offset=offset
                 )
                 values = residual.double()
                 valid_d = valid.double()

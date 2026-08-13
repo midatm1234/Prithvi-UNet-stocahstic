@@ -40,6 +40,7 @@ import os
 import random
 import sys
 from pathlib import Path
+from typing import Any, Mapping
 
 import numpy as np
 import torch
@@ -200,6 +201,247 @@ def _seed_training(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _load_phase1_cache(
+    *,
+    config,
+    raw_config: Mapping[str, Any],
+    phase1_checkpoint: str,
+    phase1_fingerprint: str,
+    performance,
+):
+    """Open and authenticate the immutable daily Phase-1/residual cache."""
+    cache_cfg = performance.phase1_cache
+    if not cache_cfg.enabled:
+        return None, None
+    from narr_prism_phase1_cache import Phase1ResidualCacheReader
+
+    cache_root = _resolve(cache_cfg.path)
+    try:
+        reader = Phase1ResidualCacheReader.from_path(
+            cache_root,
+            cfg=raw_config,
+            config=config,
+            phase1_checkpoint=phase1_checkpoint,
+            phase1_fingerprint=phase1_fingerprint,
+            validate_inventory=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "The configured Phase-1 residual cache is missing, incomplete, or "
+            f"incompatible: {cache_root}. Build/repair it with "
+            "`mamba run -n Prithvi python "
+            "examples/NARR_PRISM/narr_prism_phase1_cache.py build "
+            f"--config {raw_config.get('_config_path', '<refinement.yaml>')} "
+            f"--checkpoint {phase1_checkpoint}`. Original error: {exc}"
+        ) from exc
+    # The full inventory and contract were authenticated above. Avoid a second
+    # validation/open for every spatial crop inside DataLoader workers.
+    reader.validate_daily = False
+    manifest = reader.manifest
+    print(
+        "[refinement] authenticated Phase-1 residual cache: "
+        f"manifest={manifest['_manifest_path']} "
+        f"contract_digest={manifest['contract_digest']}"
+    )
+    return reader, manifest
+
+
+def _validated_cache_statistics(
+    model: TwoPhaseDownscalingModel,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the training-only residual statistics stored in a cache."""
+    from narr_prism_phase1_cache import RESIDUAL_DEFINITION, TARGET_SPACE_NAME
+
+    metadata = manifest.get("residual_normalization")
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError(
+            "A complete Phase-1 residual cache must contain training residual "
+            "normalization metadata. Re-finalize the cache."
+        )
+    expected_variables = list(manifest["contract"]["target_variables"])
+    if list(metadata.get("target_variables") or []) != expected_variables:
+        raise RuntimeError(
+            "Cache residual-normalization channel order does not match its "
+            "ordered target-variable contract."
+        )
+    if metadata.get("fit_split") != "training":
+        raise RuntimeError("Cache residual statistics were not fitted on training data.")
+    if metadata.get("space") != TARGET_SPACE_NAME:
+        raise RuntimeError("Cache uses an unsupported residual target space.")
+    if metadata.get("residual_definition") != RESIDUAL_DEFINITION:
+        raise RuntimeError("Cache uses an unsupported residual sign/definition.")
+    if not bool(metadata.get("enabled")) or not bool(metadata.get("fitted")):
+        raise RuntimeError("Cache residual-normalization metadata is not fitted.")
+    epsilon = float(metadata.get("epsilon", float("nan")))
+    configured_epsilon = float(
+        model.refinement_config.residual_normalization.epsilon
+    )
+    if not np.isfinite(epsilon) or epsilon <= 0:
+        raise RuntimeError(
+            "Cache residual-normalization epsilon must be finite and positive."
+        )
+    if not np.isfinite(configured_epsilon) or configured_epsilon <= 0:
+        raise RuntimeError(
+            "Configured residual-normalization epsilon must be finite and positive."
+        )
+    if epsilon != configured_epsilon:
+        raise RuntimeError(
+            "Cache residual-normalization epsilon does not match the refinement "
+            f"configuration ({epsilon} != {configured_epsilon})."
+        )
+    channels = model.target_space.num_channels
+    arrays = {}
+    for name, dtype in (("mean", np.float64), ("std", np.float64), ("count", np.int64)):
+        value = np.asarray(metadata.get(name), dtype=dtype)
+        if value.shape != (channels,):
+            raise RuntimeError(
+                f"Cache residual statistic {name!r} has shape {value.shape}; "
+                f"expected ({channels},)."
+            )
+        arrays[name] = value
+    if not np.isfinite(arrays["mean"]).all() or not np.isfinite(arrays["std"]).all():
+        raise RuntimeError("Cache residual mean/std contains NaN or infinity.")
+    if np.any(arrays["std"] <= 0) or np.any(arrays["count"] <= 0):
+        raise RuntimeError("Cache residual std/count must be strictly positive.")
+    return dict(metadata)
+
+
+def _install_cache_statistics(
+    model: TwoPhaseDownscalingModel,
+    metadata: Mapping[str, Any],
+) -> None:
+    """Install cache statistics in a fresh head; checkpoint buffers own resume."""
+    if not model.refinement_config.residual_normalization.enabled:
+        return
+    if model.refiner is None:
+        raise RuntimeError("Refinement head must be initialized before installing statistics.")
+    model.refiner.set_residual_normalization(
+        torch.as_tensor(metadata["mean"]),
+        torch.as_tensor(metadata["std"]),
+        torch.as_tensor(metadata["count"], dtype=torch.int64),
+    )
+    print(
+        "[refinement] installed cached training residual normalization; "
+        "the live residual-normalization scan is skipped"
+    )
+
+
+def _assert_cache_statistics_match_resume(
+    model: TwoPhaseDownscalingModel,
+    metadata: Mapping[str, Any],
+    *,
+    tolerance: float,
+) -> None:
+    """Fail if resumed checkpoint normalizers differ from the cache contract."""
+    if not model.refinement_config.residual_normalization.enabled:
+        return
+    if model.refiner is None:
+        raise RuntimeError("Resumed checkpoint did not initialize a refinement head.")
+    observed = model.refiner.residual_normalization_metadata()
+    if not bool(observed.get("fitted")):
+        raise RuntimeError("Resumed checkpoint has no fitted residual normalizer.")
+    for name in ("mean", "std"):
+        actual = np.asarray(observed[name], dtype=np.float64)
+        expected = np.asarray(metadata[name], dtype=np.float64)
+        if not np.allclose(actual, expected, rtol=0.0, atol=tolerance):
+            raise RuntimeError(
+                f"Resumed checkpoint residual {name} differs from the authenticated "
+                f"cache (max_abs={np.max(np.abs(actual - expected)):.6g}, "
+                f"tolerance={tolerance:.6g})."
+            )
+    if not np.array_equal(
+        np.asarray(observed["count"], dtype=np.int64),
+        np.asarray(metadata["count"], dtype=np.int64),
+    ):
+        raise RuntimeError("Resumed checkpoint residual counts differ from the cache.")
+    print("[refinement] resumed residual-normalization buffers match the cache")
+
+
+def _single_sample(batch: Mapping[str, Any], index: int, batch_size: int) -> dict[str, Any]:
+    result = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim and value.shape[0] == batch_size:
+            result[key] = value[index : index + 1]
+        elif isinstance(value, (list, tuple)) and len(value) == batch_size:
+            result[key] = value[index : index + 1]
+        else:
+            result[key] = value
+    return result
+
+
+@torch.no_grad()
+def _validate_phase1_cache_parity(
+    model: TwoPhaseDownscalingModel,
+    loader,
+    *,
+    device: torch.device,
+    samples: int,
+    tolerance: float,
+) -> dict[str, float]:
+    """Compare cached fields with live Phase-1 and residual construction."""
+    requested = int(samples)
+    if requested <= 0:
+        return {"samples": 0, "baseline_max_abs": 0.0, "residual_max_abs": 0.0}
+    maxima = {"baseline_max_abs": 0.0, "residual_max_abs": 0.0}
+    checked = 0
+    was_training = model.training
+    model.eval()
+    try:
+        for batch in loader:
+            batch_size = int(batch["__phase1_normalized"].shape[0])
+            for index in range(batch_size):
+                sample = _to_device(_single_sample(batch, index, batch_size), device)
+                cached_baseline = sample["__phase1_normalized"]
+                cached_residual = sample["__residual_target_normalized"]
+                cached_valid = sample["__residual_valid_mask"].bool()
+                live_batch = dict(sample)
+                live_batch.pop("__phase1_normalized")
+                live_batch.pop("__residual_target_normalized")
+                live_batch.pop("__residual_valid_mask")
+                _, live_baseline, _ = model.run_phase1(live_batch)
+                offset = live_batch.get(
+                    "__output_scaler_offset", live_batch.get("__scaler_offset")
+                )
+                live_residual, live_valid = model.target_space.residual_target(
+                    live_batch["y"], live_baseline, scaler_offset=offset
+                )
+                if not torch.equal(cached_valid, live_valid.bool()):
+                    raise RuntimeError(
+                        "Cached residual validity mask differs from live target validity."
+                    )
+                baseline_error = float(
+                    (cached_baseline - live_baseline).abs().max().detach().cpu()
+                )
+                residual_error = float(
+                    (cached_residual - live_residual).abs().max().detach().cpu()
+                )
+                maxima["baseline_max_abs"] = max(maxima["baseline_max_abs"], baseline_error)
+                maxima["residual_max_abs"] = max(maxima["residual_max_abs"], residual_error)
+                checked += 1
+                if baseline_error > tolerance or residual_error > tolerance:
+                    raise RuntimeError(
+                        "Phase-1 cache parity validation failed: "
+                        f"baseline_max_abs={baseline_error:.6g}, "
+                        f"residual_max_abs={residual_error:.6g}, "
+                        f"tolerance={tolerance:.6g}."
+                    )
+                if checked >= requested:
+                    maxima["samples"] = checked
+                    print(
+                        "[refinement] Phase-1 cache live parity: "
+                        f"samples={checked} baseline_max_abs={maxima['baseline_max_abs']:.6g} "
+                        f"residual_max_abs={maxima['residual_max_abs']:.6g} "
+                        f"tolerance={tolerance:.6g}"
+                    )
+                    return maxima
+    finally:
+        model.train(was_training)
+    raise RuntimeError(
+        f"Phase-1 cache parity requested {requested} samples but loader supplied {checked}."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -209,6 +451,7 @@ def cmd_train(args) -> int:
     config = get_config(args.config)
     device = torch.device(args.device)
     refinement = resolve_refinement_config(config)
+    performance = resolve_performance_config(config)
     # This must precede model construction, DataLoader creation/iteration and
     # lazy refiner initialization. The notebook runs this command in a child
     # process, so its parent-kernel RNG state cannot provide reproducibility.
@@ -223,13 +466,37 @@ def cmd_train(args) -> int:
         label="Phase-1 deterministic",
     )
     model, fingerprint = build_model(config, args.config, phase1_checkpoint, device)
+    raw_config = load_yaml(args.config)
+    raw_config["_config_path"] = str(Path(args.config).resolve())
 
-    train_loader, val_loader = get_dataloaders(args.config, config)
+    cache_reader, cache_manifest = _load_phase1_cache(
+        config=config,
+        raw_config=raw_config,
+        phase1_checkpoint=phase1_checkpoint,
+        phase1_fingerprint=fingerprint,
+        performance=performance,
+    )
+    train_loader, val_loader = get_dataloaders(
+        args.config, config, phase1_cache_reader=cache_reader
+    )
     probe = _to_device(_first_batch(train_loader), device)
     model.initialize_from_batch(probe)
     model.to(device)
     residual_norm = model.refinement_config.residual_normalization
-    if residual_norm.enabled and not args.resume:
+    cache_statistics = None
+    if cache_manifest is not None:
+        cache_statistics = _validated_cache_statistics(model, cache_manifest)
+        if performance.phase1_cache.validate_cache:
+            _validate_phase1_cache_parity(
+                model,
+                train_loader,
+                device=device,
+                samples=performance.phase1_cache.validate_samples,
+                tolerance=performance.phase1_cache.validate_tolerance,
+            )
+        if not args.resume:
+            _install_cache_statistics(model, cache_statistics)
+    elif residual_norm.enabled and not args.resume:
         fit_limit = int(residual_norm.fit_batches)
         print(
             "[refinement] fitting ordered per-variable residual normalization "
@@ -314,6 +581,11 @@ def cmd_train(args) -> int:
                 "effective_train_batches_per_epoch": steps,
                 "optimizer_steps_per_epoch": optimizer_steps,
                 "total_optimizer_steps": epochs * optimizer_steps,
+                "phase1_cache_contract_digest": (
+                    cache_manifest["contract_digest"]
+                    if cache_manifest is not None
+                    else None
+                ),
             },
             "case_name": get_case_name(config),
             "config_path": os.path.abspath(args.config),
@@ -330,6 +602,12 @@ def cmd_train(args) -> int:
     if args.resume:
         resume_path = args.resume if isinstance(args.resume, str) else os.path.join(checkpoint_dir, "last.ckpt")
         trainer.resume(resume_path)
+        if cache_statistics is not None:
+            _assert_cache_statistics_match_resume(
+                model,
+                cache_statistics,
+                tolerance=performance.phase1_cache.validate_tolerance,
+            )
 
     # ``epochs`` is the total run budget, not a number of extra epochs.  An
     # interrupted run therefore completes only the remaining epochs after the
