@@ -1,3 +1,4 @@
+case_name: NZ_ESD_pseudo-reality_config_small_v4
 data:
   type: cordex
   training_predictor_paths:

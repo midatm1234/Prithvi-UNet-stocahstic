@@ -177,6 +177,24 @@ Optional flags:
 | `lon` | PRISM longitude grid |
 | Variables | `ppt`, `tmax`, `tmin` (denormalized) |
 
+Do not infer completeness from the directory name alone. Resolve the artifact
+portal, inventory the exact inclusive YAML dates, and validate the first/last
+NetCDF contracts with:
+
+```bash
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_output_audit.py \
+  --config examples/NARR_PRISM/NARR_PRISM_subdomain.yaml \
+  --validation-level endpoints
+```
+
+Endpoint validation is a fast structural check, not a complete-product
+certification. After all 3,653 configured inference dates exist, rerun with
+`--validation-level all --write-manifest` to open every NetCDF and publish an
+atomic run manifest in the case directory. See
+[`NARR_PRISM_INFERENCE_OUTPUTS.md`](NARR_PRISM_INFERENCE_OUTPUTS.md) for the
+historical deletion evidence, current external location, regeneration command,
+and full all-file validation procedure.
+
 ---
 
 ### 4. Evaluate Inference

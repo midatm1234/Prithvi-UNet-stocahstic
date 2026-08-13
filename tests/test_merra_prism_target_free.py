@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -34,6 +35,43 @@ def _load_example_module(script_name: str):
         return module
     finally:
         sys.path.remove(str(MERRA_EXAMPLE_DIR))
+
+
+def test_merra_checkpoint_discovery_preserves_last_before_best(
+    tmp_path: Path,
+) -> None:
+    inference = _load_example_module("merra_prism_inference.py")
+    checkpoint_root = tmp_path / "checkpoints"
+    case_dir = checkpoint_root / "merra_case"
+    case_dir.mkdir(parents=True)
+    (case_dir / "best.ckpt").write_bytes(b"best")
+    (case_dir / "last.ckpt").write_bytes(b"last")
+
+    selected = inference._find_checkpoint(
+        {
+            "case_name": "merra_case",
+            "checkpoint_dir": str(checkpoint_root),
+        },
+        explicit=None,
+    )
+
+    assert Path(selected) == case_dir / "last.ckpt"
+
+
+def test_merra_artifact_links_are_relative_and_external() -> None:
+    expected = {
+        "experiments": Path("artifacts/experiments"),
+        "preprocessed": Path("artifacts/preprocessed"),
+        "scalars_with_H": Path("artifacts/scalars_with_H"),
+    }
+    for name, target in expected.items():
+        link = MERRA_EXAMPLE_DIR / name
+        assert link.is_symlink()
+        assert Path(os.readlink(link)) == target
+    portal = MERRA_EXAMPLE_DIR / "artifacts"
+    if os.path.lexists(portal):
+        resolved_portal = portal.resolve(strict=True)
+        assert MERRA_EXAMPLE_DIR.resolve() not in resolved_portal.parents
 
 
 def _target_free_config(tmp_path: Path, *, case_name: str = "target_free") -> dict:

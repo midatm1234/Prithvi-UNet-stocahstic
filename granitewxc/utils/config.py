@@ -1,8 +1,30 @@
 import os
 from argparse import Namespace
-from typing import List, Optional
+from typing import Optional
 
 import yaml
+
+
+# Canonical names written by ``examples/CORDEX_ML/compute_scalars_cordex.py``.
+# Keeping this small contract here lets training, inference, and the validation
+# utility resolve the same case-local files without duplicating literals.
+SCALAR_FILENAMES = {
+    "inputs_mean": "inputs_mean.npy",
+    "inputs_std": "inputs_std.npy",
+    "targets_mean": "targets_mean.npy",
+    "targets_std": "targets_std.npy",
+}
+
+CASE_SUBDIRS = ("scalars", "preproc", "checkpoints", "inference", "logs")
+
+
+class MissingCaseNameError(ValueError):
+    """Raised when a configuration omits its required ``case_name``."""
+
+
+def _clean_case_name(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
 
 class DataConfig:
     def __init__(
@@ -102,6 +124,7 @@ class ExperimentConfig:
         job_id: str = "",
         data_config: DataConfig = None,
         model_config: ModelConfig = None,
+        case_name: Optional[str] = None,
         num_epochs: int = 1,
         limit_steps_train: int = 1,
         limit_steps_valid: int = 1,
@@ -121,6 +144,7 @@ class ExperimentConfig:
         self.__dict__.update(kwargs)
 
         self.job_id = job_id
+        self.case_name = _clean_case_name(case_name)
         self.data = data_config
         self.model = model_config
         self.num_epochs = num_epochs
@@ -154,6 +178,59 @@ class ExperimentConfig:
     def path_wandb(self) -> str:
         return os.path.join(self.path_experiment, self.make_suffix_path())
 
+    def require_case_name(self) -> str:
+        """Return the configured case name or fail with an actionable error."""
+
+        name = _clean_case_name(getattr(self, "case_name", None))
+        if not name:
+            raise MissingCaseNameError(
+                "`case_name` is not defined for this config. Add `case_name: "
+                "<name>` so generated outputs can be organized under a "
+                "case-specific folder."
+            )
+        return name
+
+    @property
+    def case_dir(self) -> str:
+        """Root output directory ``<path_experiment>/<case_name>``."""
+
+        case_name = self.require_case_name()
+        base = os.path.normpath(self.path_experiment or ".")
+        # Notebook callers sometimes already pass the case directory itself.
+        if os.path.basename(base) == case_name:
+            return base
+        return os.path.join(base, case_name)
+
+    @property
+    def path_scalars(self) -> str:
+        return os.path.join(self.case_dir, "scalars")
+
+    @property
+    def path_preproc(self) -> str:
+        return os.path.join(self.case_dir, "preproc")
+
+    @property
+    def path_checkpoints(self) -> str:
+        return os.path.join(self.case_dir, "checkpoints")
+
+    @property
+    def path_inference(self) -> str:
+        return os.path.join(self.case_dir, "inference")
+
+    @property
+    def path_logs(self) -> str:
+        return os.path.join(self.case_dir, "logs")
+
+    def scalar_path(self, key: str) -> str:
+        try:
+            filename = SCALAR_FILENAMES[key]
+        except KeyError as exc:
+            raise KeyError(
+                f"Unknown scalar {key!r}; expected one of "
+                f"{sorted(SCALAR_FILENAMES)}."
+            ) from exc
+        return os.path.join(self.path_scalars, filename)
+
     def to_dict(self):
         d = self.__dict__.copy()
         d["model"] = self.model.to_dict()
@@ -178,7 +255,7 @@ class ExperimentConfig:
         )
 
     def make_folder_name(self) -> str:
-        param_folder = f"v1"
+        param_folder = "v1"
         return param_folder
 
     def make_suffix_path(self) -> str:
@@ -207,10 +284,53 @@ class ExperimentConfig:
         )
 
 
+def apply_case_output_paths(config: ExperimentConfig) -> ExperimentConfig:
+    """Apply the legacy CORDEX case-local artifact layout additively.
+
+    Explicit run-directory attributes continue to win.  Scalar paths are
+    derived only when ``derive_output_paths: true`` is explicitly selected.
+    Existing CORDEX configurations retain their configured scaler paths.
+    """
+
+    config.require_case_name()
+    data_type = str(getattr(config.data, "type", "") or "").strip().lower()
+    if data_type != "cordex":
+        # PRISM workflows authenticate and resolve their own scalar artifacts.
+        # Never repoint those paths through the legacy CORDEX case layout.
+        return config
+    if not bool(getattr(config, "derive_output_paths", False)):
+        return config
+    if config.model is not None:
+        config.model.input_mu = config.scalar_path("inputs_mean")
+        config.model.input_sigma = config.scalar_path("inputs_std")
+        config.model.target_mu = config.scalar_path("targets_mean")
+        config.model.target_sigma = config.scalar_path("targets_std")
+    if config.data is not None:
+        config.data.scalers = {
+            key: config.scalar_path(key) for key in SCALAR_FILENAMES
+        }
+
+    for attr, path in (
+        ("scalar_dir", config.path_scalars),
+        ("preproc_dir", config.path_preproc),
+        ("checkpoint_dir", config.path_checkpoints),
+        ("inference_dir", config.path_inference),
+        ("log_dir", config.path_logs),
+    ):
+        if not getattr(config, attr, None):
+            setattr(config, attr, path)
+    return config
+
+
 def get_config(config_path: str) -> ExperimentConfig:
-    cfg = yaml.safe_load(open(config_path, 'r'))
+    with open(config_path, "r", encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
     if not isinstance(cfg, dict):
         raise ValueError(f"Expected a mapping at the top level of {config_path}")
-    if not cfg.get("case_name"):
-        raise ValueError(f"case_name must be set in the YAML config: {config_path}")
-    return ExperimentConfig.from_dict(cfg)
+    if not _clean_case_name(cfg.get("case_name")):
+        raise MissingCaseNameError(
+            f"`case_name` must be defined in {config_path!r}. Add "
+            "`case_name: <name>` so generated artifacts use a case-specific "
+            "directory."
+        )
+    return apply_case_output_paths(ExperimentConfig.from_dict(cfg))

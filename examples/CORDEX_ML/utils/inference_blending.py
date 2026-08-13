@@ -23,6 +23,8 @@ class BoundaryMitigationConfig:
     force_full_frame: bool = False
     tile_size: tuple[int, int] | None = None
     overlap: tuple[int, int] = (0, 0)
+    halo: tuple[int, int] = (0, 0)
+    tile_origin: tuple[int, int] = (0, 0)
     blend_window: str = "hann"
     blend_sigma: float = 0.35
     deblock: DeblockConfig = field(default_factory=DeblockConfig)
@@ -54,10 +56,35 @@ def _to_tuple2(value: Any, default: tuple[int, int]) -> tuple[int, int]:
     return default
 
 
+def _iter_model_and_wrappers(model: torch.nn.Module):
+    """Yield the model and common DDP/compile wrappers without cycles."""
+
+    pending = [model]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        yield current
+        for attribute in ("module", "_orig_mod"):
+            candidate = getattr(current, attribute, None)
+            if candidate is not None:
+                pending.append(candidate)
+
+
+def _model_uses_diffusion(model: torch.nn.Module) -> bool:
+    return any(
+        bool(getattr(candidate, "diffusion_enabled", False))
+        for candidate in _iter_model_and_wrappers(model)
+    )
+
+
 def _resolve_model_stride(model: torch.nn.Module) -> tuple[int, int]:
-    raw = getattr(model, "mask_unit_size_px_backbone", None)
-    if isinstance(raw, (list, tuple)) and len(raw) == 2:
-        return max(1, int(raw[0])), max(1, int(raw[1]))
+    for candidate in _iter_model_and_wrappers(model):
+        raw = getattr(candidate, "mask_unit_size_px_backbone", None)
+        if isinstance(raw, (list, tuple)) and len(raw) == 2:
+            return max(1, int(raw[0])), max(1, int(raw[1]))
     return 1, 1
 
 
@@ -108,6 +135,12 @@ def resolve_boundary_mitigation_settings(config: Any) -> BoundaryMitigationConfi
     )
     overlap = (max(0, overlap[0]), max(0, overlap[1]))
 
+    halo = _to_tuple2(raw.get("halo", root.get("inference_halo")), (0, 0))
+    halo = (max(0, halo[0]), max(0, halo[1]))
+    tile_origin = _to_tuple2(
+        raw.get("tile_origin", root.get("inference_tile_origin")), (0, 0)
+    )
+
     blend_window = str(
         raw.get(
             "blend_window",
@@ -148,17 +181,24 @@ def resolve_boundary_mitigation_settings(config: Any) -> BoundaryMitigationConfi
         force_full_frame=force_full_frame,
         tile_size=tile_size,
         overlap=overlap,
+        halo=halo,
+        tile_origin=tile_origin,
         blend_window=blend_window,
         blend_sigma=blend_sigma,
         deblock=deblock,
     )
 
 
-def _compute_starts(size: int, tile: int, overlap: int) -> list[int]:
+def _compute_starts(
+    size: int, tile: int, overlap: int, origin: int = 0
+) -> list[int]:
     if tile >= size:
         return [0]
     stride = max(1, tile - overlap)
-    starts = list(range(0, max(size - tile + 1, 1), stride))
+    origin = int(origin) % stride
+    starts = list(range(origin, max(size - tile + 1, 1), stride))
+    if not starts or starts[0] != 0:
+        starts.insert(0, 0)
     last = size - tile
     if starts[-1] != last:
         starts.append(last)
@@ -303,6 +343,13 @@ def infer_batch_with_boundary_mitigation(
     if not cfg.enabled or cfg.force_full_frame:
         return _call_model_with_optional_raw(model, batch)
 
+    if _model_uses_diffusion(model):
+        raise RuntimeError(
+            "Independent tile-level diffusion is unsupported: each tile would "
+            "draw a different reverse-process noise field. Set "
+            "boundary_mitigation.force_full_frame=true."
+        )
+
     x = batch["x"]
     _, _, h, w = x.shape
 
@@ -336,8 +383,9 @@ def infer_batch_with_boundary_mitigation(
     if tile_h >= h and tile_w >= w:
         return _call_model_with_optional_raw(model, batch)
 
-    y_starts = _compute_starts(h, tile_h, overlap_h)
-    x_starts = _compute_starts(w, tile_w, overlap_w)
+    halo_h, halo_w = max(0, int(cfg.halo[0])), max(0, int(cfg.halo[1]))
+    y_starts = _compute_starts(h, tile_h, overlap_h, cfg.tile_origin[0])
+    x_starts = _compute_starts(w, tile_w, overlap_w, cfg.tile_origin[1])
     base_offset = batch.get("__scaler_offset", (0, 0))
     base_y, base_x = int(base_offset[0]), int(base_offset[1])
 
@@ -347,12 +395,34 @@ def infer_batch_with_boundary_mitigation(
         y1 = min(y0 + tile_h, h)
         for x0 in x_starts:
             x1 = min(x0 + tile_w, w)
+            context_y0 = max(0, y0 - halo_h)
+            context_y1 = min(h, y1 + halo_h)
+            context_x0 = max(0, x0 - halo_w)
+            context_x1 = min(w, x1 + halo_w)
             tile_batch = {
-                key: value[..., y0:y1, x0:x1] if torch.is_tensor(value) and value.ndim >= 4 else value
+                key: value[..., context_y0:context_y1, context_x0:context_x1]
+                if torch.is_tensor(value) and value.ndim >= 4
+                else value
                 for key, value in batch.items()
             }
-            tile_batch["__scaler_offset"] = (base_y + y0, base_x + x0)
+            tile_batch["__scaler_offset"] = (
+                base_y + context_y0,
+                base_x + context_x0,
+            )
             tile_out, tile_pre, tile_raw = _call_model_with_optional_raw(model, tile_batch)
+
+            core_y0, core_x0 = y0 - context_y0, x0 - context_x0
+            core_y1 = core_y0 + (y1 - y0)
+            core_x1 = core_x0 + (x1 - x0)
+            tile_out = tile_out[..., core_y0:core_y1, core_x0:core_x1]
+            tile_pre = tile_pre[..., core_y0:core_y1, core_x0:core_x1]
+            tile_raw = tile_raw[..., core_y0:core_y1, core_x0:core_x1]
+            expected_core = (y1 - y0, x1 - x0)
+            if tuple(tile_out.shape[-2:]) != expected_core:
+                raise RuntimeError(
+                    "Halo tile output does not match its valid core: got "
+                    f"{tuple(tile_out.shape[-2:])}, expected {expected_core}."
+                )
 
             weight = _tile_weight(
                 y1 - y0,

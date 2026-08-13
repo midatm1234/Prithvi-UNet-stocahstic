@@ -7,6 +7,7 @@ import sys
 import subprocess
 import socket
 import math
+import json
 from pathlib import Path
 from typing import Iterable, Sequence, Tuple
 
@@ -991,6 +992,165 @@ class CordexWrappedDataset(torch.utils.data.Dataset):
         return {"x": dynamic, "y": sample["y"], "static_x": static, "static_y": static}
 
 
+class CordexIndexSubset(torch.utils.data.Dataset):
+    """Index subset that preserves the wrapped dataset's ``base`` interface."""
+
+    def __init__(self, dataset: CordexWrappedDataset, indices: range):
+        self.dataset = dataset
+        self.indices = indices
+        self.base = dataset.base
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int):
+        return self.dataset[self.indices[idx]]
+
+
+def _contiguous_holdout_indices(total: int, fraction: float, role: str) -> range:
+    """Return disjoint leading-training or trailing-validation indices."""
+
+    total = int(total)
+    fraction = float(fraction)
+    if total < 2:
+        raise ValueError("A train/validation holdout requires at least two samples.")
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(
+            f"data.validation_holdout_fraction must lie in (0, 1), got {fraction}."
+        )
+    validation_count = max(1, int(round(total * fraction)))
+    validation_count = min(validation_count, total - 1)
+    split = total - validation_count
+    if role == "train":
+        return range(0, split)
+    if role == "validation":
+        return range(split, total)
+    raise ValueError(f"Unknown holdout role {role!r}.")
+
+
+def _validate_train_validation_source_paths(
+    train_predictors: Sequence[str],
+    train_targets: Sequence[str],
+    validation_predictors: Sequence[str],
+    validation_targets: Sequence[str],
+) -> bool:
+    """Return exact paired-source identity and reject any partial overlap."""
+
+    def path_identities(paths: Sequence[str]) -> list[str]:
+        return [os.path.normcase(os.path.normpath(os.fspath(path))) for path in paths]
+
+    train_predictor_ids = path_identities(train_predictors)
+    train_target_ids = path_identities(train_targets)
+    validation_predictor_ids = path_identities(validation_predictors)
+    validation_target_ids = path_identities(validation_targets)
+    sources_identical = (
+        train_predictor_ids == validation_predictor_ids
+        and train_target_ids == validation_target_ids
+    )
+    predictor_overlap = sorted(
+        set(train_predictor_ids).intersection(validation_predictor_ids)
+    )
+    target_overlap = sorted(set(train_target_ids).intersection(validation_target_ids))
+    if not sources_identical and (predictor_overlap or target_overlap):
+        raise ValueError(
+            "Training and validation source lists partially overlap. Source lists "
+            "must be either exactly identical paired lists (with a configured "
+            "contiguous-tail holdout) or fully disjoint. "
+            f"Shared predictor paths: {predictor_overlap or 'none'}; "
+            f"shared target paths: {target_overlap or 'none'}."
+        )
+    return sources_identical
+
+
+def _validate_scalar_holdout_metadata(
+    config: ExperimentConfig,
+    *,
+    source_sample_count: int,
+    training_sample_count: int,
+    holdout_fraction: float,
+    holdout_strategy: str,
+) -> dict:
+    """Fail closed unless scalar metadata proves training-only estimation."""
+
+    model_cfg = getattr(config, "model", None)
+    scalar_path = getattr(model_cfg, "target_sigma", None)
+    if scalar_path in (None, ""):
+        scalers = getattr(getattr(config, "data", None), "scalers", None)
+        if isinstance(scalers, dict):
+            scalar_path = scalers.get("targets_std")
+        else:
+            scalar_path = getattr(scalers, "targets_std", None)
+    if scalar_path in (None, ""):
+        raise ValueError(
+            "A validation holdout is configured, but no target scalar path is "
+            "available to verify training-only scalar fitting."
+        )
+
+    metadata_path = Path(_resolve_path(str(scalar_path))).parent / "metadata.json"
+    if not metadata_path.is_file():
+        raise ValueError(
+            "Validation-holdout training requires scalar selection metadata at "
+            f"{metadata_path}. Recompute scalars with compute_scalars_cordex.py."
+        )
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Scalar selection metadata is unreadable at {metadata_path}: {exc}."
+        ) from exc
+
+    selection = metadata.get("sample_selection")
+    if not isinstance(selection, dict):
+        raise ValueError(
+            "Scalar metadata predates training-only holdout selection (missing "
+            f"sample_selection in {metadata_path}). Recompute scalars; old "
+            f"metadata reports num_samples={metadata.get('num_samples')!r}, but "
+            f"the training partition contains {training_sample_count}."
+        )
+
+    expected = {
+        "policy": "leading_training_partition_excluding_contiguous_validation_tail",
+        "source_sample_count": int(source_sample_count),
+        "used_sample_count": int(training_sample_count),
+        "used_index_start": 0,
+        "used_index_stop_exclusive": int(training_sample_count),
+        "excluded_index_start": int(training_sample_count),
+        "excluded_index_stop_exclusive": int(source_sample_count),
+        "config_training_validation_sources_identical": True,
+        "validation_holdout_strategy": str(holdout_strategy),
+    }
+    mismatches = [
+        f"{key}: metadata={selection.get(key)!r}, expected={value!r}"
+        for key, value in expected.items()
+        if selection.get(key) != value
+    ]
+    try:
+        saved_fraction = float(selection.get("validation_holdout_fraction"))
+    except (TypeError, ValueError):
+        saved_fraction = float("nan")
+    if not math.isclose(
+        saved_fraction, float(holdout_fraction), rel_tol=0.0, abs_tol=1e-12
+    ):
+        mismatches.append(
+            "validation_holdout_fraction: "
+            f"metadata={selection.get('validation_holdout_fraction')!r}, "
+            f"expected={holdout_fraction!r}"
+        )
+    if metadata.get("num_samples") != int(training_sample_count):
+        mismatches.append(
+            f"num_samples: metadata={metadata.get('num_samples')!r}, "
+            f"expected={training_sample_count!r}"
+        )
+    if mismatches:
+        raise ValueError(
+            "Scalar metadata is incompatible with the configured validation "
+            "holdout; refusing leaked normalization statistics:\n  - "
+            + "\n  - ".join(mismatches)
+            + "\nRecompute scalars with compute_scalars_cordex.py."
+        )
+    return metadata
+
+
 def build_dataloader(
     config: ExperimentConfig,
     predictor_paths: Sequence[str],
@@ -1004,6 +1164,8 @@ def build_dataloader(
     crop_size: Tuple[int, int],
     random_crop: bool,
     random_crop_offset: Tuple[int, int] = (0, 0),
+    holdout_fraction: float | None = None,
+    holdout_role: str | None = None,
 ) -> DataLoader:
     predictor_paths = _resolve_paths(predictor_paths)
     target_paths = _resolve_paths(target_paths)
@@ -1025,6 +1187,18 @@ def build_dataloader(
                 "Set data.train_crop_size_lat/lon smaller than the target grid to enable crop augmentation."
             )
     dataset = CordexWrappedDataset(base_dataset)
+    if holdout_role is not None:
+        if holdout_fraction is None:
+            raise ValueError("holdout_role requires holdout_fraction.")
+        indices = _contiguous_holdout_indices(
+            len(dataset), holdout_fraction, holdout_role
+        )
+        dataset = CordexIndexSubset(dataset, indices)
+        if rank == 0:
+            print(
+                f"[data] {holdout_role} uses disjoint contiguous indices "
+                f"[{indices.start}, {indices.stop}) of {len(base_dataset)} samples."
+            )
 
     sampler = None
     if distributed:
@@ -1061,7 +1235,7 @@ def build_dataloader(
 
 def get_dataloaders(
     config: ExperimentConfig, use_gpu: bool, rank: int = 0, world_size: int = 1
-) -> Tuple[DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader | None]:
     distributed = world_size > 1
     target_crop_size = (
         int(config.data.target_size_lat),
@@ -1071,10 +1245,6 @@ def get_dataloaders(
         int(getattr(config.data, "train_crop_size_lat", target_crop_size[0])),
         int(getattr(config.data, "train_crop_size_lon", target_crop_size[1])),
     )
-    val_crop_size = (
-        int(getattr(config.data, "val_crop_size_lat", target_crop_size[0])),
-        int(getattr(config.data, "val_crop_size_lon", target_crop_size[1])),
-    )
     offset_cfg = getattr(config.data, "train_random_crop_offset", (0, 0))
     if isinstance(offset_cfg, (int, float)):
         train_random_crop_offset = (max(0, int(offset_cfg)), max(0, int(offset_cfg)))
@@ -1082,6 +1252,69 @@ def get_dataloaders(
         train_random_crop_offset = (max(0, int(offset_cfg[0])), max(0, int(offset_cfg[1])))
     else:
         train_random_crop_offset = (0, 0)
+
+    validation_enabled = bool(getattr(config, "validation_enabled", True))
+    if not validation_enabled:
+        if rank == 0:
+            print(
+                "[data] validation disabled; using 100% of the configured "
+                "training sources with no validation loader or holdout."
+            )
+        train_loader = build_dataloader(
+            config,
+            config.data.training_predictor_paths,
+            config.data.training_target_paths,
+            shuffle=True,
+            use_gpu=use_gpu,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            crop_size=train_crop_size,
+            random_crop=True,
+            random_crop_offset=train_random_crop_offset,
+            holdout_fraction=None,
+            holdout_role=None,
+        )
+        return train_loader, None
+
+    val_crop_size = (
+        int(getattr(config.data, "val_crop_size_lat", target_crop_size[0])),
+        int(getattr(config.data, "val_crop_size_lon", target_crop_size[1])),
+    )
+
+    train_predictors = _resolve_paths(config.data.training_predictor_paths)
+    train_targets = _resolve_paths(config.data.training_target_paths)
+    validation_predictors = _resolve_paths(config.data.validation_predictor_paths)
+    validation_targets = _resolve_paths(config.data.validation_target_paths)
+    sources_overlap_exactly = _validate_train_validation_source_paths(
+        train_predictors,
+        train_targets,
+        validation_predictors,
+        validation_targets,
+    )
+    holdout_fraction = float(
+        getattr(config.data, "validation_holdout_fraction", 0.0) or 0.0
+    )
+    holdout_strategy = str(
+        getattr(config.data, "validation_holdout_strategy", "contiguous_tail")
+    ).strip().lower()
+    if holdout_strategy != "contiguous_tail":
+        raise ValueError(
+            "Only data.validation_holdout_strategy='contiguous_tail' is "
+            f"implemented, got {holdout_strategy!r}."
+        )
+    if sources_overlap_exactly and not 0.0 < holdout_fraction < 1.0:
+        raise ValueError(
+            "Training and validation paths are identical, but no disjoint holdout "
+            "is configured. Set data.validation_holdout_fraction in (0, 1), or "
+            "provide separate validation files."
+        )
+    if not sources_overlap_exactly and holdout_fraction != 0.0 and rank == 0:
+        print(
+            "[data] separate validation files are configured; "
+            "data.validation_holdout_fraction is ignored."
+        )
+    shared_holdout = holdout_fraction if sources_overlap_exactly else None
 
     train_loader = build_dataloader(
         config,
@@ -1095,7 +1328,17 @@ def get_dataloaders(
         crop_size=train_crop_size,
         random_crop=True,
         random_crop_offset=train_random_crop_offset,
+        holdout_fraction=shared_holdout,
+        holdout_role="train" if shared_holdout is not None else None,
     )
+    if shared_holdout is not None:
+        _validate_scalar_holdout_metadata(
+            config,
+            source_sample_count=len(train_loader.dataset.base),
+            training_sample_count=len(train_loader.dataset),
+            holdout_fraction=shared_holdout,
+            holdout_strategy=holdout_strategy,
+        )
     val_loader = build_dataloader(
         config,
         config.data.validation_predictor_paths,
@@ -1108,6 +1351,8 @@ def get_dataloaders(
         crop_size=val_crop_size,
         random_crop=False,
         random_crop_offset=(0, 0),
+        holdout_fraction=shared_holdout,
+        holdout_role="validation" if shared_holdout is not None else None,
     )
     return train_loader, val_loader
 
@@ -1201,7 +1446,12 @@ def _build_grad_scaler(enabled: bool):
 def build_optimizer_scheduler(
     config: ExperimentConfig, model: torch.nn.Module, train_loader_length: int, use_gpu: bool
 ):
-    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("No trainable parameters are available for the optimizer.")
+    optimizer = AdamW(trainable_parameters, lr=config.learning_rate)
     scaler = _build_grad_scaler(enabled=use_gpu and torch.cuda.is_available())
     accumulation_steps = max(1, int(getattr(config, "gradient_accumulation_steps", 1)))
     steps_per_epoch = max(1, min(train_loader_length, config.limit_steps_train))

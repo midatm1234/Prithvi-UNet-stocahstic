@@ -3,6 +3,24 @@
 ## Overview
 This folder hosts the CORDEX-ML benchmark workflows for multiple regional domains—European Alps (ALPS), New Zealand (NZ), and South Africa (SA)—demonstrating how to fine-tune the Prithvi WxC UNet on coarse CORDEX predictors and produce high-resolution precipitation (`pr`) and maximum temperature (`tasmax`) forecasts. The assets here reuse the helper scripts (`preproc_cordex.py`, `compute_scalars_cordex.py`, `cordex_training.py`, and the notebooks in `notebooks/`) to cover the full loop: preprocess/regrid → compute scalars → fine-tune → inference → persist predictions as NetCDF.
 
+## Output paths and refinement compatibility
+
+Every CORDEX YAML declares an explicit `case_name`. The configuration exposes
+case-scoped helpers such as `path_scalars`, `path_preproc`, `path_checkpoints`,
+`path_inference`, and `path_logs`. Existing configurations keep their historical
+explicit scalar/checkpoint paths by default; set `derive_output_paths: true`
+only when all generated paths should be rebased under
+`<path_experiment>/<case_name>/`. This opt-in prevents an older experiment from
+silently looking in a new directory after a branch update.
+
+The legacy CORDEX score/diffusion head and its compatibility tools remain
+available. Its residual sign, checkpoint contract, ensemble inference,
+limitations, and measured audit result are documented in
+[`DIFFUSION_RESIDUAL_CORRECTION.md`](./DIFFUSION_RESIDUAL_CORRECTION.md).
+New stochastic work should use the shared `granitewxc.refinement` package and
+the explicitly named diffusion/flow-matching YAMLs; the legacy head is retained
+so existing CORDEX checkpoints and scripts remain inspectable and runnable.
+
 ## v6 Block Artifact Root-Cause Fixes
 
 The remaining coarse block patterns in `pr` and `tasmax` are now addressed in the training/inference pipeline itself, not by cosmetic post-smoothing.

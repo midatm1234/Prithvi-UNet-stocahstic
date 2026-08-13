@@ -1,3 +1,4 @@
+case_name: ALPS_T1_CNRM-CM5_no_static_v6
 data:
   type: cordex
   training_predictor_paths:

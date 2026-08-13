@@ -5,7 +5,11 @@ from granitewxc.utils.config import ExperimentConfig
 from granitewxc.utils.distributed import is_main_process
 from granitewxc.decoders.downscaling import ConvEncoderDecoder
 from granitewxc.models.finetune_model import PatchEmbed
-from granitewxc.models.cordex_finetune_model import ClimateDownscaleFinetuneUNETModel, ClimateDownscaleFinetuneModel
+from granitewxc.models.cordex_finetune_model import (
+    ClimateDownscaleFinetuneModel,
+    ClimateDownscaleFinetuneUNETModel,
+    resolve_head_type,
+)
 from granitewxc.utils.predictands import build_predictand_specs
 from PrithviWxC.model import PrithviWxCEncoderDecoder
 
@@ -362,7 +366,12 @@ def get_finetune_model(config: ExperimentConfig) -> torch.nn.Module:
     #########################################################
     # 4. Upscale after FM 
     #########################################################
-    if config.model.encoder_decoder_type == 'conv':
+    if resolve_head_type(config) == "diffusion" and not _residual_diffusion_enabled(config):
+        # Full-field diffusion replaces the deterministic decoder. Residual
+        # diffusion keeps it as the supervised baseline defining target-minus-
+        # baseline corrections.
+        head = None
+    elif config.model.encoder_decoder_type == 'conv':
         head = ConvEncoderDecoder(
                 in_channels=config.model.embed_dim,
                 channels=config.model.encoder_decoder_conv_channels,
@@ -409,3 +418,15 @@ def get_finetune_model(config: ExperimentConfig) -> torch.nn.Module:
         print(f"--> model has {total_params:,.0f} params.")
 
     return model
+
+
+def _residual_diffusion_enabled(config: ExperimentConfig) -> bool:
+    model_cfg = getattr(config, "model", None)
+    diffusion_cfg = (
+        model_cfg.get("diffusion")
+        if isinstance(model_cfg, dict)
+        else getattr(model_cfg, "diffusion", None)
+    )
+    if isinstance(diffusion_cfg, dict):
+        return bool(diffusion_cfg.get("residual_diffusion", False))
+    return bool(getattr(diffusion_cfg, "residual_diffusion", False))

@@ -4,7 +4,7 @@ Loads a trained checkpoint, runs prediction over the YAML-defined inference
 date range, denormalizes outputs, and writes NetCDF files.
 
 Usage:
-    python merra_prism_inference.py --config MERRA_PRISM_subdomain.yaml [--checkpoint path/to/best.ckpt]
+    python merra_prism_inference.py --config MERRA_PRISM_subdomain.yaml [--checkpoint path/to/last.ckpt]
 """
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from granitewxc.utils.config import get_config
-from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.normalization import (
     apply_scalar_paths,
     assert_scalars_available,
@@ -48,7 +47,6 @@ from granitewxc.utils.normalization import (
     log_case_context,
     log_scalar_summary,
     resolve_scalar_dir,
-    seam_gradient_ratio,
     targets_are_spatial,
 )
 from granitewxc.utils.prism_tiling import (
@@ -66,10 +64,8 @@ from granitewxc.utils.prism_grid import validate_prism_grid
 from merra_prism_dataset import MerraPrismDataset
 from merra_prism_utils import (
     case_output_dir,
-    expand_predictor_variables,
     get_case_name,
     load_yaml,
-    parse_date_range_from_config,
     resolve_path,
 )
 
@@ -91,7 +87,7 @@ def _find_checkpoint(cfg: Dict[str, Any], explicit: Optional[str]) -> str:
     checkpoint_dir = cfg.get("checkpoint_dir")
     if checkpoint_dir:
         case_checkpoint_dir = case_output_dir(checkpoint_dir, case_name)
-        for candidate in ("best.ckpt", "last.ckpt"):
+        for candidate in ("last.ckpt", "best.ckpt"):
             p = case_checkpoint_dir / candidate
             if p.exists():
                 return str(p)
@@ -99,17 +95,17 @@ def _find_checkpoint(cfg: Dict[str, Any], explicit: Optional[str]) -> str:
     run_dir = cfg.get("run_dir")
     if run_dir:
         case_run_dir = case_output_dir(run_dir, case_name)
-        for candidate in ("best.ckpt", "last.ckpt"):
+        for candidate in ("last.ckpt", "best.ckpt"):
             p = case_run_dir / candidate
             if p.exists():
                 return str(p)
-        for candidate in ("best.ckpt", "last.ckpt"):
+        for candidate in ("last.ckpt", "best.ckpt"):
             p = case_run_dir / "checkpoints" / candidate
             if p.exists():
                 return str(p)
 
     exp = cfg.get("path_experiment", ".")
-    for candidate in ("best.ckpt", "last.ckpt"):
+    for candidate in ("last.ckpt", "best.ckpt"):
         p = case_output_dir(resolve_path(exp) / "checkpoints", case_name) / candidate
         if p.exists():
             return str(p)
@@ -1018,7 +1014,9 @@ def run_inference(
                 )
             pair_metrics: List[Dict[str, float]] = []
             for lat0 in lat_origins:
-                for left, right in zip(lon_origins[:-1], lon_origins[1:]):
+                for left, right in zip(
+                    lon_origins[:-1], lon_origins[1:], strict=True
+                ):
                     if (lat0, left) in tile_predictions and (lat0, right) in tile_predictions:
                         pair_metrics.append(
                             overlap_disagreement(
@@ -1027,7 +1025,9 @@ def run_inference(
                             )
                         )
             for lon0 in lon_origins:
-                for top, bottom in zip(lat_origins[:-1], lat_origins[1:]):
+                for top, bottom in zip(
+                    lat_origins[:-1], lat_origins[1:], strict=True
+                ):
                     if (top, lon0) in tile_predictions and (bottom, lon0) in tile_predictions:
                         pair_metrics.append(
                             overlap_disagreement(

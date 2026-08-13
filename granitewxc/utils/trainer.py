@@ -1,6 +1,7 @@
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Dict
 
+import math
 import os
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ from tqdm.std import tqdm as terminal_tqdm
 from time import time
 
 from granitewxc.utils.distributed import is_main_process
+from granitewxc.utils.checkpoint_metadata import build_checkpoint_metadata
 
 try:
     from torch.distributed.fsdp import (
@@ -35,6 +37,21 @@ def _to_scalar(value):
             return value.detach().cpu().item()
         return value.detach().cpu().float().mean().item()
     return value
+
+
+def _default_checkpoint_dir(config) -> str:
+    """Resolve the case-scoped checkpoint directory with a legacy fallback."""
+
+    path_checkpoints = None
+    if bool(getattr(config, "derive_output_paths", False)):
+        try:
+            path_checkpoints = getattr(config, "path_checkpoints", None)
+        except (AttributeError, ValueError):
+            # Lightweight test configurations may not define a case name.
+            path_checkpoints = None
+    if path_checkpoints:
+        return str(path_checkpoints)
+    return os.path.join(config.path_experiment, "weights")
 
 
 def _loader_step_count(loader: DataLoader, limit_steps: int = 0) -> int:
@@ -143,6 +160,124 @@ def _auto_resume_enabled(config) -> bool:
     if env is not None:
         return env
     return True
+
+
+def _coerce_mapping(value) -> dict:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    if hasattr(value, "__dict__"):
+        return dict(value.__dict__)
+    return {}
+
+
+def _validation_enabled(config) -> bool:
+    """Resolve validation policy, defaulting to historical enabled behavior."""
+
+    top_level_raw = getattr(config, "validation_enabled", None)
+    top_level = _coerce_bool(top_level_raw)
+    if top_level is not None:
+        return top_level
+    if top_level_raw is not None:
+        raise ValueError(
+            "config.validation_enabled must be a boolean-like value, got "
+            f"{top_level_raw!r}."
+        )
+    training_cfg = getattr(config, "training", None)
+    nested_raw = (
+        training_cfg.get("validation_enabled")
+        if isinstance(training_cfg, dict)
+        else getattr(training_cfg, "validation_enabled", None)
+        if training_cfg is not None
+        else None
+    )
+    nested = _coerce_bool(nested_raw)
+    if nested is not None:
+        return nested
+    if nested_raw is not None:
+        raise ValueError(
+            "config.training.validation_enabled must be a boolean-like value, "
+            f"got {nested_raw!r}."
+        )
+    return True
+
+
+def _resolve_correction_validation(config, loss_func, validation_enabled: bool):
+    validation_cfg = _coerce_mapping(getattr(config, "validation", None))
+    raw_cfg = _coerce_mapping(validation_cfg.get("residual_correction"))
+    enabled_raw = raw_cfg.get("enabled", False)
+    enabled = _coerce_bool(enabled_raw)
+    if enabled is None:
+        raise ValueError(
+            "validation.residual_correction.enabled must be boolean-like, got "
+            f"{enabled_raw!r}."
+        )
+    if not enabled:
+        return None
+    if not validation_enabled:
+        raise ValueError(
+            "Residual-correction qualification requires validation_enabled=true."
+        )
+    evaluator = getattr(loss_func, "evaluate_configured_prediction", None)
+    if not callable(evaluator):
+        raise TypeError(
+            "Residual-correction validation requires a loss exposing "
+            "evaluate_configured_prediction()."
+        )
+    ensemble_size = int(raw_cfg.get("ensemble_size", 3))
+    if ensemble_size < 2:
+        raise ValueError(
+            "validation.residual_correction.ensemble_size must be at least 2."
+        )
+    application_scale = float(raw_cfg.get("application_scale", 1.0))
+    if not math.isfinite(application_scale) or application_scale != 1.0:
+        raise ValueError(
+            "A full-correction qualification requires "
+            "validation.residual_correction.application_scale=1.0."
+        )
+    minimum_relative_improvement = float(
+        getattr(loss_func, "minimum_relative_improvement", 0.0)
+    )
+    require_terms = _coerce_bool(
+        raw_cfg.get("require_each_configured_term_non_degradation", False)
+    )
+    if require_terms is None:
+        raise ValueError(
+            "validation.residual_correction."
+            "require_each_configured_term_non_degradation must be boolean-like."
+        )
+    model_cfg = _coerce_mapping(getattr(config, "model", None))
+    diffusion_cfg = _coerce_mapping(model_cfg.get("diffusion"))
+    return {
+        "ensemble_size": ensemble_size,
+        "base_seed": int(raw_cfg.get("base_seed", 42)),
+        "application_scale": application_scale,
+        "minimum_relative_improvement": minimum_relative_improvement,
+        "require_each_configured_term_non_degradation": require_terms,
+        "term_tolerance": float(raw_cfg.get("term_tolerance", 0.0)),
+        "limit_steps": int(raw_cfg.get("limit_steps", 0) or 0),
+        "sampling_method": str(diffusion_cfg.get("sampling_method", "unknown")),
+        "num_sampling_steps": int(diffusion_cfg.get("num_sampling_steps", 0) or 0),
+        "eta": float(diffusion_cfg.get("eta", 0.0) or 0.0),
+    }
+
+
+def _checkpoint_head_metadata(
+    config,
+    model,
+    *,
+    epoch: int | None = None,
+    global_step: int | None = None,
+) -> dict[str, object]:
+    return build_checkpoint_metadata(
+        config, model, epoch=epoch, global_step=global_step
+    )
+
+
+def _save_epoch_checkpoints_enabled(config) -> bool:
+    value = _coerce_bool(getattr(config, "save_epoch_checkpoints", None))
+    return True if value is None else value
 
 
 def _iter_wrapped_modules(model: torch.nn.Module):
@@ -324,6 +459,115 @@ def _inject_precip_hurdle_aux(batch: Dict[str, torch.Tensor], model: torch.nn.Mo
         batch.pop("__precip_hurdle_aux", None)
 
 
+def _inject_bernoulli_gamma_aux(
+    batch: Dict[str, torch.Tensor], model: torch.nn.Module
+) -> None:
+    """Publish BG parameter tensors through DDP/FSDP wrapper boundaries."""
+
+    aux = None
+    for candidate in _iter_wrapped_modules(model):
+        getter = getattr(candidate, "get_last_bernoulli_gamma_aux", None)
+        if callable(getter):
+            aux = getter()
+            break
+        value = getattr(candidate, "_last_bg_aux", None)
+        if value is not None:
+            aux = value
+            break
+    if aux is not None:
+        batch["__bernoulli_gamma_aux"] = aux
+    else:
+        batch.pop("__bernoulli_gamma_aux", None)
+
+
+def _last_diffusion_baseline(model: torch.nn.Module) -> torch.Tensor:
+    for candidate in _iter_wrapped_modules(model):
+        getter = getattr(candidate, "get_last_diffusion_baseline", None)
+        if callable(getter):
+            pair = getter()
+            if pair is not None:
+                physical, _ = pair
+                if torch.is_tensor(physical):
+                    return physical
+    raise RuntimeError(
+        "Diffusion sampling did not publish its paired deterministic baseline."
+    )
+
+
+def _sampled_correction_batch(
+    *,
+    batch: Dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    loss_func,
+    correction_validation: Mapping[str, object],
+    batch_index: int,
+    gpu: bool,
+) -> tuple[torch.Tensor, dict[str, float], torch.Tensor, dict[str, float]]:
+    """Score the paired baseline and actual stochastic ensemble mean."""
+
+    ensemble_size = int(correction_validation["ensemble_size"])
+    base_seed = int(correction_validation["base_seed"])
+    application_scale = float(correction_validation["application_scale"])
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    input_tensor = batch.get("x")
+    if not torch.is_tensor(input_tensor):
+        raise TypeError("Correction validation requires tensor batch['x'].")
+    device = input_tensor.device
+
+    ensemble_sum: torch.Tensor | None = None
+    baseline_physical: torch.Tensor | None = None
+    for member_index in range(ensemble_size):
+        seed = (
+            base_seed
+            + rank * 1_000_000_000
+            + batch_index * ensemble_size
+            + member_index
+        )
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+        if gpu:
+            dtype = (
+                torch.bfloat16
+                if torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
+            with autocast(device_type="cuda", dtype=dtype):
+                sampled = model(
+                    batch,
+                    return_pre_inverse=True,
+                    diffusion_generator=generator,
+                    diffusion_application_scale=application_scale,
+                )
+        else:
+            sampled = model(
+                batch,
+                return_pre_inverse=True,
+                diffusion_generator=generator,
+                diffusion_application_scale=application_scale,
+            )
+        physical_sample = sampled[0] if isinstance(sampled, tuple) else sampled
+        if not torch.is_tensor(physical_sample):
+            raise TypeError(
+                "Diffusion sampling must return a physical prediction tensor."
+            )
+        physical_sample = physical_sample.float()
+        ensemble_sum = (
+            physical_sample
+            if ensemble_sum is None
+            else ensemble_sum + physical_sample
+        )
+        if baseline_physical is None:
+            baseline_physical = _last_diffusion_baseline(model).float()
+
+    if ensemble_sum is None or baseline_physical is None:
+        raise RuntimeError("Correction validation produced no ensemble members.")
+    ensemble_mean = ensemble_sum / float(ensemble_size)
+    evaluate = loss_func.evaluate_configured_prediction
+    baseline_loss, baseline_terms = evaluate(baseline_physical, batch)
+    ensemble_loss, ensemble_terms = evaluate(ensemble_mean, batch)
+    return baseline_loss, baseline_terms, ensemble_loss, ensemble_terms
+
+
 def batch_step(
     batch: Dict[str, torch.Tensor],
     model: torch.nn.Module,
@@ -339,10 +583,12 @@ def batch_step(
         with autocast(device_type="cuda", dtype=dtype):
             prediction = model(batch)
             _inject_precip_hurdle_aux(batch, model)
+            _inject_bernoulli_gamma_aux(batch, model)
             loss = loss_func(prediction, batch)
     else:
         prediction = model(batch)
         _inject_precip_hurdle_aux(batch, model)
+        _inject_bernoulli_gamma_aux(batch, model)
         loss = loss_func(prediction, batch)
 
     return loss
@@ -356,6 +602,7 @@ def validate_one_epoch(
     epoch: int,
     gpu: bool,
     limit_steps: int = 0,
+    correction_validation: Mapping[str, object] | None = None,
 ):
     model.eval()
     ddp_loss = torch.zeros(2)
@@ -364,9 +611,15 @@ def validate_one_epoch(
     benchmark_forward = np.zeros(2)
     benchmark_total = np.zeros(2)
     benchmark_samples = 0
+    correction_batches = 0
+    correction_count = torch.zeros((), dtype=torch.float64)
+    correction_batch_count = torch.zeros((), dtype=torch.float64)
+    correction_sums: dict[str, torch.Tensor] = {}
 
     if gpu:
         ddp_loss = ddp_loss.to(local_rank)
+        correction_count = correction_count.to(local_rank)
+        correction_batch_count = correction_batch_count.to(local_rank)
     
     sampler = validation_loader.sampler
     if hasattr(sampler, 'set_epoch'):
@@ -401,6 +654,68 @@ def validate_one_epoch(
             ddp_loss[0] += loss.item()  # sum up batch loss
             ddp_loss[1] += 1
 
+            correction_limit = (
+                int(correction_validation.get("limit_steps", 0) or 0)
+                if correction_validation is not None
+                else 0
+            )
+            run_correction = correction_validation is not None and (
+                correction_limit <= 0 or correction_batches < correction_limit
+            )
+            if run_correction:
+                (
+                    baseline_configured_loss,
+                    baseline_terms,
+                    ensemble_configured_loss,
+                    ensemble_terms,
+                ) = _sampled_correction_batch(
+                    batch=batch,
+                    model=model,
+                    loss_func=loss_func,
+                    correction_validation=correction_validation,
+                    batch_index=i,
+                    gpu=gpu,
+                )
+                batch_size = int(batch["y"].shape[0])
+                correction_count += batch_size
+                correction_batch_count += 1
+                paired_values = {
+                    "baseline.total": baseline_configured_loss,
+                    "ensemble_mean.total": ensemble_configured_loss,
+                }
+                paired_values.update(
+                    {
+                        f"baseline.term.{name}": value
+                        for name, value in baseline_terms.items()
+                    }
+                )
+                paired_values.update(
+                    {
+                        f"ensemble_mean.term.{name}": value
+                        for name, value in ensemble_terms.items()
+                    }
+                )
+                for name, value in paired_values.items():
+                    scalar = (
+                        value.detach().to(
+                            device=correction_count.device, dtype=torch.float64
+                        )
+                        if isinstance(value, torch.Tensor)
+                        else torch.tensor(
+                            float(value),
+                            device=correction_count.device,
+                            dtype=torch.float64,
+                        )
+                    )
+                    if scalar.numel() != 1:
+                        raise ValueError(
+                            f"Correction validation term {name!r} is not scalar."
+                        )
+                    correction_sums.setdefault(
+                        name, torch.zeros_like(correction_count)
+                    ).add_(scalar.reshape(()) * batch_size)
+                correction_batches += 1
+
             if inner_pbar is not None:
                 inner_pbar.update(1)
                 inner_pbar.set_postfix(loss=loss.item())
@@ -415,6 +730,11 @@ def validate_one_epoch(
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+        if correction_validation is not None:
+            dist.all_reduce(correction_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(correction_batch_count, op=dist.ReduceOp.SUM)
+            for name in sorted(correction_sums):
+                dist.all_reduce(correction_sums[name], op=dist.ReduceOp.SUM)
     val_loss = ddp_loss[0] / max(ddp_loss[1], 1)
 
     if inner_pbar is not None:
@@ -426,6 +746,89 @@ def validate_one_epoch(
         'val.benchmark.total': benchmark_total[0] / benchmark_total[1],
         'val.benchmark.samples': benchmark_samples,
     }
+
+    if correction_validation is not None:
+        paired_sample_count = float(correction_count.detach().cpu().item())
+        if paired_sample_count <= 0.0:
+            raise RuntimeError(
+                "Residual-correction validation was enabled but evaluated no samples."
+            )
+        averaged = {
+            name: float((value / correction_count).detach().cpu().item())
+            for name, value in correction_sums.items()
+        }
+        baseline_total = averaged["baseline.total"]
+        ensemble_total = averaged["ensemble_mean.total"]
+        minimum_relative_improvement = float(
+            correction_validation["minimum_relative_improvement"]
+        )
+        finite = math.isfinite(baseline_total) and math.isfinite(ensemble_total)
+        total_qualified = finite and ensemble_total <= baseline_total * (
+            1.0 - minimum_relative_improvement
+        )
+        term_qualified = True
+        failed_terms: list[str] = []
+        if bool(
+            correction_validation[
+                "require_each_configured_term_non_degradation"
+            ]
+        ):
+            tolerance = float(correction_validation["term_tolerance"])
+            baseline_prefix = "baseline.term."
+            for key, baseline_value in averaged.items():
+                if not key.startswith(baseline_prefix):
+                    continue
+                term_name = key[len(baseline_prefix) :]
+                ensemble_key = f"ensemble_mean.term.{term_name}"
+                if ensemble_key not in averaged:
+                    failed_terms.append(term_name)
+                    term_qualified = False
+                    continue
+                ensemble_value = averaged[ensemble_key]
+                if (
+                    not math.isfinite(baseline_value)
+                    or not math.isfinite(ensemble_value)
+                    or ensemble_value > baseline_value + tolerance
+                ):
+                    failed_terms.append(term_name)
+                    term_qualified = False
+        qualified = total_qualified and term_qualified
+        relative_improvement = (
+            (baseline_total - ensemble_total) / max(abs(baseline_total), 1e-12)
+        )
+        metrics.update(
+            {f"val.correction.{name}": value for name, value in averaged.items()}
+        )
+        metrics.update(
+            {
+                "val.correction.relative_improvement": relative_improvement,
+                "val.correction.minimum_relative_improvement": minimum_relative_improvement,
+                "val.correction.total_qualified": float(total_qualified),
+                "val.correction.terms_qualified": float(term_qualified),
+                "val.correction.qualified": float(qualified),
+                "val.correction.failed_terms": failed_terms,
+                "val.correction.ensemble_size": int(
+                    correction_validation["ensemble_size"]
+                ),
+                "val.correction.base_seed": int(
+                    correction_validation["base_seed"]
+                ),
+                "val.correction.application_scale": float(
+                    correction_validation["application_scale"]
+                ),
+                "val.correction.sample_count": int(paired_sample_count),
+                "val.correction.batch_count": int(
+                    correction_batch_count.detach().cpu().item()
+                ),
+                "val.correction.sampling_method": str(
+                    correction_validation["sampling_method"]
+                ),
+                "val.correction.num_sampling_steps": int(
+                    correction_validation["num_sampling_steps"]
+                ),
+                "val.correction.eta": float(correction_validation["eta"]),
+            }
+        )
 
     return val_loss, metrics
 
@@ -606,6 +1009,8 @@ def save_checkpoint(
     train_loss_history: list[float] | None = None,
     val_loss_history: list[float] | None = None,
     best_val_loss: float | None = None,
+    best_correction_loss: float | None = None,
+    correction_report: Mapping[str, object] | None = None,
     checkpoint_dir: str | None = None,
     is_best: bool = False,
     save_epoch_checkpoint: bool = True,
@@ -622,7 +1027,7 @@ def save_checkpoint(
 
     checkpoint_dir = checkpoint_dir or getattr(config, "checkpoint_dir", None)
     if checkpoint_dir is None:
-        checkpoint_dir = os.path.join(config.path_experiment, "weights")
+        checkpoint_dir = _default_checkpoint_dir(config)
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -631,12 +1036,23 @@ def save_checkpoint(
         sche_state = scheduler.state_dict()
         sche_dict = {k: v for k, v in sche_state.items() if k != "anneal_func"}  # fix OneCycleLR serialization bug
 
+    scheduler_global_step = (
+        int(getattr(scheduler, "last_epoch", 0)) if scheduler is not None else None
+    )
+    metadata = _checkpoint_head_metadata(
+        config,
+        model,
+        epoch=epoch,
+        global_step=scheduler_global_step,
+    )
     state_dict = {
         "model": model_state,
         "optimizer": optimizer_state,
         "epoch": epoch,
         "loss": train_loss,
         "val_loss": curr_val_loss,
+        "validation_enabled": _validation_enabled(config),
+        "metadata": metadata,
     }
     # PRISM models have coordinate-sensitive scalers, crop offsets, and decoder
     # skip semantics that are not encoded by tensor shapes. Persist their
@@ -659,6 +1075,10 @@ def save_checkpoint(
         state_dict["val_loss_history"] = list(val_loss_history)
     if best_val_loss is not None:
         state_dict["best_val_loss"] = best_val_loss
+    if best_correction_loss is not None:
+        state_dict["best_correction_loss"] = best_correction_loss
+    if correction_report is not None:
+        state_dict["correction_qualification"] = dict(correction_report)
 
     if save_epoch_checkpoint:
         epoch_checkpoint = os.path.join(checkpoint_dir, f"epoch_{epoch + 1:03d}.ckpt")
@@ -678,6 +1098,17 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
     train_loss = []
     val_loss = []
     best_val_loss = None
+    best_correction_loss = None
+    latest_correction_report: dict[str, object] | None = None
+    validation_enabled = _validation_enabled(config)
+    if validation_enabled and val_dl is None:
+        raise ValueError(
+            "Validation is enabled but val_dl is None. Provide a validation "
+            "DataLoader or set config.validation_enabled=false explicitly."
+        )
+    correction_validation = _resolve_correction_validation(
+        config, loss_func, validation_enabled
+    )
     checkpoint_dir = getattr(config, "checkpoint_dir", None)
     start_epoch = 0
     resume_requested = bool(
@@ -688,7 +1119,7 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
     if not resume_requested and _auto_resume_enabled(config):
         probe_checkpoint_dir = checkpoint_dir
         if probe_checkpoint_dir is None:
-            probe_checkpoint_dir = os.path.join(config.path_experiment, "weights")
+            probe_checkpoint_dir = _default_checkpoint_dir(config)
         auto_resume_checkpoint = _resolve_resume_probe_checkpoint(probe_checkpoint_dir)
         if auto_resume_checkpoint is not None:
             setattr(config, "resume_training", True)
@@ -699,7 +1130,7 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
                 print(f"[resume] auto-resume enabled; found checkpoint {auto_resume_checkpoint}")
     if resume_requested:
         if checkpoint_dir is None:
-            checkpoint_dir = os.path.join(config.path_experiment, "weights")
+            checkpoint_dir = _default_checkpoint_dir(config)
         resume_checkpoint = getattr(config, "resume_checkpoint_path", None)
         if resume_checkpoint:
             resume_checkpoint = str(resume_checkpoint)
@@ -794,12 +1225,19 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
         saved_val_history = checkpoint.get("val_loss_history")
         if isinstance(saved_train_history, list):
             train_loss = [float(_to_scalar(item)) for item in saved_train_history]
-        if isinstance(saved_val_history, list):
+        if validation_enabled and isinstance(saved_val_history, list):
             val_loss = [float(_to_scalar(item)) for item in saved_val_history]
 
-        restored_best = checkpoint.get("best_val_loss", checkpoint.get("val_loss"))
-        if restored_best is not None:
-            best_val_loss = float(_to_scalar(restored_best))
+        if validation_enabled:
+            restored_best = checkpoint.get("best_val_loss", checkpoint.get("val_loss"))
+            if restored_best is not None:
+                best_val_loss = float(_to_scalar(restored_best))
+        restored_best_correction = checkpoint.get("best_correction_loss")
+        if restored_best_correction is not None:
+            best_correction_loss = float(_to_scalar(restored_best_correction))
+        restored_correction_report = checkpoint.get("correction_qualification")
+        if isinstance(restored_correction_report, Mapping):
+            latest_correction_report = dict(restored_correction_report)
 
         if is_main_process():
             print(f"[resume] loaded checkpoint: {resume_checkpoint}")
@@ -808,7 +1246,7 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
             )
 
     if checkpoint_dir is None:
-        checkpoint_dir = os.path.join(config.path_experiment, "weights")
+        checkpoint_dir = _default_checkpoint_dir(config)
 
     # Ensure a resumable checkpoint exists from the beginning of training.
     # In distributed mode this decision must be synchronized across ranks;
@@ -849,6 +1287,8 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
                 train_loss_history=train_loss,
                 val_loss_history=val_loss,
                 best_val_loss=best_val_loss,
+                best_correction_loss=best_correction_loss,
+                correction_report=latest_correction_report,
                 checkpoint_dir=checkpoint_dir,
                 is_best=False,
                 save_epoch_checkpoint=False,
@@ -893,24 +1333,41 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
                 max_grad_norm=float(getattr(config, "max_grad_norm", 0.0) or 0.0),
             )
 
-            # Free cached training allocations before validation to reduce fragmentation/OOM risk.
-            if use_gpu and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
             curr_train_loss_scalar = float(_to_scalar(curr_train_loss))
-            curr_val_loss, _ = validate_one_epoch(
-                model=model,
-                local_rank=local_rank,
-                validation_loader=val_dl,
-                loss_func=loss_func,
-                epoch=epoch,
-                gpu=use_gpu,
-                limit_steps=config.limit_steps_valid,
-            )
-            curr_val_loss_scalar = float(_to_scalar(curr_val_loss))
-
-            if use_gpu and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if validation_enabled:
+                if use_gpu and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                curr_val_loss, val_metrics = validate_one_epoch(
+                    model=model,
+                    local_rank=local_rank,
+                    validation_loader=val_dl,
+                    loss_func=loss_func,
+                    epoch=epoch,
+                    gpu=use_gpu,
+                    limit_steps=config.limit_steps_valid,
+                    correction_validation=correction_validation,
+                )
+                curr_val_loss_scalar = float(_to_scalar(curr_val_loss))
+                if correction_validation is not None:
+                    correction_metrics = {
+                        key: value
+                        for key, value in val_metrics.items()
+                        if key.startswith("val.correction.")
+                    }
+                    latest_correction_report = {
+                        "epoch": epoch,
+                        "qualified": bool(
+                            correction_metrics.get("val.correction.qualified", 0.0)
+                        ),
+                        "selection_metric": (
+                            "yaml_configured_physical_ensemble_mean_loss"
+                        ),
+                        "metrics": correction_metrics,
+                    }
+                if use_gpu and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            else:
+                curr_val_loss_scalar = float("inf")
         except Exception as exc:
             write_checkpoint = (not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0)
             must_participate = write_checkpoint or _checkpoint_requires_all_ranks(model)
@@ -920,7 +1377,9 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
                 else (float(train_loss[-1]) if train_loss else float("inf"))
             )
             fallback_val = (
-                float(curr_val_loss_scalar)
+                float("inf")
+                if not validation_enabled
+                else float(curr_val_loss_scalar)
                 if curr_val_loss_scalar is not None
                 else (float(val_loss[-1]) if val_loss else float("inf"))
             )
@@ -943,6 +1402,8 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
                         train_loss_history=train_loss,
                         val_loss_history=val_loss,
                         best_val_loss=best_val_loss,
+                        best_correction_loss=best_correction_loss,
+                        correction_report=latest_correction_report,
                         checkpoint_dir=checkpoint_dir,
                         is_best=False,
                         save_epoch_checkpoint=False,
@@ -965,14 +1426,41 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
             raise
 
         train_loss.append(curr_train_loss_scalar)
-        val_loss.append(curr_val_loss_scalar)
-
-        is_best = best_val_loss is None or curr_val_loss_scalar < best_val_loss
-        if is_best:
-            best_val_loss = curr_val_loss_scalar
+        if validation_enabled:
+            val_loss.append(curr_val_loss_scalar)
+            joint_is_best = (
+                best_val_loss is None or curr_val_loss_scalar < best_val_loss
+            )
+            if joint_is_best:
+                best_val_loss = curr_val_loss_scalar
+            if correction_validation is not None:
+                if latest_correction_report is None:
+                    raise RuntimeError(
+                        "Correction validation did not return a qualification report."
+                    )
+                correction_metrics = latest_correction_report["metrics"]
+                qualified = bool(
+                    correction_metrics["val.correction.qualified"]
+                )
+                correction_loss = float(
+                    correction_metrics["val.correction.ensemble_mean.total"]
+                )
+                is_best = qualified and (
+                    best_correction_loss is None
+                    or correction_loss < best_correction_loss
+                )
+                if is_best:
+                    best_correction_loss = correction_loss
+            else:
+                is_best = joint_is_best
+        else:
+            is_best = False
 
         save_every_n = max(1, int(save_every or 1))
-        save_epoch_checkpoint = ((epoch + 1) % save_every_n == 0) or ((epoch + 1) == config.num_epochs)
+        save_epoch_checkpoint = _save_epoch_checkpoints_enabled(config) and (
+            ((epoch + 1) % save_every_n == 0)
+            or ((epoch + 1) == config.num_epochs)
+        )
         # Always persist a resumable last.ckpt after each completed epoch.
         save_now = True
         write_checkpoint = (not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0)
@@ -990,6 +1478,8 @@ def train_model(config, model, train_dl, val_dl, optimizer, scheduler, scaler, l
                 train_loss_history=train_loss,
                 val_loss_history=val_loss,
                 best_val_loss=best_val_loss,
+                best_correction_loss=best_correction_loss,
+                correction_report=latest_correction_report,
                 checkpoint_dir=checkpoint_dir,
                 is_best=is_best,
                 save_epoch_checkpoint=save_epoch_checkpoint,

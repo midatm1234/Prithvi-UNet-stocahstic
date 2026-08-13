@@ -1,0 +1,369 @@
+case_name: SA_T2_ACCESS-CM2_static_twophase
+# Integrated two-phase fine-tuning:
+#   Phase 1  — domain-adapt the U-Net backbone (deterministic head, full training).
+#   Phase 2  — freeze the adapted U-Net and train only the residual diffusion head.
+#
+# Run via the finetune notebook with a single launch_cordex_training() call.
+# The trainer detects two_phase_training and executes both phases sequentially,
+# saving a phase-1 checkpoint and then resuming with a fresh diffusion head.
+validation_enabled: false
+save_epoch_checkpoints: false
+
+# ─── data ─────────────────────────────────────────────────────────────────────
+data:
+  type: cordex
+  training_predictor_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099_regridded.nc
+  training_target_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc
+  validation_predictor_paths: []
+  validation_target_paths: []
+  validation_holdout_fraction: 0.0
+  validation_holdout_strategy: contiguous_tail
+  test_predictor_paths: []
+  test_target_paths: []
+  static_path: D:/CORDEX/SA_domain/train/Emulator_hist_future/predictors/Static_fields.nc
+  use_static: true
+  input_vars:
+  - u
+  - v
+  - q
+  - t
+  - z
+  input_levels:
+  - 850.0
+  - 700.0
+  - 500.0
+  input_surface_vars: []
+  input_static_surface_vars:
+  - orog
+  vertical_pres_vars:
+  - u
+  - v
+  - q
+  - t
+  - z
+  vertical_level1_vars: []
+  vertical_level2_vars: []
+  other: []
+  output_vars:
+  - pr
+  - tasmax
+  input_level_pres:
+  - 850.0
+  - 700.0
+  - 500.0
+  input_level1: []
+  input_level2: []
+  n_input_timestamps: 1
+  n_random_windows: 1
+  input_size_lat: 16
+  input_size_lon: 16
+  target_size_lat: 128
+  target_size_lon: 128
+  train_crop_size_lat: 128
+  train_crop_size_lon: 128
+  crop_factor: 128
+  downsample_factor: 8
+  scalers:
+    inputs_mean: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_mean.npy
+    inputs_std: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_std.npy
+    targets_mean: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_mean.npy
+    targets_std: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_std.npy
+  train_random_crop_offset:
+  - 8
+  - 8
+
+# ─── predictands ──────────────────────────────────────────────────────────────
+predictands:
+  pr:
+    name: pr
+    allow_negative_value: false
+    nonnegativity:
+      enabled: true
+      method: softplus
+    scaling:
+      method: divide_only
+      scale_stat: p95
+      fixed_scale: null
+    normalization:
+      method: divide_only
+      mode: global
+      eps_std: 1.0e-06
+      allow_negative_value: false
+  tasmax:
+    name: tasmax
+    allow_negative_value: false
+    nonnegativity:
+      enabled: false
+      method: none
+    scaling:
+      method: standardize
+      scale_stat: mean
+      fixed_scale: null
+    normalization:
+      method: zscore
+      mode: gridpoint
+      eps_std: 1.0e-06
+
+# ─── model (shared geometry; head_type overridden per phase) ──────────────────
+model:
+  input_mu: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_mean.npy
+  input_sigma: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_std.npy
+  target_mu: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_mean.npy
+  target_sigma: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_std.npy
+  embed_dim: 1024
+  n_blocks_encoder: 8
+  mlp_multiplier: 4
+  n_heads: 16
+  dropout_rate: 0.0
+  drop_path: 0.0
+  residual: none
+  num_static_channels: 1
+  downscaling_patch_size:
+  - 2
+  - 2
+  downscaling_embed_dim: 512
+  encoder_decoder_type: conv
+  encoder_decoder_upsampling_mode: pixel_shuffle
+  encoder_decoder_kernel_size_per_stage:
+  - - 3
+  - - 3
+  encoder_decoder_scale_per_stage:
+  - - 2
+  - - 3
+  encoder_decoder_conv_channels: 128
+  residual_connection: true
+  encoder_shift: false
+  unet: true
+  static_embedding_scale: 1.0
+  static_skip_scale: 1
+  static_dropout_p: 0
+  decoder_upsampling_mode: bilinear
+  output_scaler_resize_mode: bilinear
+  output_scaler_align_corners: false
+  unet_upsample_scales: [2, 2, 2]
+  unet_decoder_kernel_size: [3, 3, 3]
+  # head_type is overridden per phase by the two-phase runner.
+  head_type: deterministic
+  bernoulli_gamma:
+    wet_threshold: 0.01
+    lambda_occurrence: 1.0
+    lambda_positive_amount: 1.0
+    min_mu: 1.0e-4
+    min_phi: 1.0e-4
+    occurrence_prob_threshold: 0.5
+    spatial_diffusion_steps: 0
+    spatial_diffusion_sigma: 1.0
+  diffusion:
+    sde: vpsde
+    beta_min: 0.1
+    beta_max: 5.0
+    sigma_min: 0.01
+    sigma_max: 50.0
+    num_scales: 1000
+    continuous: true
+    likelihood_weighting: false
+    reduce_mean: true
+    eps: 1.0e-5
+    noise_conditioning_scale: 1.0
+    sampling_method: ddim
+    eta: 0.0
+    predictor: euler_maruyama
+    corrector: none
+    snr: 0.16
+    n_corrector_steps: 1
+    num_sampling_steps: 256
+    probability_flow: false
+    denoise: true
+    sampling_eps: 1.0e-3
+    base_channels: 64
+    channel_multipliers: [1, 2, 2]
+    num_res_blocks: 2
+    time_embed_dim: 128
+    dropout: 0.1
+    fourier_scale: 16.0
+    projected_cond_channels: 128
+    residual_diffusion: true
+    residual_mean_enabled: true
+    residual_mean_channels: 64
+    prediction_type: epsilon
+    residual_application_scale: 1.0
+    padding_mode: replicate
+    zero_init_output: true
+    clean_x0_reconstruction_weight: 0.0
+    clean_x0_inverse_snr_cap: 100.0
+    residual_magnitude_guard_multiple: 5.0
+    residual_guard_min_count: 1024
+    residual_guard_mode: clip
+    conditioning_channels: null
+    output_channels: 2
+
+# ─── top-level training defaults (overridden per phase below) ─────────────────
+job_id: SA_T2_ACCESS-CM2_static_twophase
+type_training: full_dataset
+batch_size: 64
+dl_num_workers: 2
+dl_prefetch_size: 1
+limit_steps_train: 100000
+limit_steps_valid: 100
+mask_unit_size:
+- 16
+- 16
+mask_ratio_inputs: 0.0
+mask_ratio_targets: 0.0
+max_batch_size: 4
+path_experiment: ./examples/CORDEX_ML/experiments
+# Pretrained U-Net initializer; diffusion_head.* keys are always skipped.
+path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET.pt
+backbone_use: true
+backbone_freeze: false
+backbone_prefix: encoder.
+finetune_w_static: true
+strict_matching: false
+device_target: cuda
+distributed_strategy: fsdp
+fsdp_precision: bf16
+fsdp_min_num_params: 5000000
+backbone_gradient_checkpointing: true
+skip_activation_offload: true
+resume_training: false
+resume_checkpoint_path: null
+auto_resume_if_checkpoint_exists: false
+precip_model: single_head
+gradient_accumulation_steps: 32
+
+# ─── shared loss (used for both deterministic baseline and corrected mean) ────
+loss:
+  base: rmse
+  deterministic_weight: 1.0
+  diffusion:
+    weight: 1.0
+    corrected_mean_weight: 1.0
+    improvement_penalty_weight: 1.0
+    minimum_relative_improvement: 0.02
+  predictands:
+    pr:
+      distribution_loss:
+        enabled: false
+        weight: 0.0
+        method: cdf
+        bins: 100
+    tasmax:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: false
+        bins: 100
+  spatial_gradient:
+    enabled: true
+    weight: 0.03
+    predictands:
+      tasmax: 1.0
+      pr: 0.25
+    precipitation_wet_only: true
+    precipitation_wet_threshold: 0.1
+  use_gradient_loss: true
+  gradient_loss_weight: 0.03
+  use_tv_loss: false
+  tv_loss_weight: 0.0005
+  use_multiscale_loss: true
+  multiscale_loss_weight: 0.015
+  tv:
+    enabled: false
+    weight: 0.0005
+    predictands:
+      pr: 0.1
+      tasmax: 0.3
+  multiscale:
+    enabled: true
+    weight: 0.015
+    scales: [2, 4]
+    loss_type: l1
+  boundary_continuity:
+    enabled: true
+    weight: 0.01
+    predictands:
+      pr: 0.2
+      tasmax: 1.0
+    stride_lat: 16
+    stride_lon: 16
+    match_target: true
+
+# ─── inference (phase 2 result is the inference-ready model) ──────────────────
+inference:
+  ensemble_size: 5
+  base_seed: 42
+  boundary_mitigation:
+    enabled: false
+    tile_size: [96, 96]
+    overlap: [32, 32]
+    blend_mode: hann
+    halo: [32, 32]
+    tile_origin: [0, 0]
+    force_full_frame: true
+    blend_window: hann
+    blend_sigma: 0.35
+    use_seam_deblocking: false
+    seam_deblocking_strength: 0.1
+  inference_tile_size: [96, 96]
+  inference_overlap: [32, 32]
+  inference_blend_window: hann
+  inference_blend_sigma: 0.35
+  inference_halo: [32, 32]
+  inference_tile_origin: [0, 0]
+  force_full_frame: true
+  use_seam_deblocking: false
+  seam_deblocking_strength: 0.1
+
+# ─── TWO-PHASE TRAINING CONFIGURATION ────────────────────────────────────────
+# The two_phase_training block is detected by run_training; it replaces the
+# normal single-phase path with a sequential phase1 → phase2 loop.
+two_phase_training:
+  # ── Phase 1: domain-adapt the U-Net ──────────────────────────────────────
+  phase1:
+    num_epochs: 10
+    learning_rate: 1.0e-04
+    min_lr: 1.0e-06
+    warm_up_steps: 0
+    # head_type: deterministic is set automatically; diffusion is disabled.
+    # freeze_deterministic_baseline is set to false automatically.
+    gradient_accumulation_steps: 32
+    early_stopping_patience: 5
+    early_stopping_min_delta: 0.001
+    # checkpoint subdir relative to the run's checkpoint_dir
+    checkpoint_subdir: phase1_unet
+
+  # ── Phase 2: train residual diffusion head (U-Net frozen) ────────────────
+  phase2:
+    num_epochs: 25
+    learning_rate: 5.0e-05
+    min_lr: 1.0e-06
+    warm_up_steps: 0
+    # head_type: diffusion + residual_diffusion: true are set automatically.
+    # freeze_deterministic_baseline is set to true automatically.
+    gradient_accumulation_steps: 32
+    early_stopping_patience: 10
+    early_stopping_min_delta: 0.01
+    checkpoint_subdir: phase2_diffusion
+    # Override the shared loss block for Phase 2: the U-Net baseline is frozen
+    # so there is no point penalising it; only the score-matching loss matters.
+    # The improvement_penalty and corrected_mean objectives add gradient noise
+    # that overwhelms the eps_mse signal and cause flat training curves.
+    loss:
+      diffusion:
+        weight: 1.0
+        corrected_mean_weight: 0.0
+        improvement_penalty_weight: 0.0
+        minimum_relative_improvement: 0.0
+
+training:
+  distributed: fsdp
+  num_gpus: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 32
+  auto_resume_if_checkpoint_exists: false
+  freeze_deterministic_baseline: false

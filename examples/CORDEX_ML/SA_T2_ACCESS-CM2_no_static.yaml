@@ -1,3 +1,4 @@
+case_name: SA_T2_ACCESS-CM2_no_static
 data:
   type: cordex
   training_predictor_paths:

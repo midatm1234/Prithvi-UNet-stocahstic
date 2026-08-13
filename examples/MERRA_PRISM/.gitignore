@@ -1,4 +1,5 @@
 experiments/
+/artifacts
 logs/
 scalars_with_H/
 notebooks/*_executed.ipynb

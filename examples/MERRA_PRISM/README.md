@@ -4,6 +4,23 @@ This directory contains a complete YAML-driven workflow for statistical
 downscaling of **MERRA2** reanalysis predictors to the **PRISM** 800 m
 daily observation grid over the contiguous United States.
 
+## Artifact portal safety
+
+The tracked `experiments`, `preprocessed`, and `scalars_with_H` entries are
+relative symbolic links through the ignored per-clone `artifacts` portal. Do
+not replace them with absolute links back into this source directory: such a
+self-link can cause Git to remove ignored checkpoints and outputs during a
+branch checkout. Configure a clone with an external root, for example:
+
+```bash
+mkdir -p /data2/granite-wxc-artifacts/MERRA_PRISM/{experiments,preprocessed,scalars_with_H}
+ln -s /data2/granite-wxc-artifacts/MERRA_PRISM examples/MERRA_PRISM/artifacts
+```
+
+The tracked links must remain exactly `artifacts/experiments`,
+`artifacts/preprocessed`, and `artifacts/scalars_with_H`. The local `artifacts`
+portal is ignored and must never be committed.
+
 The pipeline follows a strict, case-scoped artifact contract:
 
 ```
@@ -131,7 +148,7 @@ Run inference over the YAML-defined inference date range.
 ```bash
 python merra_prism_inference.py \
     --config MERRA_PRISM_subdomain.yaml \
-    [--checkpoint path/to/best.ckpt]
+    [--checkpoint path/to/last.ckpt]
 ```
 
 Optional flags:

@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence, Tuple
+from typing import Any, Mapping, Sequence, Tuple
 
 
 def _coerce_path(value: Any) -> Path:
@@ -171,8 +171,12 @@ def resolve_run_dir(
     env_override = os.environ.get(params.env_run_name_var or "")
     run_name = env_override or params.run_name
     if not run_name:
-        job_id = getattr(config, "job_id", "nz_finetune")
-        run_name = str(job_id)
+        case_name = getattr(config, "case_name", None)
+        run_name = (
+            str(case_name)
+            if case_name
+            else str(getattr(config, "job_id", "nz_finetune"))
+        )
         append_ts = bool(getattr(config, "append_timestamp_to_run_name", False))
         env_append = os.environ.get("CORDEX_APPEND_RUN_TIMESTAMP", "").strip().lower() in {
             "1",

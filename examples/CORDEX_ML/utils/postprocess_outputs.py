@@ -6,6 +6,21 @@ import numpy as np
 import xarray as xr
 
 
+def ensemble_mean_xr(pred: xr.Dataset | xr.DataArray, *, dim: str = "ensemble") -> xr.Dataset | xr.DataArray:
+    """Return the ensemble mean for diffusion outputs, preserving attrs.
+
+    Evaluation/postprocessing callers should opt into this explicitly instead of
+    silently squeezing or dropping the ensemble dimension.
+    """
+    if dim not in pred.dims:
+        return pred
+    out = pred.mean(dim=dim, keep_attrs=True)
+    out.attrs.update(dict(pred.attrs))
+    out.attrs["ensemble_reduction"] = "mean"
+    out.attrs["ensemble_dimension"] = dim
+    return out
+
+
 def _to_stats(array: xr.DataArray) -> tuple[float, int]:
     values = np.asarray(array.values)
     valid = np.isfinite(values)
@@ -83,4 +98,3 @@ def enforce_pr_nonnegative_xr(
 
     print("[clamp] Could not locate precipitation channel in DataArray; skipping nonnegative clamp.")
     return pred
-

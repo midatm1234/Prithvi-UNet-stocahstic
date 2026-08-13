@@ -1,3 +1,4 @@
+case_name: cordex_config
 data:
   type: cordex
   training_predictor_paths:

@@ -1,0 +1,279 @@
+case_name: SA_T2_ACCESS-CM2_static_phase1_unet
+# Phase 1 of two-phase training: domain-adapt the deterministic U-Net to the
+# SA/ACCESS-CM2 CORDEX domain.  No diffusion head is instantiated.
+# Once this run converges (stable RMSE, no epoch-to-epoch oscillation), use
+# the resulting last.ckpt as path_model_weights for Phase 2.
+validation_enabled: false
+save_epoch_checkpoints: false
+data:
+  type: cordex
+  training_predictor_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099_regridded.nc
+  training_target_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc
+  validation_predictor_paths: []
+  validation_target_paths: []
+  validation_holdout_fraction: 0.0
+  validation_holdout_strategy: contiguous_tail
+  test_predictor_paths: []
+  test_target_paths: []
+  static_path: D:/CORDEX/SA_domain/train/Emulator_hist_future/predictors/Static_fields.nc
+  use_static: true
+  input_vars:
+  - u
+  - v
+  - q
+  - t
+  - z
+  input_levels:
+  - 850.0
+  - 700.0
+  - 500.0
+  input_surface_vars: []
+  input_static_surface_vars:
+  - orog
+  vertical_pres_vars:
+  - u
+  - v
+  - q
+  - t
+  - z
+  vertical_level1_vars: []
+  vertical_level2_vars: []
+  other: []
+  output_vars:
+  - pr
+  - tasmax
+  input_level_pres:
+  - 850.0
+  - 700.0
+  - 500.0
+  input_level1: []
+  input_level2: []
+  n_input_timestamps: 1
+  n_random_windows: 1
+  input_size_lat: 16
+  input_size_lon: 16
+  target_size_lat: 128
+  target_size_lon: 128
+  train_crop_size_lat: 128
+  train_crop_size_lon: 128
+  crop_factor: 128
+  downsample_factor: 8
+  scalers:
+    inputs_mean: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_residual_diffusion/scalars/inputs_mean.npy
+    inputs_std: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_residual_diffusion/scalars/inputs_std.npy
+    targets_mean: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_residual_diffusion/scalars/targets_mean.npy
+    targets_std: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_residual_diffusion/scalars/targets_std.npy
+  train_random_crop_offset:
+  - 8
+  - 8
+predictands:
+  pr:
+    name: pr
+    allow_negative_value: false
+    nonnegativity:
+      enabled: true
+      method: softplus
+    scaling:
+      method: divide_only
+      scale_stat: p95
+      fixed_scale: null
+    normalization:
+      method: divide_only
+      mode: global
+      eps_std: 1.0e-06
+      allow_negative_value: false
+  tasmax:
+    name: tasmax
+    allow_negative_value: false
+    nonnegativity:
+      enabled: false
+      method: none
+    scaling:
+      method: standardize
+      scale_stat: mean
+      fixed_scale: null
+    normalization:
+      method: zscore
+      mode: gridpoint
+      eps_std: 1.0e-06
+model:
+  input_mu: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_residual_diffusion/scalars/inputs_mean.npy
+  input_sigma: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_residual_diffusion/scalars/inputs_std.npy
+  target_mu: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_residual_diffusion/scalars/targets_mean.npy
+  target_sigma: ./examples/CORDEX_ML/experiments/SA_T2_ACCESS-CM2_static_residual_diffusion/scalars/targets_std.npy
+  embed_dim: 1024
+  n_blocks_encoder: 8
+  mlp_multiplier: 4
+  n_heads: 16
+  dropout_rate: 0.0
+  drop_path: 0.0
+  residual: none
+  num_static_channels: 1
+  downscaling_patch_size:
+  - 2
+  - 2
+  downscaling_embed_dim: 512
+  encoder_decoder_type: conv
+  encoder_decoder_upsampling_mode: pixel_shuffle
+  encoder_decoder_kernel_size_per_stage:
+  - - 3
+  - - 3
+  encoder_decoder_scale_per_stage:
+  - - 2
+  - - 3
+  encoder_decoder_conv_channels: 128
+  residual_connection: true
+  encoder_shift: false
+  unet: true
+  static_embedding_scale: 1.0
+  static_skip_scale: 1
+  static_dropout_p: 0
+  decoder_upsampling_mode: bilinear
+  output_scaler_resize_mode: bilinear
+  output_scaler_align_corners: false
+  unet_upsample_scales: [2, 2, 2]
+  unet_decoder_kernel_size: [3, 3, 3]
+  # Deterministic head only — no diffusion branch.
+  head_type: deterministic
+  bernoulli_gamma:
+    wet_threshold: 0.01
+    lambda_occurrence: 1.0
+    lambda_positive_amount: 1.0
+    min_mu: 1.0e-4
+    min_phi: 1.0e-4
+    occurrence_prob_threshold: 0.5
+    spatial_diffusion_steps: 0
+    spatial_diffusion_sigma: 1.0
+job_id: SA_T2_ACCESS-CM2_static_phase1_unet
+type_training: full_dataset
+batch_size: 64
+num_epochs: 10
+dl_num_workers: 2
+dl_prefetch_size: 1
+learning_rate: 5.0e-05
+limit_steps_train: 100000
+limit_steps_valid: 100
+min_lr: 1.0e-06
+max_lr: 0.0001
+warm_up_steps: 0
+mask_unit_size:
+- 16
+- 16
+mask_ratio_inputs: 0.0
+mask_ratio_targets: 0.0
+max_batch_size: 8
+path_experiment: ./examples/CORDEX_ML/experiments
+# Initialize backbone from the pretrained WxC weights; train all U-Net
+# parameters (backbone + decoder + output head) from scratch for this domain.
+path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET.pt
+backbone_use: true
+backbone_freeze: false
+backbone_prefix: encoder.
+finetune_w_static: true
+strict_matching: false
+device_target: cuda
+distributed_strategy: fsdp
+fsdp_precision: bf16
+fsdp_min_num_params: 5000000
+backbone_gradient_checkpointing: true
+skip_activation_offload: true
+inference:
+  ensemble_size: 1
+  base_seed: 42
+  boundary_mitigation:
+    enabled: false
+    tile_size: [96, 96]
+    overlap: [32, 32]
+    blend_mode: hann
+    halo: [32, 32]
+    tile_origin: [0, 0]
+    force_full_frame: true
+    blend_window: hann
+    blend_sigma: 0.35
+    use_seam_deblocking: false
+    seam_deblocking_strength: 0.1
+  inference_tile_size: [96, 96]
+  inference_overlap: [32, 32]
+  inference_blend_window: hann
+  inference_blend_sigma: 0.35
+  inference_halo: [32, 32]
+  inference_tile_origin: [0, 0]
+  force_full_frame: true
+  use_seam_deblocking: false
+  seam_deblocking_strength: 0.1
+training:
+  distributed: fsdp
+  num_gpus: 1
+  # Larger per-device batch fits comfortably on the 96 GB GPU in Phase 1
+  # (no diffusion head). Accumulation steps reduced proportionally so the
+  # effective batch size stays at 32 (8 × 4 = 32).
+  per_device_batch_size: 8
+  gradient_accumulation_steps: 4
+  auto_resume_if_checkpoint_exists: false
+  freeze_deterministic_baseline: false
+gradient_accumulation_steps: 4
+resume_training: false
+resume_checkpoint_path: null
+precip_model: single_head
+loss:
+  base: rmse
+  deterministic_weight: 1.0
+  # Diffusion weights are all zero — no score head exists in Phase 1.
+  diffusion:
+    weight: 0.0
+    corrected_mean_weight: 0.0
+    improvement_penalty_weight: 0.0
+    minimum_relative_improvement: 0.0
+  predictands:
+    pr:
+      distribution_loss:
+        enabled: false
+        weight: 0.0
+        method: cdf
+        bins: 100
+    tasmax:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: false
+        bins: 100
+  spatial_gradient:
+    enabled: true
+    weight: 0.03
+    predictands:
+      tasmax: 1.0
+      pr: 0.25
+    precipitation_wet_only: true
+    precipitation_wet_threshold: 0.1
+  use_gradient_loss: true
+  gradient_loss_weight: 0.03
+  use_tv_loss: false
+  tv_loss_weight: 0.0005
+  use_multiscale_loss: true
+  multiscale_loss_weight: 0.015
+  tv:
+    enabled: false
+    weight: 0.0005
+    predictands:
+      pr: 0.1
+      tasmax: 0.3
+  multiscale:
+    enabled: true
+    weight: 0.015
+    scales: [2, 4]
+    loss_type: l1
+  boundary_continuity:
+    enabled: true
+    weight: 0.01
+    predictands:
+      pr: 0.2
+      tasmax: 1.0
+    stride_lat: 16
+    stride_lon: 16
+    match_target: true
+auto_resume_if_checkpoint_exists: false

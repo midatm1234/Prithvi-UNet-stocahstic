@@ -101,12 +101,42 @@ def _canonicalize_precip_model(value: Any) -> str:
         "bernoulli_plus_positive": "hurdle",
         "bernoulli_positive_amount": "hurdle",
         "bernoulli-plus-positive-amount": "hurdle",
+        "bernoulli_gamma": "bernoulli_gamma",
+        "bernoulli-gamma": "bernoulli_gamma",
+        "bg": "bernoulli_gamma",
+        "zero_inflated_gamma": "bernoulli_gamma",
     }
     if text not in aliases:
         raise ValueError(
             f"Unsupported precip_model '{value}'. Expected one of {sorted(aliases)}."
         )
     return aliases[text]
+
+
+def _resolve_bernoulli_gamma_index(
+    output_vars: list[str], cfg: Mapping[str, Any]
+) -> int:
+    """Return the physical precipitation channel modeled by the BG head."""
+
+    precip_model = _canonicalize_precip_model(
+        cfg.get("precip_model", cfg.get("precip_head_type", "single_head"))
+    )
+    if precip_model != "bernoulli_gamma":
+        return -1
+    precip_index = next(
+        (
+            idx
+            for idx, name in enumerate(output_vars)
+            if str(name).lower() in PRECIP_VAR_NAMES
+        ),
+        -1,
+    )
+    if precip_index < 0:
+        raise ValueError(
+            "precip_model='bernoulli_gamma' requires a precipitation output "
+            "variable (e.g. 'pr')."
+        )
+    return precip_index
 
 
 def _resolve_precip_hurdle_spec(output_vars: list[str], cfg: Mapping[str, Any]) -> PrecipHurdleLossSpec | None:
@@ -162,6 +192,31 @@ class CompositePredictandLoss:
                 self._amount_loss_fn = nn.MSELoss(reduction="mean")
             else:
                 self._amount_loss_fn = nn.SmoothL1Loss(reduction="mean")
+
+        self._bg_precip_index = _resolve_bernoulli_gamma_index(
+            self.output_vars, cfg
+        )
+        self._bg_loss = None
+        if self._bg_precip_index >= 0:
+            from granitewxc.models.bernoulli_gamma_head import (
+                BernoulliGammaConfig,
+                BernoulliGammaLoss,
+            )
+
+            bg_config = BernoulliGammaConfig(
+                wet_threshold=float(cfg.get("precip_wet_threshold", 0.1)),
+                lambda_occurrence=float(
+                    cfg.get("precip_lambda_occurrence", 1.0)
+                ),
+                lambda_positive_amount=float(
+                    cfg.get("precip_lambda_amount", 1.0)
+                ),
+                min_mu=float(cfg.get("precip_bg_min_mu", 1e-4)),
+                min_phi=float(cfg.get("precip_bg_min_phi", 1e-4)),
+            )
+            self._bg_loss = BernoulliGammaLoss(
+                config=bg_config, output_vars=self.output_vars
+            )
 
         predictand_cfg = _coerce_mapping(cfg.get("predictands"))
         self._dist_specs: dict[int, DistributionLossSpec] = {}
@@ -532,11 +587,15 @@ class CompositePredictandLoss:
         return total / total_weight
 
     def _base_rmse(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if self._precip_hurdle is None:
+        excluded: set[int] = set()
+        if self._precip_hurdle is not None:
+            excluded.add(self._precip_hurdle.precip_index)
+        if self._bg_precip_index >= 0:
+            excluded.add(self._bg_precip_index)
+        if not excluded:
             return torch.sqrt(torch.mean((pred - target) ** 2))
 
-        precip_idx = self._precip_hurdle.precip_index
-        keep_indices = [idx for idx in range(pred.shape[1]) if idx != precip_idx]
+        keep_indices = [idx for idx in range(pred.shape[1]) if idx not in excluded]
         if not keep_indices:
             return torch.zeros((), device=pred.device, dtype=pred.dtype)
         pred_non_precip = pred[:, keep_indices, ...]
@@ -552,9 +611,13 @@ class CompositePredictandLoss:
         target cells (PRISM ocean / outside-CONUS, ~44%) must not contribute to
         the loss; otherwise the model is trained to predict zeros there.
         """
+        excluded: set[int] = set()
         if self._precip_hurdle is not None:
-            precip_idx = self._precip_hurdle.precip_index
-            keep_indices = [idx for idx in range(pred.shape[1]) if idx != precip_idx]
+            excluded.add(self._precip_hurdle.precip_index)
+        if self._bg_precip_index >= 0:
+            excluded.add(self._bg_precip_index)
+        if excluded:
+            keep_indices = [idx for idx in range(pred.shape[1]) if idx not in excluded]
             if not keep_indices:
                 return torch.zeros((), device=pred.device, dtype=pred.dtype)
             pred = pred[:, keep_indices, ...]
@@ -644,6 +707,46 @@ class CompositePredictandLoss:
         }
         return total, terms
 
+    def _compute_bernoulli_gamma_loss(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        assert self._bg_precip_index >= 0
+        assert self._bg_loss is not None
+        aux = batch.get("__bernoulli_gamma_aux")
+        if not isinstance(aux, Mapping):
+            raise ValueError(
+                "precip_model='bernoulli_gamma' requires model auxiliary "
+                "outputs in batch['__bernoulli_gamma_aux']."
+            )
+        required = ("logit_wet", "log_mu", "log_phi")
+        if any(not torch.is_tensor(aux.get(name)) for name in required):
+            raise ValueError(
+                "batch['__bernoulli_gamma_aux'] must contain tensors: "
+                "logit_wet, log_mu, log_phi."
+            )
+
+        target = batch["y"][:, self._bg_precip_index, ...]
+        valid_mask = batch.get("__valid_mask")
+        if torch.is_tensor(valid_mask):
+            valid_mask = valid_mask[:, self._bg_precip_index, ...]
+        else:
+            valid_mask = torch.isfinite(target)
+        if not bool(valid_mask.any().item()):
+            zero = aux["logit_wet"].sum() * 0.0
+            return zero, {
+                "bg.occurrence_bce": 0.0,
+                "bg.positive_gamma_nll": 0.0,
+                "bg.total": 0.0,
+            }
+        loss = self._bg_loss(
+            aux["logit_wet"],
+            aux["log_mu"],
+            aux["log_phi"],
+            target,
+            validity_mask=valid_mask,
+        )
+        return loss, self._bg_loss.get_last_terms()
+
     def __call__(self, y_hat: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         raw_target = batch["y"]
 
@@ -688,10 +791,17 @@ class CompositePredictandLoss:
             total = total + precip_loss
             terms.update(precip_terms)
 
+        if self._bg_precip_index >= 0:
+            bg_loss, bg_terms = self._compute_bernoulli_gamma_loss(batch)
+            total = total + bg_loss
+            terms.update(bg_terms)
+
         for ch_idx, spec in self._dist_specs.items():
             if not spec.enabled or spec.weight <= 0.0:
                 continue
             if self._precip_hurdle is not None and ch_idx == self._precip_hurdle.precip_index:
+                continue
+            if self._bg_precip_index >= 0 and ch_idx == self._bg_precip_index:
                 continue
             ch_valid = valid[:, ch_idx, ...]
             if not bool(ch_valid.any().item()):
@@ -805,10 +915,61 @@ class CompositePredictandLoss:
             }
         else:
             payload["precip_hurdle"] = {"enabled": False}
+        if self._bg_loss is not None:
+            bg_cfg = self._bg_loss.cfg
+            payload["bernoulli_gamma"] = {
+                "enabled": True,
+                "precip_index": self._bg_precip_index,
+                "wet_threshold": bg_cfg.wet_threshold,
+                "lambda_occurrence": bg_cfg.lambda_occurrence,
+                "lambda_positive_amount": bg_cfg.lambda_positive_amount,
+                "min_mu": bg_cfg.min_mu,
+                "min_phi": bg_cfg.min_phi,
+            }
+        else:
+            payload["bernoulli_gamma"] = {"enabled": False}
         return payload
 
 
+def _head_type_is_diffusion(config: Any) -> bool:
+    model_cfg = getattr(config, "model", None)
+    if model_cfg is None:
+        return False
+    raw = getattr(model_cfg, "head_type", None)
+    if raw is None:
+        raw = getattr(model_cfg, "decoder_type", None)
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in {
+        "diffusion",
+        "diffusion_head",
+        "sde",
+        "score",
+        "score_sde",
+    }
+
+
+def _residual_diffusion_enabled(config: Any) -> bool:
+    model_cfg = getattr(config, "model", None)
+    if isinstance(model_cfg, Mapping):
+        diffusion_cfg = model_cfg.get("diffusion")
+    else:
+        diffusion_cfg = (
+            getattr(model_cfg, "diffusion", None)
+            if model_cfg is not None
+            else None
+        )
+    return bool(_coerce_mapping(diffusion_cfg).get("residual_diffusion", False))
+
+
 def build_loss_fn(config: Any, output_vars: list[str]):
+    is_diffusion = _head_type_is_diffusion(config)
+    is_residual_diffusion = is_diffusion and _residual_diffusion_enabled(config)
+    if is_diffusion and not is_residual_diffusion:
+        from granitewxc.models.diffusion_loss import DiffusionLossPassthrough
+
+        return DiffusionLossPassthrough(output_vars=output_vars)
+
     loss_cfg = _coerce_mapping(getattr(config, "loss", {}))
     merged_cfg = dict(loss_cfg)
     for key in (
@@ -818,6 +979,8 @@ def build_loss_fn(config: Any, output_vars: list[str]):
         "precip_lambda_occurrence",
         "precip_lambda_amount",
         "precip_amount_loss_type",
+        "precip_bg_min_mu",
+        "precip_bg_min_phi",
         "use_gradient_loss",
         "gradient_loss_weight",
         "use_tv_loss",
@@ -830,9 +993,70 @@ def build_loss_fn(config: Any, output_vars: list[str]):
     if "mask_unit_size" not in merged_cfg and hasattr(config, "mask_unit_size"):
         merged_cfg["mask_unit_size"] = getattr(config, "mask_unit_size")
 
+    model_cfg = getattr(config, "model", None)
+    bg_cfg = _coerce_mapping(
+        getattr(model_cfg, "bernoulli_gamma", None)
+        if model_cfg is not None
+        else None
+    )
+    for loss_key, bg_key in (
+        ("precip_wet_threshold", "wet_threshold"),
+        ("precip_lambda_occurrence", "lambda_occurrence"),
+        ("precip_lambda_amount", "lambda_positive_amount"),
+        ("precip_bg_min_mu", "min_mu"),
+        ("precip_bg_min_phi", "min_phi"),
+    ):
+        if loss_key not in merged_cfg and bg_key in bg_cfg:
+            merged_cfg[loss_key] = bg_cfg[bg_key]
+
     precip_model = _canonicalize_precip_model(
         merged_cfg.get("precip_model", merged_cfg.get("precip_head_type", "single_head"))
     )
-    if not loss_cfg and precip_model != "hurdle":
+    if (
+        not is_residual_diffusion
+        and not loss_cfg
+        and precip_model not in {"hurdle", "bernoulli_gamma"}
+    ):
         return rmse_loss
-    return CompositePredictandLoss(output_vars=output_vars, loss_cfg=merged_cfg)
+    deterministic_loss = CompositePredictandLoss(
+        output_vars=output_vars, loss_cfg=merged_cfg
+    )
+
+    if is_residual_diffusion:
+        from granitewxc.models.diffusion_loss import JointResidualDiffusionLoss
+
+        diffusion_loss_cfg = _coerce_mapping(loss_cfg.get("diffusion"))
+        joint_loss = JointResidualDiffusionLoss(
+            deterministic_loss=deterministic_loss,
+            output_vars=output_vars,
+            deterministic_weight=float(loss_cfg.get("deterministic_weight", 1.0)),
+            diffusion_weight=float(diffusion_loss_cfg.get("weight", 1.0)),
+            corrected_mean_weight=diffusion_loss_cfg.get(
+                "corrected_mean_weight", 0.0
+            ),
+            improvement_penalty_weight=diffusion_loss_cfg.get(
+                "improvement_penalty_weight", 0.0
+            ),
+            minimum_relative_improvement=diffusion_loss_cfg.get(
+                "minimum_relative_improvement", 0.0
+            ),
+        )
+        correction_objective_enabled = (
+            joint_loss.corrected_mean_weight > 0.0
+            or joint_loss.improvement_penalty_weight > 0.0
+        )
+        has_precipitation = any(
+            str(name).lower() in PRECIP_VAR_NAMES for name in output_vars
+        )
+        if (
+            correction_objective_enabled
+            and has_precipitation
+            and precip_model != "single_head"
+        ):
+            raise ValueError(
+                "YAML-enabled corrected-mean supervision requires "
+                "precip_model='single_head' when precipitation is an output."
+            )
+        return joint_loss
+
+    return deterministic_loss

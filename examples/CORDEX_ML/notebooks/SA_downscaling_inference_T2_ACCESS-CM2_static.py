@@ -7,6 +7,8 @@ inference runs without editing the script each time.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import sys
@@ -35,6 +37,11 @@ from cordex_inference import CordexWrappedDataset, build_inference_dataset, buil
 from utils.nearest_fill import repair_invalid_by_nearest_xr, summarize_invalid_counts_xr  # noqa: E402
 from utils.predictand_runtime import assert_nonnegative_outputs, resolve_predictand_specs  # noqa: E402
 from utils.inference_blending import infer_batch_with_boundary_mitigation, resolve_boundary_mitigation_settings  # noqa: E402
+from utils.diffusion_inference import (  # noqa: E402
+    add_predictions_to_dataset,
+    infer_batch_ensemble,
+    reset_ensemble_generators,
+)
 from utils.quantization_diagnostics import (  # noqa: E402
     RunningStats,
     format_compact_table,
@@ -53,12 +60,580 @@ from granitewxc.utils.config import get_config  # noqa: E402
 from sa_params import (  # noqa: E402
     UserParams,
     export_params,
-    resolve_checkpoint,
-    resolve_existing_run_dir,
     validate_paths,
 )
-from run_utils import assert_no_eccc_reference, load_run_manifest  # noqa: E402
+from run_utils import assert_no_eccc_reference  # noqa: E402
 
+
+_CANONICAL_TARGET_UNITS = {
+    "pr": "mm/day",
+    "tasmax": "K",
+}
+
+
+def _iter_runtime_model_wrappers(model: torch.nn.Module):
+    """Yield a model and common DDP/compile wrappers without following cycles."""
+
+    pending = [model]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        yield current
+        for attribute in ("module", "_orig_mod"):
+            candidate = getattr(current, attribute, None)
+            if candidate is not None:
+                pending.append(candidate)
+
+
+def _runtime_model_with_attribute(
+    model: torch.nn.Module, attribute: str
+) -> torch.nn.Module:
+    return next(
+        (
+            candidate
+            for candidate in _iter_runtime_model_wrappers(model)
+            if hasattr(candidate, attribute)
+        ),
+        model,
+    )
+
+
+def _normalized_unit_token(value: object) -> str:
+    """Return a conservative token used only for supported-unit lookup."""
+
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="strict")
+    text = str(value).strip().lower()
+    text = (
+        text.replace("−", "-")
+        .replace("⁻", "-")
+        .replace("²", "2")
+        .replace("·", "")
+        .replace("**", "^")
+    )
+    return "".join(text.split())
+
+
+def _target_unit_rule(var_name: str, source_units: object) -> dict[str, object]:
+    """Resolve one explicitly supported source-to-canonical conversion."""
+
+    name = str(var_name).strip().lower()
+    token = _normalized_unit_token(source_units)
+    if name == "pr":
+        flux_tokens = {
+            "kgm-2s-1",
+            "kgm^-2s^-1",
+            "kg/m2/s",
+            "mms-1",
+            "mms^-1",
+            "mm/s",
+        }
+        daily_tokens = {
+            "mm/day",
+            "mmday-1",
+            "mmday^-1",
+            "mmd-1",
+            "mmd^-1",
+            "kgm-2day-1",
+            "kgm^-2day^-1",
+            "kg/m2/day",
+        }
+        if token in flux_tokens:
+            return {
+                "source_unit_key": "precipitation_depth_per_second",
+                "canonical_units": _CANONICAL_TARGET_UNITS[name],
+                "conversion_factor": 86_400.0,
+            }
+        if token in daily_tokens:
+            return {
+                "source_unit_key": "precipitation_depth_per_day",
+                "canonical_units": _CANONICAL_TARGET_UNITS[name],
+                "conversion_factor": 1.0,
+            }
+    elif name == "tasmax" and token in {"k", "kelvin", "degk", "degreekelvin"}:
+        return {
+            "source_unit_key": "kelvin",
+            "canonical_units": _CANONICAL_TARGET_UNITS[name],
+            "conversion_factor": 1.0,
+        }
+    elif name not in _CANONICAL_TARGET_UNITS:
+        raise ValueError(
+            f"No canonical inference-target unit contract is defined for {var_name!r}."
+        )
+
+    raise ValueError(
+        f"Unsupported units {source_units!r} for inference target {var_name!r}; "
+        f"expected a unit convertible to {_CANONICAL_TARGET_UNITS[name]!r}."
+    )
+
+
+def _resolve_target_unit_provenance(
+    target_paths: list[str], target_vars: list[str]
+) -> dict[str, dict[str, object]]:
+    """Validate source units across files and return canonical conversion metadata."""
+
+    if not target_paths:
+        raise ValueError("At least one inference target path is required for unit validation.")
+    if not target_vars:
+        raise ValueError("At least one inference target variable is required for unit validation.")
+
+    records: dict[str, list[dict[str, object]]] = {name: [] for name in target_vars}
+    for raw_path in target_paths:
+        path = Path(raw_path).expanduser().resolve(strict=True)
+        with xr.open_dataset(path, decode_times=False) as dataset:
+            for name in target_vars:
+                if name not in dataset.data_vars:
+                    raise ValueError(f"Inference target {path} is missing variable {name!r}.")
+                source_units = dataset[name].attrs.get("units")
+                if source_units in (None, ""):
+                    raise ValueError(
+                        f"Inference target variable {name!r} in {path} has no units attribute."
+                    )
+                rule = _target_unit_rule(name, source_units)
+                records[name].append(
+                    {
+                        **rule,
+                        "source_units": str(source_units),
+                        "source_path": str(path),
+                    }
+                )
+
+    provenance: dict[str, dict[str, object]] = {}
+    for name, per_file in records.items():
+        source_keys = {str(record["source_unit_key"]) for record in per_file}
+        factors = {float(record["conversion_factor"]) for record in per_file}
+        canonical_units = {str(record["canonical_units"]) for record in per_file}
+        if len(source_keys) != 1 or len(factors) != 1 or len(canonical_units) != 1:
+            detail = [
+                {
+                    "path": record["source_path"],
+                    "units": record["source_units"],
+                    "factor": record["conversion_factor"],
+                }
+                for record in per_file
+            ]
+            raise ValueError(
+                f"Mixed units for inference target variable {name!r}: {detail}. "
+                "Use one source-unit convention per inference run."
+            )
+        provenance[name] = {
+            "source_units": sorted(
+                {str(record["source_units"]) for record in per_file}
+            ),
+            "source_unit_key": next(iter(source_keys)),
+            "canonical_units": next(iter(canonical_units)),
+            "conversion_factor": next(iter(factors)),
+            "source_paths": [str(record["source_path"]) for record in per_file],
+        }
+    return provenance
+
+
+def _canonicalize_target_tensor(
+    target: torch.Tensor,
+    target_vars: list[str],
+    unit_provenance: dict[str, dict[str, object]],
+) -> torch.Tensor:
+    """Convert target channels without changing rank, shape, device, or dtype."""
+
+    if target.ndim != 4:
+        raise ValueError(f"Inference targets must have shape [B,V,H,W], got {tuple(target.shape)}.")
+    if target.shape[1] != len(target_vars):
+        raise ValueError(
+            f"Inference target channel count {target.shape[1]} does not match "
+            f"target_vars={target_vars}."
+        )
+    missing = [name for name in target_vars if name not in unit_provenance]
+    if missing:
+        raise ValueError(f"Missing unit provenance for inference targets: {missing}.")
+    factors = target.new_tensor(
+        [float(unit_provenance[name]["conversion_factor"]) for name in target_vars]
+    ).view(1, -1, 1, 1)
+    return target * factors
+
+
+def _canonical_target_attrs(
+    target_attrs: dict[str, dict[str, object]],
+    unit_provenance: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Replace inherited truth units with the units of the numeric predictions."""
+
+    result: dict[str, dict[str, object]] = {}
+    for name, attrs in target_attrs.items():
+        updated = dict(attrs)
+        conversion = unit_provenance.get(name)
+        if conversion is not None:
+            source_units = list(conversion["source_units"])
+            updated["units"] = str(conversion["canonical_units"])
+            updated["canonical_units"] = str(conversion["canonical_units"])
+            updated["source_target_units"] = (
+                source_units[0] if len(source_units) == 1 else json.dumps(source_units)
+            )
+            updated["source_target_to_canonical_factor"] = float(
+                conversion["conversion_factor"]
+            )
+        result[name] = updated
+    return result
+
+
+def _output_runtime_contract(
+    target_vars: list[str],
+    unit_provenance: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Describe the channel/variable order and numeric units of saved outputs."""
+
+    missing = [name for name in target_vars if name not in unit_provenance]
+    if missing:
+        raise ValueError(f"Missing output-unit provenance for variables: {missing}.")
+    return {
+        "variable_order": list(target_vars),
+        "canonical_units": {
+            name: str(unit_provenance[name]["canonical_units"])
+            for name in target_vars
+        },
+        "numeric_storage": "physical_canonical_units",
+    }
+
+
+def _boundary_runtime_provenance(boundary_cfg: object) -> dict[str, object]:
+    """Describe the effective boundary path without silently overriding config."""
+
+    enabled = bool(getattr(boundary_cfg, "enabled", False))
+    force_full_frame = bool(getattr(boundary_cfg, "force_full_frame", False))
+    tile_size = getattr(boundary_cfg, "tile_size", None)
+    overlap = getattr(boundary_cfg, "overlap", (0, 0))
+    halo = getattr(boundary_cfg, "halo", (0, 0))
+    tile_origin = getattr(boundary_cfg, "tile_origin", (0, 0))
+    mode = "overlap_tiled" if enabled and not force_full_frame else "full_frame"
+    tile_stride = (
+        [
+            max(1, int(tile_size[0]) - int(overlap[0])),
+            max(1, int(tile_size[1]) - int(overlap[1])),
+        ]
+        if tile_size is not None
+        else None
+    )
+    deblock = getattr(boundary_cfg, "deblock", None)
+    return {
+        "mode": mode,
+        "enabled": enabled,
+        "force_full_frame": force_full_frame,
+        "tile_size": list(tile_size) if tile_size is not None else None,
+        "overlap": list(overlap),
+        "halo": list(halo),
+        "tile_origin": list(tile_origin),
+        "tile_stride": tile_stride,
+        "blend_window": str(getattr(boundary_cfg, "blend_window", "uniform")),
+        "blend_sigma": float(getattr(boundary_cfg, "blend_sigma", 0.0)),
+        "deblock_enabled": bool(getattr(deblock, "enabled", False)),
+        "deblock_boundary_width": int(getattr(deblock, "boundary_width", 0)),
+        "deblock_strength": float(getattr(deblock, "strength", 0.0)),
+        "deblock_kernel_size": int(getattr(deblock, "kernel_size", 0)),
+    }
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.resolve(strict=True).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _normalization_scalar_provenance(
+    config: object, checkpoint: dict
+) -> dict[str, dict[str, object]]:
+    """Hash the exact scalar files used to reconstruct the inference model."""
+
+    scalar_fields = {
+        "inputs_mean": "input_mu",
+        "inputs_std": "input_sigma",
+        "targets_mean": "target_mu",
+        "targets_std": "target_sigma",
+    }
+    metadata = checkpoint.get("metadata", {}) if isinstance(checkpoint, dict) else {}
+    compatibility = metadata.get("compatibility", {})
+    checkpoint_scalars = (
+        compatibility.get("normalization_scalars", {})
+        if isinstance(compatibility, dict)
+        else {}
+    )
+    model_config = getattr(config, "model", None)
+    result: dict[str, dict[str, object]] = {}
+    for scalar_name, config_attr in scalar_fields.items():
+        raw_path = getattr(model_config, config_attr, None)
+        if raw_path in (None, ""):
+            raise ValueError(
+                f"Missing model.{config_attr} while constructing scalar provenance."
+            )
+        path = Path(str(raw_path)).expanduser().resolve(strict=True)
+        sha256 = _sha256_path(path)
+        checkpoint_record = checkpoint_scalars.get(scalar_name, {})
+        expected_sha256 = (
+            checkpoint_record.get("sha256")
+            if isinstance(checkpoint_record, dict)
+            else None
+        )
+        if expected_sha256 and str(expected_sha256).lower() != sha256.lower():
+            raise RuntimeError(
+                f"Scalar hash mismatch for {scalar_name}: runtime {sha256}, "
+                f"checkpoint {expected_sha256}."
+            )
+        result[scalar_name] = {
+            "config_field": f"model.{config_attr}",
+            "path": str(path),
+            "sha256": sha256,
+            "size_bytes": int(path.stat().st_size),
+            "checkpoint_sha256": (
+                str(expected_sha256) if expected_sha256 is not None else None
+            ),
+        }
+    return result
+
+
+def _apply_residual_alpha_runtime_override(
+    config: object,
+    environ: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Resolve and apply the optional ``SA_RESIDUAL_ALPHA`` deployment gate."""
+
+    environment = os.environ if environ is None else environ
+    model_cfg = getattr(config, "model", None)
+    diffusion_cfg = (
+        model_cfg.get("diffusion")
+        if isinstance(model_cfg, dict)
+        else getattr(model_cfg, "diffusion", None)
+    )
+
+    if isinstance(diffusion_cfg, dict):
+        residual_enabled = bool(diffusion_cfg.get("residual_diffusion", False))
+        alpha_is_configured = "residual_application_scale" in diffusion_cfg
+        configured_value = diffusion_cfg.get("residual_application_scale", 0.0)
+    else:
+        residual_enabled = bool(
+            getattr(diffusion_cfg, "residual_diffusion", False)
+        )
+        alpha_is_configured = bool(
+            diffusion_cfg is not None
+            and hasattr(diffusion_cfg, "residual_application_scale")
+        )
+        configured_value = getattr(
+            diffusion_cfg, "residual_application_scale", 0.0
+        )
+
+    environment_variable = "SA_RESIDUAL_ALPHA"
+    override_is_set = environment_variable in environment
+    raw_override = environment.get(environment_variable)
+    if override_is_set and not residual_enabled:
+        raise ValueError(
+            f"{environment_variable} is set, but model.diffusion.residual_diffusion "
+            "is not enabled. Remove the override or use a residual-diffusion run."
+        )
+
+    raw_value = raw_override if override_is_set else configured_value
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        source = environment_variable if override_is_set else "resolved configuration"
+        raise ValueError(
+            f"Residual application scale from {source} must be numeric, got "
+            f"{raw_value!r}."
+        ) from exc
+    if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+        source = environment_variable if override_is_set else "resolved configuration"
+        raise ValueError(
+            f"Residual application scale from {source} must be finite and in "
+            f"[0, 1], got {raw_value!r}."
+        )
+
+    if diffusion_cfg is not None:
+        if isinstance(diffusion_cfg, dict):
+            diffusion_cfg["residual_application_scale"] = value
+        else:
+            setattr(diffusion_cfg, "residual_application_scale", value)
+
+    return {
+        "environment_variable": environment_variable,
+        "source": (
+            f"environment:{environment_variable}"
+            if override_is_set
+            else ("resolved_config" if alpha_is_configured else "safe_default")
+        ),
+        "value": value,
+        "configured_value": float(configured_value),
+        "override_is_set": bool(override_is_set),
+    }
+
+
+def _diffusion_runtime_provenance(
+    model: torch.nn.Module,
+    *,
+    head_type: str,
+    ensemble_size: int,
+    base_seed: int,
+    checkpoint: dict,
+    inference_batch_size: int | None = None,
+    residual_alpha_provenance: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Capture the effective sampler, residual gate, and score padding contract."""
+
+    runtime_model = _runtime_model_with_attribute(model, "diffusion_head")
+    head = getattr(runtime_model, "diffusion_head", None)
+    cfg = getattr(head, "cfg", None)
+    stochastic_diffusion = str(head_type).strip().lower() == "diffusion"
+    rng_provenance: dict[str, object] = {
+        "rng_stream_scope": (
+            "reset_per_scenario_run"
+            if stochastic_diffusion
+            else "not_applicable_deterministic"
+        ),
+        "batch_size_invariant": not stochastic_diffusion,
+        "exact_reproduction_requires_same_batching": stochastic_diffusion,
+    }
+    if inference_batch_size is not None:
+        if int(inference_batch_size) <= 0:
+            raise ValueError("inference_batch_size must be positive when provided.")
+        rng_provenance["inference_batch_size"] = int(inference_batch_size)
+    if residual_alpha_provenance is not None:
+        rng_provenance["runtime_overrides"] = {
+            "residual_alpha": dict(residual_alpha_provenance)
+        }
+
+    if cfg is None:
+        return {
+            "head_type": str(head_type),
+            "enabled": False,
+            "ensemble_size": int(ensemble_size),
+            "base_seed": int(base_seed),
+            "member_seeds": [int(base_seed)],
+            **rng_provenance,
+        }
+
+    fields = (
+        "sde",
+        "beta_min",
+        "beta_max",
+        "sigma_min",
+        "sigma_max",
+        "num_scales",
+        "continuous",
+        "sampling_method",
+        "eta",
+        "predictor",
+        "corrector",
+        "snr",
+        "n_corrector_steps",
+        "num_sampling_steps",
+        "probability_flow",
+        "denoise",
+        "sampling_eps",
+        "prediction_type",
+        "noise_conditioning_scale",
+        "residual_magnitude_guard_multiple",
+        "residual_guard_min_count",
+        "zero_init_output",
+    )
+    sampling = {name: getattr(cfg, name) for name in fields if hasattr(cfg, name)}
+    for name, value in list(sampling.items()):
+        if isinstance(value, np.generic):
+            sampling[name] = value.item()
+        elif isinstance(value, tuple):
+            sampling[name] = list(value)
+
+    # Real diffusion heads expose ``score_fn`` as a bound callable that wraps
+    # the actual convolutional module stored in ``score_model``.  Only inspect
+    # a verified nn.Module; calling ``.modules()`` on the bound method would
+    # fail during real-model provenance collection.
+    score_model = getattr(head, "score_model", None)
+    if not isinstance(score_model, torch.nn.Module):
+        legacy_score_module = getattr(head, "score_fn", None)
+        score_model = (
+            legacy_score_module
+            if isinstance(legacy_score_module, torch.nn.Module)
+            else None
+        )
+    score_convs = (
+        [
+            module
+            for module in score_model.modules()
+            if isinstance(module, torch.nn.Conv2d)
+        ]
+        if score_model is not None
+        else []
+    )
+    padded_score_convs = [
+        module
+        for module in score_convs
+        if any(int(value) > 0 for value in tuple(module.padding))
+    ]
+    effective_padding_modes = sorted(
+        {str(module.padding_mode) for module in padded_score_convs}
+    )
+
+    metadata = checkpoint.get("metadata", {}) if isinstance(checkpoint, dict) else {}
+    compatibility = metadata.get("compatibility", {})
+    checkpoint_residual = (
+        compatibility.get("residual_contract", {})
+        if isinstance(compatibility, dict)
+        else {}
+    )
+    residual_enabled = bool(getattr(cfg, "residual_diffusion", False))
+    residual_application_scale = float(
+        getattr(cfg, "residual_application_scale", 0.0)
+    )
+    residual_contract = (
+        dict(checkpoint_residual) if isinstance(checkpoint_residual, dict) else {}
+    )
+    residual_contract.update(
+        {
+            "enabled": residual_enabled,
+            "definition": residual_contract.get(
+                "definition",
+                "target_normalized - stop_gradient(deterministic_baseline_normalized)",
+            ),
+            "reconstruction": (
+                "deterministic_baseline_normalized + "
+                "residual_application_scale * sampled_residual_normalized"
+            ),
+            "residual_application_scale": residual_application_scale,
+            "alpha": residual_application_scale,
+        }
+    )
+    if residual_alpha_provenance is not None:
+        residual_contract.update(
+            {
+                "alpha_source": residual_alpha_provenance.get("source"),
+                "alpha_environment_variable": residual_alpha_provenance.get(
+                    "environment_variable"
+                ),
+                "alpha_override_is_set": residual_alpha_provenance.get(
+                    "override_is_set"
+                ),
+            }
+        )
+    return {
+        "head_type": str(head_type),
+        "enabled": True,
+        "ensemble_size": int(ensemble_size),
+        "base_seed": int(base_seed),
+        "member_seeds": [
+            int(base_seed) + member_idx for member_idx in range(int(ensemble_size))
+        ],
+        **rng_provenance,
+        "sampling": sampling,
+        "residual_contract": residual_contract,
+        "score_network": {
+            "configured_padding_mode": str(
+                getattr(cfg, "padding_mode", "unspecified")
+            ),
+            "effective_padded_conv_modes": effective_padding_modes,
+            "conv2d_count": len(score_convs),
+            "padded_conv2d_count": len(padded_score_convs),
+        },
+    }
 
 # ===================== USER PARAMETERS (EDIT ME) =====================
 NUM_RUNS = 12
@@ -307,7 +882,7 @@ def _to_pre_inverse_output(pred_inverse: torch.Tensor, model: torch.nn.Module) -
     return (pred - mu) / (sigma + 1e-12)
 
 
-def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
+def _run_full_inference_two_phase(dataloader, model, device, target_vars, boundary_cfg):
     predictions = []
     deterministic_predictions = []
     ensemble_member_predictions = []
@@ -438,6 +1013,161 @@ def _run_full_inference(dataloader, model, device, target_vars, boundary_cfg):
     }
 
 
+def _run_full_inference(
+    dataloader,
+    model,
+    device,
+    target_vars,
+    boundary_cfg,
+    target_unit_provenance=None,
+    head_type="deterministic",
+    ensemble_size=1,
+    base_seed=42,
+):
+    """Run either the current two-phase model or a legacy diffusion head.
+
+    The optional unit-provenance argument is the compatibility discriminator:
+    current two-phase callers omit it, while historical diffusion inference
+    validates and canonicalizes truth units without changing the model batch.
+    """
+
+    if target_unit_provenance is None:
+        return _run_full_inference_two_phase(
+            dataloader, model, device, target_vars, boundary_cfg
+        )
+
+    reset_ensemble_generators(model)
+    predictions = []
+    pre_inverse_predictions = []
+    targets = []
+    stage_stats = {
+        "raw_predictors": RunningStats(
+            max_samples=DIAGNOSTIC_MAX_SAMPLES,
+            round_decimals=DIAGNOSTIC_ROUND_DECIMALS,
+        ),
+        "normalized_predictors": RunningStats(
+            max_samples=DIAGNOSTIC_MAX_SAMPLES,
+            round_decimals=DIAGNOSTIC_ROUND_DECIMALS,
+        ),
+        "raw_model_outputs_pre_inverse": RunningStats(
+            max_samples=DIAGNOSTIC_MAX_SAMPLES,
+            round_decimals=DIAGNOSTIC_ROUND_DECIMALS,
+        ),
+        "inverse_outputs": RunningStats(
+            max_samples=DIAGNOSTIC_MAX_SAMPLES,
+            round_decimals=DIAGNOSTIC_ROUND_DECIMALS,
+        ),
+    }
+    stage_stats_by_var = {
+        stage: {
+            name: RunningStats(
+                max_samples=DIAGNOSTIC_MAX_SAMPLES,
+                round_decimals=DIAGNOSTIC_ROUND_DECIMALS,
+            )
+            for name in target_vars
+        }
+        for stage in (
+            "raw_model_outputs_pre_inverse",
+            "inverse_outputs",
+            "targets",
+        )
+    }
+
+    autocast_enabled = bool(ENABLE_MIXED_PRECISION and device.type == "cuda")
+    autocast_dtype = (
+        torch.bfloat16
+        if autocast_enabled and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
+
+    def autocast_context():
+        return (
+            torch.amp.autocast(
+                "cuda", dtype=autocast_dtype, enabled=autocast_enabled
+            )
+            if autocast_enabled
+            else nullcontext()
+        )
+
+    with torch.no_grad():
+        model.eval()
+        for batch in tqdm(dataloader, desc="Running inference", leave=False):
+            if "x" not in batch or "y" not in batch:
+                raise KeyError("Inference batch must include 'x' and 'y'")
+
+            stage_stats["raw_predictors"].add(batch["x"].numpy())
+            target_canonical_cpu = _canonicalize_target_tensor(
+                batch["y"].float(), target_vars, target_unit_provenance
+            )
+            target_cpu = target_canonical_cpu.numpy()
+            for var_idx, var_name in enumerate(target_vars):
+                stage_stats_by_var["targets"][var_name].add(
+                    target_cpu[:, var_idx]
+                )
+
+            model_batch = {
+                key: value.to(
+                    device=device, dtype=torch.float32, non_blocking=True
+                )
+                for key, value in batch.items()
+            }
+            normalized_x = _normalize_predictors_for_diagnostics(
+                model_batch, model
+            )
+            stage_stats["normalized_predictors"].add(
+                normalized_x.detach().cpu().numpy()
+            )
+            out, out_pre_inverse, _ = infer_batch_ensemble(
+                model=model,
+                batch=model_batch,
+                infer_batch=infer_batch_with_boundary_mitigation,
+                boundary_cfg=boundary_cfg,
+                head_type=head_type,
+                ensemble_size=ensemble_size,
+                base_seed=base_seed,
+                device=device,
+                autocast_context=autocast_context,
+                force_float32=FORCE_OUTPUT_FLOAT32,
+            )
+            out_cpu = out.detach().cpu()
+            out_pre_inverse_cpu = out_pre_inverse.detach().cpu()
+            predictions.append(out_cpu)
+            pre_inverse_predictions.append(out_pre_inverse_cpu)
+            targets.append(target_canonical_cpu)
+            stage_stats["raw_model_outputs_pre_inverse"].add(
+                out_pre_inverse_cpu.numpy()
+            )
+            stage_stats["inverse_outputs"].add(out_cpu.numpy())
+            for var_idx, var_name in enumerate(target_vars):
+                if out_cpu.ndim == 5:
+                    pre_var = out_pre_inverse_cpu[:, :, var_idx].numpy()
+                    out_var = out_cpu[:, :, var_idx].numpy()
+                else:
+                    pre_var = out_pre_inverse_cpu[:, var_idx].numpy()
+                    out_var = out_cpu[:, var_idx].numpy()
+                stage_stats_by_var["raw_model_outputs_pre_inverse"][
+                    var_name
+                ].add(pre_var)
+                stage_stats_by_var["inverse_outputs"][var_name].add(out_var)
+
+    if not predictions:
+        raise RuntimeError("Inference dataloader yielded no batches")
+    return {
+        "predictions": torch.cat(predictions, dim=0),
+        "predictions_pre_inverse": torch.cat(pre_inverse_predictions, dim=0),
+        "baseline_predictions": None,
+        "targets": torch.cat(targets, dim=0),
+        "transformation_stage_samples": {},
+        "stage_stats": {key: value.finalize() for key, value in stage_stats.items()},
+        "stage_stats_by_var": {
+            stage: {
+                name: stats.finalize() for name, stats in by_var.items()
+            }
+            for stage, by_var in stage_stats_by_var.items()
+        },
+    }
+
+
 def _concat_time_coordinate(paths, time_key):
     arrays = []
     attrs = None
@@ -460,11 +1190,47 @@ def _concat_time_coordinate(paths, time_key):
     return combined.load()
 
 
+def _netcdf_engine() -> str:
+    """Use h5netcdf when available, otherwise fall back to netCDF4."""
+
+    try:
+        import h5py  # noqa: F401
+
+        return "h5netcdf"
+    except ImportError:
+        return "netcdf4"
+
+
+def _netcdf_safe_attr_value(value: object) -> object:
+    if isinstance(value, (bool, np.bool_)):
+        return np.int8(value)
+    if isinstance(value, np.ndarray) and value.dtype.kind == "b":
+        return value.astype(np.int8)
+    if isinstance(value, (list, tuple)):
+        array = np.asarray(value)
+        if array.dtype.kind == "b":
+            return array.astype(np.int8)
+    return value
+
+
+def _netcdf_safe_attrs(attrs: dict[str, object]) -> dict[str, object]:
+    return {key: _netcdf_safe_attr_value(value) for key, value in attrs.items()}
+
+
 def _sanitize_data_attrs(attrs: dict[str, object]) -> dict[str, object]:
-    clean_attrs = dict(attrs)
+    clean_attrs = _netcdf_safe_attrs(attrs)
     for key in ("scale_factor", "add_offset", "_FillValue", "missing_value", "dtype"):
         clean_attrs.pop(key, None)
     return clean_attrs
+
+
+def _sanitize_dataset_attrs_for_netcdf(dataset: xr.Dataset) -> xr.Dataset:
+    dataset.attrs = _netcdf_safe_attrs(dict(dataset.attrs))
+    for variable_name in dataset.variables:
+        dataset[variable_name].attrs = _netcdf_safe_attrs(
+            dict(dataset[variable_name].attrs)
+        )
+    return dataset
 
 
 def _build_netcdf_encoding(var_names: list[str]) -> dict[str, dict[str, object]]:
@@ -692,6 +1458,355 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
     return run_name, run_dir, refinement_path, config, model, run_dir.parent
 
 
+def _save_run_outputs(
+    *,
+    idx: int,
+    output_root: Path,
+    prediction_output_stub: Path,
+    outputs_np: np.ndarray,
+    outputs_pre_inverse_np: np.ndarray,
+    baseline_outputs_np: np.ndarray | None,
+    target_vars: list[str],
+    predictor_paths: list[str],
+    target_template_paths: list[str],
+    time_dim: str,
+    lat_dim: str,
+    lon_dim: str,
+    lat_name: str,
+    lon_name: str,
+    head_type: str,
+    ensemble_size: int,
+    base_seed: int,
+    diagnostics_payload: dict,
+    predicted_var_values: dict[str, np.ndarray],
+    predicted_pre_inverse_var_values: dict[str, np.ndarray],
+    target_var_values: dict[str, np.ndarray],
+    transformation_stage_samples: dict[str, np.ndarray],
+    target_unit_provenance: dict[str, dict[str, object]],
+    boundary_provenance: dict[str, object],
+    model_provenance: dict[str, object],
+) -> None:
+    import pickle
+
+    baseline_output_path = output_root / prediction_output_stub.with_suffix(
+        ".baseline.nc"
+    )
+    if baseline_outputs_np is not None:
+        diagnostics_payload["full_domain_baseline_artifact"] = {
+            "path": str(baseline_output_path.resolve()),
+            "shape": list(baseline_outputs_np.shape),
+            "ensemble_dimension": False,
+        }
+
+    if transformation_stage_samples:
+        stage_artifact_path = output_root / prediction_output_stub.with_suffix(
+            ".residual_stages.npz"
+        )
+        np.savez_compressed(stage_artifact_path, **transformation_stage_samples)
+        diagnostics_payload["transformation_stage_sample_artifact"] = {
+            "path": str(stage_artifact_path.resolve()),
+            "sample_count": int(
+                next(iter(transformation_stage_samples.values())).shape[0]
+            ),
+            "stages": list(transformation_stage_samples),
+        }
+        print(
+            f"[diag] Saved residual transformation-stage samples to "
+            f"{stage_artifact_path}"
+        )
+
+    if SAVE_DIAGNOSTICS_JSON:
+        diagnostics_path = output_root / prediction_output_stub.with_suffix(".diagnostics.json")
+        save_json(diagnostics_payload, diagnostics_path)
+        print(f"[diag] Saved diagnostics JSON to {diagnostics_path}")
+
+    if SAVE_DISTRIBUTION_PLOT:
+        if "tasmax" in predicted_var_values and "pr" in predicted_var_values:
+            plot_path = output_root / prediction_output_stub.with_suffix(".distribution.png")
+            save_distribution_plot(
+                target_values=target_var_values,
+                predicted_values=predicted_var_values,
+                predicted_raw_values=predicted_pre_inverse_var_values,
+                output_path=plot_path,
+            )
+            print(f"[diag] Saved distribution comparison plot to {plot_path}")
+        else:
+            print("[diag] Skipped distribution plot; expected vars 'pr' and 'tasmax' were not both present.")
+
+    predictor_time_coord = _concat_time_coordinate(predictor_paths, time_dim)
+    if outputs_np.shape[0] != predictor_time_coord.sizes[time_dim]:
+        raise ValueError(
+            f"Prediction time dimension {outputs_np.shape[0]} does not match "
+            f"predictor timestamps {predictor_time_coord.sizes[time_dim]}"
+        )
+
+    if not target_template_paths:
+        raise FileNotFoundError("Target template paths missing; ensure config.data.test_target_paths is set")
+
+    with xr.open_dataset(target_template_paths[0], engine=_netcdf_engine()) as template_ds:
+        template_attrs = dict(template_ds.attrs)
+        target_attrs = {
+            name: _sanitize_data_attrs(dict(template_ds[name].attrs))
+            for name in target_vars
+            if name in template_ds.data_vars
+        }
+        lat_coord = template_ds[lat_name].load()
+        lon_coord = template_ds[lon_name].load()
+
+    target_attrs = _canonical_target_attrs(target_attrs, target_unit_provenance)
+    output_contract = _output_runtime_contract(target_vars, target_unit_provenance)
+    scalar_provenance = model_provenance.get("normalization_scalars", {})
+    diffusion_runtime = model_provenance.get("diffusion_runtime", {})
+    sampling_provenance = (
+        diffusion_runtime.get("sampling", {})
+        if isinstance(diffusion_runtime, dict)
+        else {}
+    )
+    residual_contract = (
+        diffusion_runtime.get("residual_contract", {})
+        if isinstance(diffusion_runtime, dict)
+        else {}
+    )
+    score_network = (
+        diffusion_runtime.get("score_network", {})
+        if isinstance(diffusion_runtime, dict)
+        else {}
+    )
+    runtime_attrs: dict[str, object] = {
+        "model_provenance": json.dumps(model_provenance, sort_keys=True),
+        "target_unit_provenance": json.dumps(
+            target_unit_provenance, sort_keys=True
+        ),
+        "output_variable_order": json.dumps(output_contract["variable_order"]),
+        "canonical_output_units": json.dumps(
+            output_contract["canonical_units"], sort_keys=True
+        ),
+        "output_numeric_storage": output_contract["numeric_storage"],
+        "normalization_scalar_provenance": json.dumps(
+            scalar_provenance, sort_keys=True
+        ),
+        "diffusion_runtime_provenance": json.dumps(
+            diffusion_runtime, sort_keys=True
+        ),
+        "inference_boundary_provenance": json.dumps(
+            boundary_provenance, sort_keys=True
+        ),
+        "boundary_mode": boundary_provenance["mode"],
+        "boundary_enabled": boundary_provenance["enabled"],
+        "boundary_force_full_frame": boundary_provenance["force_full_frame"],
+        "boundary_tile_size": json.dumps(boundary_provenance["tile_size"]),
+        "boundary_overlap": json.dumps(boundary_provenance["overlap"]),
+        "boundary_halo": json.dumps(boundary_provenance["halo"]),
+        "boundary_tile_origin": json.dumps(boundary_provenance["tile_origin"]),
+        "boundary_tile_stride": json.dumps(boundary_provenance["tile_stride"]),
+    }
+    for key in (
+        "checkpoint_path",
+        "checkpoint_sha256",
+        "checkpoint_epoch",
+        "checkpoint_global_step",
+        "config_snapshot_path",
+        "config_snapshot_sha256",
+        "config_fingerprint_sha256",
+        "git_commit",
+        "git_branch",
+        "git_dirty",
+        "checkpoint_metadata_schema",
+        "checkpoint_metadata_schema_version",
+        "checkpoint_created_utc",
+        "checkpoint_head_type",
+    ):
+        value = model_provenance.get(key)
+        if value is not None:
+            runtime_attrs[key] = value
+    if isinstance(scalar_provenance, dict):
+        for scalar_name, record in scalar_provenance.items():
+            if not isinstance(record, dict):
+                continue
+            for field in ("path", "sha256", "size_bytes"):
+                value = record.get(field)
+                if value is not None:
+                    runtime_attrs[f"scalar_{scalar_name}_{field}"] = value
+    if isinstance(diffusion_runtime, dict):
+        runtime_attrs["diffusion_base_seed"] = int(
+            diffusion_runtime.get("base_seed", base_seed)
+        )
+        runtime_attrs["diffusion_ensemble_size"] = int(
+            diffusion_runtime.get("ensemble_size", ensemble_size)
+        )
+        runtime_attrs["diffusion_member_seeds"] = json.dumps(
+            diffusion_runtime.get("member_seeds", [base_seed])
+        )
+        inference_batch_size = diffusion_runtime.get("inference_batch_size")
+        if inference_batch_size is not None:
+            runtime_attrs["inference_batch_size"] = int(inference_batch_size)
+        runtime_attrs["diffusion_rng_stream_scope"] = diffusion_runtime.get(
+            "rng_stream_scope", "unspecified"
+        )
+        runtime_attrs["diffusion_batch_size_invariant"] = bool(
+            diffusion_runtime.get("batch_size_invariant", False)
+        )
+        runtime_attrs["diffusion_exact_reproduction_requires_same_batching"] = bool(
+            diffusion_runtime.get(
+                "exact_reproduction_requires_same_batching", True
+            )
+        )
+    if isinstance(sampling_provenance, dict):
+        for field in (
+            "sde",
+            "beta_min",
+            "beta_max",
+            "sigma_min",
+            "sigma_max",
+            "num_scales",
+            "continuous",
+            "sampling_method",
+            "eta",
+            "predictor",
+            "corrector",
+            "num_sampling_steps",
+            "prediction_type",
+        ):
+            value = sampling_provenance.get(field)
+            if value is not None:
+                runtime_attrs[f"diffusion_{field}"] = value
+    if isinstance(residual_contract, dict):
+        residual_attr_names = {
+            "enabled": "residual_diffusion",
+            "definition": "residual_definition",
+            "sign": "residual_sign",
+            "space": "residual_space",
+            "reconstruction": "residual_reconstruction",
+            "residual_application_scale": "residual_application_scale",
+            "alpha": "residual_alpha",
+            "alpha_source": "residual_alpha_source",
+            "alpha_environment_variable": "residual_alpha_environment_variable",
+            "alpha_override_is_set": "residual_alpha_override_is_set",
+        }
+        for field in (
+            "enabled",
+            "definition",
+            "sign",
+            "space",
+            "reconstruction",
+            "residual_application_scale",
+            "alpha",
+            "alpha_source",
+            "alpha_environment_variable",
+            "alpha_override_is_set",
+        ):
+            value = residual_contract.get(field)
+            if value is not None:
+                runtime_attrs[residual_attr_names[field]] = value
+    if isinstance(score_network, dict):
+        padding_mode = score_network.get("configured_padding_mode")
+        if padding_mode is not None:
+            runtime_attrs["score_padding_mode"] = padding_mode
+        runtime_attrs["score_effective_padded_conv_modes"] = json.dumps(
+            score_network.get("effective_padded_conv_modes", [])
+        )
+        for field in ("conv2d_count", "padded_conv2d_count"):
+            value = score_network.get(field)
+            if value is not None:
+                runtime_attrs[f"score_{field}"] = value
+
+    coords = {time_dim: predictor_time_coord, lat_dim: lat_coord, lon_dim: lon_coord}
+    prediction_ds = xr.Dataset(coords=coords)
+    prediction_ds.attrs.update(template_attrs)
+    prediction_ds.attrs.update(runtime_attrs)
+    if baseline_outputs_np is not None:
+        prediction_ds.attrs.update(
+            {
+                "baseline_file": baseline_output_path.name,
+            }
+        )
+    prediction_ds = add_predictions_to_dataset(
+        prediction_ds=prediction_ds,
+        target_vars=target_vars,
+        outputs_np=outputs_np,
+        coords=coords,
+        time_dim=time_dim,
+        lat_dim=lat_dim,
+        lon_dim=lon_dim,
+        target_attrs=target_attrs,
+        head_type=head_type,
+        ensemble_size=ensemble_size,
+        base_seed=base_seed,
+    )
+    prediction_output_path = output_root / prediction_output_stub
+    prediction_ds = _sanitize_dataset_attrs_for_netcdf(prediction_ds)
+    prediction_ds.to_netcdf(
+        prediction_output_path,
+        engine=_netcdf_engine(),
+        encoding=_build_netcdf_encoding(target_vars),
+    )
+    print(
+        f"[{idx + 1:02d}/{NUM_RUNS}] Saved predictions to {prediction_output_path} "
+        f"({predictor_time_coord.values[0]} -> {predictor_time_coord.values[-1]})"
+    )
+
+    if baseline_outputs_np is not None:
+        expected_baseline_shape = (
+            outputs_np.shape[0],
+            len(target_vars),
+            int(lat_coord.size),
+            int(lon_coord.size),
+        )
+        if tuple(baseline_outputs_np.shape) != expected_baseline_shape:
+            raise ValueError(
+                "Deterministic baseline shape does not match output coordinates: "
+                f"{tuple(baseline_outputs_np.shape)} != {expected_baseline_shape}."
+            )
+        baseline_ds = xr.Dataset(coords=coords)
+        baseline_ds.attrs.update(template_attrs)
+        baseline_ds.attrs.update(runtime_attrs)
+        baseline_ds.attrs.update(
+            {
+                "head_type": "deterministic",
+                "baseline_role": (
+                    "joint_residual_diffusion_deterministic_baseline"
+                ),
+                "paired_corrected_prediction": prediction_output_path.name,
+            }
+        )
+        baseline_ds = add_predictions_to_dataset(
+            prediction_ds=baseline_ds,
+            target_vars=target_vars,
+            outputs_np=baseline_outputs_np,
+            coords=coords,
+            time_dim=time_dim,
+            lat_dim=lat_dim,
+            lon_dim=lon_dim,
+            target_attrs=target_attrs,
+            head_type="deterministic",
+            ensemble_size=1,
+            base_seed=base_seed,
+        )
+        baseline_ds = _sanitize_dataset_attrs_for_netcdf(baseline_ds)
+        baseline_ds.to_netcdf(
+            baseline_output_path,
+            engine=_netcdf_engine(),
+            encoding=_build_netcdf_encoding(target_vars),
+        )
+        print(
+            f"[{idx + 1:02d}/{NUM_RUNS}] Saved jointly trained deterministic "
+            f"baseline to {baseline_output_path}"
+        )
+
+    pickle_path = output_root / prediction_output_stub.with_suffix(".pkl")
+    with open(pickle_path, "wb") as handle:
+        pickle.dump(outputs_np, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[{idx + 1:02d}/{NUM_RUNS}] Saved raw predictions array to {pickle_path}")
+
+    pre_inverse_pickle_path = output_root / prediction_output_stub.with_suffix(".pre_inverse.pkl")
+    with open(pre_inverse_pickle_path, "wb") as handle:
+        pickle.dump(outputs_pre_inverse_np, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    print(
+        f"[{idx + 1:02d}/{NUM_RUNS}] Saved pre-inverse predictions array to "
+        f"{pre_inverse_pickle_path}"
+    )
+
+
 def main() -> None:
     global DIST_ENABLED, DIST_RANK, DIST_WORLD_SIZE, DIST_LOCAL_RANK
 
@@ -821,7 +1936,6 @@ def main() -> None:
         target_template_paths = list(base_dataset.target_paths)
 
         boundary_cfg = resolve_boundary_mitigation_settings(config)
-        boundary_cfg.force_full_frame = True
         if boundary_cfg.force_full_frame:
             print("[boundary] force_full_frame=True (tiling/blending disabled)")
         else:

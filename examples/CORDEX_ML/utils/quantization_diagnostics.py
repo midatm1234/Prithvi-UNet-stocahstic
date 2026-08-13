@@ -114,6 +114,9 @@ def save_distribution_plot(
     predicted_raw_values: dict[str, np.ndarray],
     output_path: str | Path,
 ) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     output_path = Path(output_path)
