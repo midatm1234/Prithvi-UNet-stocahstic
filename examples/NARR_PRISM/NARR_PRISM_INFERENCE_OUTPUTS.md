@@ -96,18 +96,36 @@ complete predictor-only inference inputs, but not the deleted deterministic
 prediction files. The durable output root now resolves through the repository
 portal to `/data2/granite-wxc-artifacts/NARR_PRISM/experiments`.
 
-## Current regeneration status
+## Regenerated output (complete and validated)
 
-A new production inference invocation began at 2026-08-12 23:52:50 UTC and was
-still in progress when this record was written. It uses the recovered
-checkpoint and three date-sharded GPU workers (`1,2,3`). Its products are
-currently accessible through the historical repository spelling and are
-stored at
+The replacement production run used the recovered checkpoint and three
+date-sharded GPU workers (`1,2,3`). It wrote its first daily file at
+2026-08-12 23:53:33 UTC and its last at 2026-08-13 02:41:49 UTC. All three
+workers exited cleanly after producing `1,218 + 1,218 + 1,217 = 3,653` files;
+no empty file or worker traceback/OOM/runtime error was found.
+
+The exhaustive audit completed at 2026-08-13 02:44:04 UTC. It opened every
+NetCDF and reported:
+
+- exact inclusive coverage `2016-01-01` through `2025-12-31`;
+- 3,653 expected, observed, and validated daily files;
+- zero missing, extra, malformed, duplicate, empty, or invalid files;
+- zero validation errors and zero validation warnings;
+- ordered variables `ppt`, `tmax`, `tmin`, canonical coordinates, units,
+  training support mask, provenance, finite valid cells, and nonnegative
+  precipitation all satisfying the output contract.
+
+The products are accessible through the historical repository spelling and
+are stored at
 `/data2/granite-wxc-artifacts/NARR_PRISM/experiments/inference_output/narr_prism_California`.
-It is a distinct regeneration under the current hardened output contract; it
-is not a byte-for-byte recovery of the deleted files. Do not describe it as
-complete until the audit reports exactly 3,653 files, no
-missing/extra/duplicate dates, and valid NetCDF endpoint (or all-file) checks.
+The run-level `inference_output_manifest.json` has SHA-256
+`7ae611ffea30b72d7f35f37aa9c563a5c99e1edcc87ce4b26c77a8c849e0d4a5`;
+its inventory signature is
+`85951d72e87817840a9ba3537f7e5da63377ac0b22b1aa96f55b1265c4f07e55`.
+The manifest binds the recovered checkpoint SHA-256
+`1d352491ab32a4069696673f504edcd9c67d48325e83dcf3b042fe3d3eb80efa`.
+This is a newly generated, contract-validated output set—not a byte-for-byte
+recovery of the deleted historical NetCDF files.
 
 ## Reproduce
 
