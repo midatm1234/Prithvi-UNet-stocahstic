@@ -47,7 +47,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -164,6 +164,10 @@ def _plain(value: Any) -> Any:
 
 class CacheBuildLockError(RuntimeError):
     """Raised when another parent process owns the cache build lock."""
+
+
+class CacheBuildNotActiveError(RuntimeError):
+    """Raised when an incomplete cache has no active parent or worker lease."""
 
 
 class CacheBuildLock:
@@ -358,6 +362,50 @@ class CacheWorkerLease:
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.release()
+
+
+def _probe_advisory_lock(path: Path) -> tuple[bool, dict[str, Any]]:
+    """Return whether an existing advisory lock is held without changing it."""
+    if not path.is_file():
+        return False, {}
+    with path.open("r", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True, CacheBuildLock._read_owner(handle)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return False, CacheBuildLock._read_owner(handle)
+
+
+def cache_build_activity(
+    output_root: str | os.PathLike,
+    *,
+    cache_dir: str | os.PathLike | None = None,
+) -> dict[str, Any]:
+    """Inspect the authoritative parent lock and optional worker lease.
+
+    Lock ownership is determined with ``flock``. JSON lock-file metadata is
+    informative only and is never treated as proof that a process is active.
+    This function is read-only and does not create either lock file.
+    """
+    root = resolve_path(output_root)
+    parent_active, parent_owner = _probe_advisory_lock(root / BUILD_LOCK_NAME)
+    workers_active = False
+    worker_owner: dict[str, Any] = {}
+    if cache_dir is not None:
+        directory = resolve_path(cache_dir)
+        workers_active, worker_owner = _probe_advisory_lock(
+            directory / WORKER_LEASE_NAME
+        )
+    return {
+        "output_root": str(root),
+        "parent_active": parent_active,
+        "parent_owner": parent_owner,
+        "workers_active": workers_active,
+        "worker_owner": worker_owner,
+        "active": parent_active or workers_active,
+    }
 
 
 def contract_digest(contract: Mapping[str, Any]) -> str:
@@ -2300,6 +2348,132 @@ def describe_cache(
         "splits": split_summaries,
         "residual_normalization": manifest.get("residual_normalization"),
     }
+
+
+def wait_for_cache_completion(
+    output_root: str | os.PathLike,
+    *,
+    cfg: Mapping[str, Any],
+    config: Any,
+    phase1_checkpoint: str | os.PathLike,
+    phase1_fingerprint: str | None = None,
+    initial_validated_manifest: Mapping[str, Any] | None = None,
+    poll_seconds: float = 60.0,
+    timeout_seconds: float | None = None,
+    status_callback: Callable[[dict[str, Any]], None] | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Wait for an already-active compatible cache build to finalize.
+
+    This never starts or stops a process. It validates the immutable contract
+    whenever a manifest is visible, uses kernel advisory locks as the source of
+    truth for activity, and performs full inventory validation before returning.
+    If no parent or worker owns the cache, ``CacheBuildNotActiveError`` tells the
+    caller it is safe to launch/resume a builder.
+    """
+    if poll_seconds <= 0:
+        raise ValueError("poll_seconds must be positive")
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive when provided")
+    started = time.monotonic()
+    root = resolve_path(output_root)
+    manifest_path: Path | None = None
+    validated_contract: Any | None = None
+    if initial_validated_manifest is not None:
+        if "_manifest_path" not in initial_validated_manifest:
+            raise ValueError(
+                "initial_validated_manifest must come from "
+                "load_and_validate_manifest"
+            )
+        manifest_path = Path(str(initial_validated_manifest["_manifest_path"]))
+        validated_contract = initial_validated_manifest["contract"]
+    while True:
+        manifest: dict[str, Any] | None = None
+        summary: dict[str, Any] | None = None
+        cache_dir: Path | None = None
+        try:
+            if manifest_path is None:
+                manifest = load_and_validate_manifest(
+                    root,
+                    cfg=cfg,
+                    config=config,
+                    phase1_checkpoint=phase1_checkpoint,
+                    phase1_fingerprint=phase1_fingerprint,
+                    require_complete=False,
+                    validate_inventory=False,
+                )
+                manifest_path = Path(manifest["_manifest_path"])
+                validated_contract = manifest["contract"]
+            else:
+                # The checkpoint and immutable contract were authenticated on
+                # the first successful read. Poll the direct manifest path so
+                # a multi-hour wait does not rehash the 2.9-GB checkpoint every
+                # minute, while still rejecting any mid-build contract change.
+                manifest = load_and_validate_manifest(
+                    manifest_path,
+                    require_complete=False,
+                    validate_inventory=False,
+                )
+                if manifest["contract"] != validated_contract:
+                    raise RuntimeError(
+                        f"Cache contract changed while waiting: {manifest_path}"
+                    )
+        except FileNotFoundError:
+            # A competing parent can own the root lock just before it creates
+            # the first incomplete manifest. Other validation failures remain
+            # fatal and are intentionally not caught.
+            pass
+        if manifest is not None:
+            cache_dir = Path(manifest["_manifest_path"]).parent
+            if manifest.get("state") == CACHE_STATE_COMPLETE:
+                return load_and_validate_manifest(
+                    root,
+                    cfg=cfg,
+                    config=config,
+                    phase1_checkpoint=phase1_checkpoint,
+                    phase1_fingerprint=phase1_fingerprint,
+                    require_complete=True,
+                    validate_inventory=True,
+                )
+            summary = describe_cache(
+                manifest["_manifest_path"], validate_present=False
+            )
+        activity = cache_build_activity(root, cache_dir=cache_dir)
+        elapsed = time.monotonic() - started
+        status = {
+            "elapsed_seconds": elapsed,
+            "activity": activity,
+            "summary": summary,
+        }
+        if status_callback is not None:
+            status_callback(status)
+        if not activity["active"]:
+            # Close the small race where finalization completed between the
+            # manifest read and the lock probe.
+            try:
+                return load_and_validate_manifest(
+                    root,
+                    cfg=cfg,
+                    config=config,
+                    phase1_checkpoint=phase1_checkpoint,
+                    phase1_fingerprint=phase1_fingerprint,
+                    require_complete=True,
+                    validate_inventory=True,
+                )
+            except FileNotFoundError:
+                pass
+            except RuntimeError as exc:
+                if "not complete" not in str(exc):
+                    raise
+            raise CacheBuildNotActiveError(
+                f"Phase-1 cache at {root} is incomplete, but no parent or "
+                "worker owns its advisory lock; launch/resume the cache builder."
+            )
+        if timeout_seconds is not None and elapsed >= timeout_seconds:
+            raise TimeoutError(
+                f"Timed out after {elapsed:.1f}s waiting for Phase-1 cache {root}"
+            )
+        sleep_fn(poll_seconds)
 
 
 def cmd_describe(args: argparse.Namespace) -> int:

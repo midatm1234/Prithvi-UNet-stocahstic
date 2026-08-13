@@ -27,6 +27,7 @@ from narr_prism_phase1_cache import (
     TARGET_VALID_MASK_TRAINING_SOURCE_SIGNATURE_ATTR,
     CacheBuildLock,
     CacheBuildLockError,
+    CacheBuildNotActiveError,
     CacheWorkerLease,
     CacheWorkerLeaseError,
     Phase1ResidualCacheReader,
@@ -40,12 +41,14 @@ from narr_prism_phase1_cache import (
     _wait_for_processes,
     _write_daily_cache,
     build_parser,
+    cache_build_activity,
     contract_digest,
     daily_cache_path,
     describe_cache,
     finalize_cache,
     load_and_validate_manifest,
     validate_daily_cache,
+    wait_for_cache_completion,
 )
 from netCDF4 import Dataset as NetCDFDataset
 
@@ -558,6 +561,123 @@ def test_build_lock_reports_owner_and_releases_for_resume(tmp_path):
             raise ValueError("synthetic interruption")
     with CacheBuildLock(tmp_path, command=["resumed-parent"]):
         pass
+
+
+def test_cache_build_activity_uses_live_locks_not_stale_metadata(tmp_path):
+    digest_dir = tmp_path / "digest"
+    assert not cache_build_activity(tmp_path, cache_dir=digest_dir)["active"]
+    assert not (tmp_path / BUILD_LOCK_NAME).exists()
+
+    with CacheBuildLock(tmp_path, command=["active-parent"]):
+        status = cache_build_activity(tmp_path, cache_dir=digest_dir)
+        assert status["parent_active"]
+        assert status["parent_owner"]["pid"] == os.getpid()
+        assert status["active"]
+
+    status = cache_build_activity(tmp_path, cache_dir=digest_dir)
+    assert not status["parent_active"]
+    assert status["parent_owner"]["state"] == "released"
+    with CacheWorkerLease(digest_dir, command=["active-workers"]):
+        status = cache_build_activity(tmp_path, cache_dir=digest_dir)
+        assert not status["parent_active"]
+        assert status["workers_active"]
+        assert status["active"]
+
+
+def test_wait_for_cache_completion_polls_active_owner_then_validates(
+    monkeypatch, tmp_path
+):
+    state = {"complete": False}
+    incomplete = {
+        "state": CACHE_STATE_INCOMPLETE,
+        "_manifest_path": str(tmp_path / "digest" / "manifest.json"),
+        "contract": {"identity": "stable"},
+    }
+    complete = {
+        "state": "complete",
+        "_manifest_path": incomplete["_manifest_path"],
+        "contract": incomplete["contract"],
+    }
+    validated_calls = []
+
+    def fake_load(*args, require_complete, **kwargs):
+        validated_calls.append((require_complete, "cfg" in kwargs))
+        if require_complete:
+            assert state["complete"]
+            return complete
+        return complete if state["complete"] else incomplete
+
+    monkeypatch.setattr(cache_module, "load_and_validate_manifest", fake_load)
+    monkeypatch.setattr(
+        cache_module,
+        "describe_cache",
+        lambda *args, **kwargs: {
+            "splits": {"training": {"observed_present_count": 7}}
+        },
+    )
+    monkeypatch.setattr(
+        cache_module,
+        "cache_build_activity",
+        lambda *args, **kwargs: {"active": not state["complete"]},
+    )
+    statuses = []
+
+    def finish_after_poll(seconds):
+        assert seconds == 2.0
+        state["complete"] = True
+
+    result = wait_for_cache_completion(
+        tmp_path,
+        cfg={},
+        config=object(),
+        phase1_checkpoint=tmp_path / "last.ckpt",
+        poll_seconds=2.0,
+        status_callback=statuses.append,
+        sleep_fn=finish_after_poll,
+    )
+    assert result is complete
+    assert len(statuses) == 1
+    assert statuses[0]["summary"]["splits"]["training"][
+        "observed_present_count"
+    ] == 7
+    assert validated_calls == [
+        (False, True),
+        (False, False),
+        (True, True),
+    ]
+
+
+def test_wait_for_cache_completion_requests_resume_when_unowned(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        cache_module,
+        "load_and_validate_manifest",
+        lambda *args, require_complete, **kwargs: (
+            (_ for _ in ()).throw(RuntimeError("not complete"))
+            if require_complete
+            else {
+                "state": CACHE_STATE_INCOMPLETE,
+                "_manifest_path": str(tmp_path / "digest" / "manifest.json"),
+                "contract": {"identity": "stable"},
+            }
+        ),
+    )
+    monkeypatch.setattr(cache_module, "describe_cache", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        cache_module,
+        "cache_build_activity",
+        lambda *args, **kwargs: {"active": False},
+    )
+    with pytest.raises(CacheBuildNotActiveError, match="launch/resume"):
+        wait_for_cache_completion(
+            tmp_path,
+            cfg={},
+            config=object(),
+            phase1_checkpoint=tmp_path / "last.ckpt",
+            poll_seconds=1.0,
+            sleep_fn=lambda seconds: pytest.fail("must not sleep"),
+        )
 
 
 def test_build_lock_is_released_by_kernel_after_crash(tmp_path):

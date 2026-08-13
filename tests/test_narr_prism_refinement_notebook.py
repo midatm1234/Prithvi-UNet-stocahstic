@@ -321,6 +321,31 @@ def test_notebook_has_one_parameter_cell_and_complete_workflow_sections():
     assert "subprocess.run(train_command" not in text
 
 
+def test_notebook_attaches_to_active_phase1_cache_without_duplicate_build():
+    parameters = _parameter_cell_source()
+    assert "NARR_PRISM_WAIT_FOR_ACTIVE_PHASE1_CACHE', True" in parameters
+    assert "NARR_PRISM_PHASE1_CACHE_WAIT_POLL_SECONDS', '60'" in parameters
+
+    training_cell = _cell_source_containing(
+        "Attaching to the existing cache build"
+    )
+    assert "wait_for_cache_completion(" in training_cell
+    assert "status_callback=report_cache_wait" in training_cell
+    assert "observed_present_count" in training_cell
+    assert "except CacheBuildNotActiveError:" in training_cell
+    assert "except subprocess.CalledProcessError as build_exc:" in training_cell
+    assert "raise build_exc" in training_cell
+    assert (
+        "Notebook wait interrupted; the external cache builder continues safely."
+        in training_cell
+    )
+    wait_offset = training_cell.index("cache_manifest = wait_for_existing_cache()")
+    launch_offset = training_cell.index(
+        "run_streaming_command(cache_command, cwd=REPO_ROOT)"
+    )
+    assert wait_offset < launch_offset
+
+
 def test_streaming_command_forwards_carriage_returns_and_failures(
     tmp_path, capsys
 ):
