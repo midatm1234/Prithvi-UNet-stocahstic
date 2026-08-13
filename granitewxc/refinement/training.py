@@ -60,6 +60,19 @@ def _move_batch(batch: Mapping[str, Any], device: torch.device, non_blocking: bo
     return moved
 
 
+def _loader_steps(
+    loader: Iterable[Mapping[str, Any]], limit_steps: int
+) -> int | None:
+    """Return the number of batches that this run will actually consume."""
+    try:
+        available = len(loader)  # type: ignore[arg-type]
+    except (TypeError, NotImplementedError):
+        available = None
+    if limit_steps > 0:
+        return min(limit_steps, available) if available is not None else limit_steps
+    return available
+
+
 def _flatten_contract(
     value: Any, prefix: str = ""
 ) -> dict[str, Any]:
@@ -369,77 +382,96 @@ class RefinementTrainer:
         loader: Iterable[Mapping[str, Any]],
         limit_steps: int = 0,
         epoch: int = 0,
+        progress_bar: Any | None = None,
     ) -> float:
         self.model.train()
         total, count = 0.0, 0
         self.optimizer.zero_grad(set_to_none=True)
 
-        available = len(loader) if hasattr(loader, "__len__") else None
-        n = min(limit_steps, available) if limit_steps > 0 and available is not None else (
-            limit_steps if limit_steps > 0 else available
-        )
+        n = _loader_steps(loader, limit_steps)
         ep_label = f"Ep {epoch+1:03d} train"
-        bar = tqdm(total=n, desc=ep_label, unit="batch", ascii=" #", ncols=100, leave=True)
-        for step, batch in enumerate(loader):
-            if limit_steps and step >= limit_steps:
-                break
-            batch = _move_batch(batch, self.device, self.non_blocking)
-            with self._autocast():
-                output = self.model.training_step(batch, generator=self._generator)
-                loss = output.losses["loss"]
-            if not torch.isfinite(loss):
-                bar.close()
-                raise RuntimeError(f"Non-finite refinement loss at step {step}: {loss.item()}")
-
-            # Scale by the actual accumulation group size. The final partial
-            # group must not be discarded or underweighted (important for smoke
-            # tests and tiny-overfit runs where batches < accumulation steps).
-            if n is not None:
-                group_start = (step // self.accum) * self.accum
-                group_size = min(self.accum, n - group_start)
-            else:
-                group_size = self.accum
-            scaled = loss / max(1, group_size)
-            if self.scaler is not None and self.scaler.is_enabled():
-                self.scaler.scale(scaled).backward()
-            else:
-                scaled.backward()
-
-            group_boundary = (step + 1) % self.accum == 0
-            final_known_batch = n is not None and (step + 1) == n
-            if group_boundary or final_known_batch:
-                if self.max_grad_norm:
-                    if self.scaler is not None and self.scaler.is_enabled():
-                        self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in self.model.parameters() if p.requires_grad], self.max_grad_norm
+        owns_bar = progress_bar is None
+        bar = (
+            progress_bar
+            if progress_bar is not None
+            else tqdm(
+                total=n,
+                desc=ep_label,
+                unit="batch",
+                ascii=" #",
+                ncols=100,
+                leave=True,
+                mininterval=1.0,
+            )
+        )
+        bar.set_postfix(stage="train", refresh=True)
+        try:
+            for step, batch in enumerate(loader):
+                if limit_steps and step >= limit_steps:
+                    break
+                batch = _move_batch(batch, self.device, self.non_blocking)
+                with self._autocast():
+                    output = self.model.training_step(batch, generator=self._generator)
+                    loss = output.losses["loss"]
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        f"Non-finite refinement loss at step {step}: {loss.item()}"
                     )
-                if self.scaler is not None and self.scaler.is_enabled():
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
-                self.optimizer.zero_grad(set_to_none=True)
-                self.state.global_step += 1
-                if self.state.global_step < self.warmup_steps:
-                    factor = float(self.state.global_step + 1) / float(self.warmup_steps)
-                    for group, base_lr in zip(
-                        self.optimizer.param_groups, self._base_lrs, strict=True
-                    ):
-                        group["lr"] = base_lr * factor
-                elif self.scheduler is not None:
-                    self.scheduler.step()
 
-            total += float(loss.detach())
-            count += 1
-            bar.update(1)
-            if count % self.log_every == 0:
-                bar.set_postfix(
-                    loss=f"{total / count:.4f}",
-                    lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
-                )
-                bar.refresh()
-        bar.close()
+                # Scale by the actual accumulation group size. The final partial
+                # group must not be discarded or underweighted (important for smoke
+                # tests and tiny-overfit runs where batches < accumulation steps).
+                if n is not None:
+                    group_start = (step // self.accum) * self.accum
+                    group_size = min(self.accum, n - group_start)
+                else:
+                    group_size = self.accum
+                scaled = loss / max(1, group_size)
+                if self.scaler is not None and self.scaler.is_enabled():
+                    self.scaler.scale(scaled).backward()
+                else:
+                    scaled.backward()
+
+                group_boundary = (step + 1) % self.accum == 0
+                final_known_batch = n is not None and (step + 1) == n
+                if group_boundary or final_known_batch:
+                    if self.max_grad_norm:
+                        if self.scaler is not None and self.scaler.is_enabled():
+                            self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for p in self.model.parameters() if p.requires_grad],
+                            self.max_grad_norm,
+                        )
+                    if self.scaler is not None and self.scaler.is_enabled():
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.state.global_step += 1
+                    if self.state.global_step < self.warmup_steps:
+                        factor = float(self.state.global_step + 1) / float(
+                            self.warmup_steps
+                        )
+                        for group, base_lr in zip(
+                            self.optimizer.param_groups, self._base_lrs, strict=True
+                        ):
+                            group["lr"] = base_lr * factor
+                    elif self.scheduler is not None:
+                        self.scheduler.step()
+
+                total += float(loss.detach())
+                count += 1
+                bar.update(1)
+                if count % self.log_every == 0:
+                    bar.set_postfix(
+                        stage="train",
+                        train_loss=f"{total / count:.4f}",
+                        lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                    )
+        finally:
+            if owns_bar:
+                bar.close()
         # Iterable loaders without __len__ cannot announce the final group. If
         # one remains, rescale its gradients from /accum to /actual_count and
         # flush it once rather than silently losing the update.
@@ -478,32 +510,49 @@ class RefinementTrainer:
         loader: Iterable[Mapping[str, Any]],
         limit_steps: int = 0,
         epoch: int = 0,
+        progress_bar: Any | None = None,
     ) -> float:
         self.model.eval()
         total, count = 0.0, 0
-        n = limit_steps if limit_steps > 0 else (len(loader) if hasattr(loader, "__len__") else None)
-        bar = tqdm(total=n, desc=f"Ep {epoch+1:03d} val  ", unit="batch", ascii=" #",
-                   ncols=100, leave=True)
-        for step, batch in enumerate(loader):
-            if limit_steps and step >= limit_steps:
-                break
-            batch = _move_batch(batch, self.device, self.non_blocking)
-            with self._autocast():
-                output = self.model.training_step(batch, generator=self._generator)
-                loss = output.losses["loss"]
-            if not torch.isfinite(loss):
+        n = _loader_steps(loader, limit_steps)
+        owns_bar = progress_bar is None
+        bar = (
+            progress_bar
+            if progress_bar is not None
+            else tqdm(
+                total=n,
+                desc=f"Ep {epoch+1:03d} val  ",
+                unit="batch",
+                ascii=" #",
+                ncols=100,
+                leave=True,
+                mininterval=1.0,
+            )
+        )
+        bar.set_postfix(stage="validation", refresh=True)
+        try:
+            for step, batch in enumerate(loader):
+                if limit_steps and step >= limit_steps:
+                    break
+                batch = _move_batch(batch, self.device, self.non_blocking)
+                with self._autocast():
+                    output = self.model.training_step(batch, generator=self._generator)
+                    loss = output.losses["loss"]
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        "Non-finite refinement validation loss at step "
+                        f"{step}: {loss.item()}"
+                    )
+                total += float(loss.detach())
+                count += 1
+                bar.update(1)
+                if count % self.log_every == 0:
+                    bar.set_postfix(
+                        stage="validation", val_loss=f"{total / count:.4f}"
+                    )
+        finally:
+            if owns_bar:
                 bar.close()
-                raise RuntimeError(
-                    "Non-finite refinement validation loss at step "
-                    f"{step}: {loss.item()}"
-                )
-            total += float(loss.detach())
-            count += 1
-            bar.update(1)
-            if count % self.log_every == 0:
-                bar.set_postfix(val_loss=f"{total / count:.4f}")
-                bar.refresh()
-        bar.close()
         return total / max(1, count)
 
     def fit(
@@ -516,17 +565,58 @@ class RefinementTrainer:
         limit_steps_valid: int = 0,
         save_every: int = 1,
     ) -> RefinementTrainState:
-        for ep in range(self.state.epoch, self.state.epoch + num_epochs):
-            train_loss = self.train_one_epoch(
-                train_loader, limit_steps=limit_steps_train, epoch=ep
+        final_epoch = self.state.epoch + num_epochs
+        for ep in range(self.state.epoch, final_epoch):
+            train_steps = _loader_steps(train_loader, limit_steps_train)
+            val_steps = (
+                _loader_steps(val_loader, limit_steps_valid)
+                if val_loader is not None
+                else 0
             )
-            self.state.train_loss_history.append(train_loss)
-            val_loss = None
-            if val_loader is not None:
-                val_loss = self.validate(
-                    val_loader, limit_steps=limit_steps_valid, epoch=ep
+            progress_total = (
+                train_steps + val_steps
+                if train_steps is not None and val_steps is not None
+                else None
+            )
+            epoch_bar = tqdm(
+                total=progress_total,
+                desc=f"Epoch {ep+1:03d}/{final_epoch:03d}",
+                unit="batch",
+                ascii=" #",
+                ncols=100,
+                leave=True,
+                mininterval=1.0,
+            )
+            try:
+                train_loss = self.train_one_epoch(
+                    train_loader,
+                    limit_steps=limit_steps_train,
+                    epoch=ep,
+                    progress_bar=epoch_bar,
                 )
-                self.state.val_loss_history.append(val_loss)
+                self.state.train_loss_history.append(train_loss)
+                val_loss = None
+                if val_loader is not None:
+                    epoch_bar.set_postfix(
+                        stage="validation", train_loss=f"{train_loss:.4f}"
+                    )
+                    val_loss = self.validate(
+                        val_loader,
+                        limit_steps=limit_steps_valid,
+                        epoch=ep,
+                        progress_bar=epoch_bar,
+                    )
+                    self.state.val_loss_history.append(val_loss)
+                final_postfix = {
+                    "stage": "complete",
+                    "train_loss": f"{train_loss:.4f}",
+                    "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                }
+                if val_loss is not None:
+                    final_postfix["val_loss"] = f"{val_loss:.4f}"
+                epoch_bar.set_postfix(**final_postfix)
+            finally:
+                epoch_bar.close()
             is_best = val_loss is not None and (
                 self.state.best_val_loss is None or val_loss < self.state.best_val_loss
             )

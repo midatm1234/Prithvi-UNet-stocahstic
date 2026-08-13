@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import codecs
 import importlib.util
 import json
 import os
@@ -315,6 +316,46 @@ def test_notebook_has_one_parameter_cell_and_complete_workflow_sections():
     assert "'scientific_validation': not SMOKE_TEST" not in text
     assert "'scientific_validation': scientific_validation_completed" in text
     assert "scientific_validation_report.is_file()" in text
+    assert "one live combined train-and-validation `tqdm` bar" in text
+    assert "run_streaming_command(train_command, cwd=REPO_ROOT)" in text
+    assert "subprocess.run(train_command" not in text
+
+
+def test_streaming_command_forwards_carriage_returns_and_failures(
+    tmp_path, capsys
+):
+    runner = _notebook_function(
+        "run_streaming_command",
+        {
+            "codecs": codecs,
+            "os": os,
+            "subprocess": subprocess,
+            "sys": sys,
+        },
+    )
+    completed = runner(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.stderr.write('epoch 1: 1/2\\r'); sys.stderr.flush(); "
+                "sys.stderr.write('epoch 1: 2/2\\n'); sys.stderr.flush()"
+            ),
+        ],
+        cwd=tmp_path,
+    )
+    rendered = capsys.readouterr().out
+    assert completed.returncode == 0
+    assert "epoch 1: 1/2\r" in rendered
+    assert "epoch 1: 2/2\n" in rendered
+
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        runner(
+            [sys.executable, "-c", "raise SystemExit(7)"],
+            cwd=tmp_path,
+        )
+    assert exc_info.value.returncode == 7
 
 
 def test_production_subprocesses_release_eager_gpu_state_after_diagnostics():
@@ -338,16 +379,20 @@ def test_production_subprocesses_release_eager_gpu_state_after_diagnostics():
     assert "gc.collect()" in inspection_cell
     assert "torch.cuda.empty_cache()" in inspection_cell
 
-    for command_name in ("train_command", "infer_command"):
+    command_invocations = (
+        "run_streaming_command(train_command, cwd=REPO_ROOT)",
+        (
+            "subprocess.run(infer_command, cwd=REPO_ROOT, check=True)"
+        ),
+    )
+    for invocation in command_invocations:
         command_cell = _cell_source_containing(
-            f"subprocess.run({command_name}, cwd=REPO_ROOT, check=True)"
+            invocation
         )
         release_offset = command_cell.index(
             "release_production_inspection_state()"
         )
-        subprocess_offset = command_cell.index(
-            f"subprocess.run({command_name}, cwd=REPO_ROOT, check=True)"
-        )
+        subprocess_offset = command_cell.index(invocation)
         assert release_offset < subprocess_offset
 
 
@@ -364,7 +409,7 @@ def test_combined_training_and_inference_defers_checkpoint_requirement():
         in training_cell
     )
     train_offset = training_cell.index(
-        "subprocess.run(train_command, cwd=REPO_ROOT, check=True)"
+        "run_streaming_command(train_command, cwd=REPO_ROOT)"
     )
     selection_offset = training_cell.index(
         "REFINEMENT_PATH = select_trained_refinement_checkpoint"

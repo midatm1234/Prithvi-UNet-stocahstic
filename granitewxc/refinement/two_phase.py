@@ -24,11 +24,13 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
+from itertools import islice
 from typing import Any, Mapping
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from tqdm import tqdm
 
 from granitewxc.refinement.base import ChunkNoiseSource, ResidualRefiner, build_refiner
 from granitewxc.refinement.config import (
@@ -41,6 +43,30 @@ from granitewxc.refinement.config import (
 from granitewxc.refinement.target_space import NormalizedTargetSpace
 
 __all__ = ["TwoPhaseOutput", "TwoPhaseDownscalingModel", "build_two_phase_model"]
+
+
+def _bounded_batches(loader, max_batches: int | None):
+    """Return an iterator and its exact advertised batch count when available."""
+    batch_limit = (
+        int(max_batches)
+        if max_batches is not None and int(max_batches) > 0
+        else None
+    )
+    try:
+        available_batches = len(loader)
+    except (TypeError, NotImplementedError):
+        available_batches = None
+    total = available_batches
+    if batch_limit is not None:
+        total = (
+            min(batch_limit, available_batches)
+            if available_batches is not None
+            else batch_limit
+        )
+    batches = iter(loader)
+    if batch_limit is not None:
+        batches = islice(batches, batch_limit)
+    return batches, total
 
 
 @dataclass
@@ -703,12 +729,15 @@ class TwoPhaseDownscalingModel(nn.Module):
         *,
         device: torch.device | str | None = None,
         max_batches: int | None = None,
+        show_progress: bool = False,
     ) -> dict[str, Any]:
-        """Fit per-variable residual statistics on the supplied training loader.
+        """Fit per-variable residual statistics on the training loader.
 
         This operation is deliberately unavailable when Phase 1 is trainable:
         changing the deterministic baseline would immediately stale the fitted
-        residual distribution.
+        residual distribution.  Progress reporting is opt-in so library callers
+        remain quiet; the NARR--PRISM training CLI enables it for this
+        potentially long pre-training pass.
         """
         if self.refiner is not None and not self.refiner.residual_normalization_enabled:
             return self.refiner.residual_normalization_metadata()
@@ -726,27 +755,48 @@ class TwoPhaseDownscalingModel(nn.Module):
         squares = torch.zeros_like(sums)
         counts = torch.zeros(self.target_space.num_channels, dtype=torch.int64, device=device)
         seen = 0
-        for batch in loader:
-            if max_batches is not None and max_batches > 0 and seen >= max_batches:
-                break
-            moved = {
-                key: value.to(device) if torch.is_tensor(value) else value
-                for key, value in batch.items()
-            }
-            _, baseline, features = self.run_phase1(moved)
-            cond = self.build_conditioning(moved, baseline, features)
-            self.initialize_refiner(cond.shape[1])
-            offset = moved.get("__output_scaler_offset", moved.get("__scaler_offset"))
-            residual, valid = self.target_space.residual_target(
-                moved["y"], baseline, scaler_offset=offset
+        # Limit the iterator itself.  Checking the limit inside a ``for`` loop
+        # fetches (and may preprocess) one unwanted batch before it can break.
+        batches, progress_total = _bounded_batches(loader, max_batches)
+        progress = (
+            tqdm(
+                total=progress_total,
+                desc="Residual-normalization scan",
+                unit="batch",
+                leave=True,
+                dynamic_ncols=True,
+                mininterval=1.0,
             )
-            values = residual.double()
-            valid_d = valid.double()
-            axes = (0, 2, 3)
-            sums += (values * valid_d).sum(dim=axes)
-            squares += (values.square() * valid_d).sum(dim=axes)
-            counts += valid.sum(dim=axes)
-            seen += 1
+            if show_progress
+            else None
+        )
+        try:
+            for batch in batches:
+                moved = {
+                    key: value.to(device) if torch.is_tensor(value) else value
+                    for key, value in batch.items()
+                }
+                _, baseline, features = self.run_phase1(moved)
+                cond = self.build_conditioning(moved, baseline, features)
+                self.initialize_refiner(cond.shape[1])
+                offset = moved.get(
+                    "__output_scaler_offset", moved.get("__scaler_offset")
+                )
+                residual, valid = self.target_space.residual_target(
+                    moved["y"], baseline, scaler_offset=offset
+                )
+                values = residual.double()
+                valid_d = valid.double()
+                axes = (0, 2, 3)
+                sums += (values * valid_d).sum(dim=axes)
+                squares += (values.square() * valid_d).sum(dim=axes)
+                counts += valid.sum(dim=axes)
+                seen += 1
+                if progress is not None:
+                    progress.update(1)
+        finally:
+            if progress is not None:
+                progress.close()
         if self.refiner is None or seen == 0:
             raise RuntimeError("Cannot fit residual normalization: training loader was empty.")
         if bool((counts <= 0).any()):

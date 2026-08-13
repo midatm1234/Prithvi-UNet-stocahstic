@@ -239,6 +239,7 @@ def cmd_train(args) -> int:
             train_loader,
             device=device,
             max_batches=fit_limit or None,
+            show_progress=True,
         )
         print(f"[refinement] residual normalization: {json.dumps(metadata, indent=2)}")
     print(f"[refinement] {json.dumps(model.describe()['refinement'], indent=2)}")
