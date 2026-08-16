@@ -118,7 +118,7 @@ DEVICE_TARGET = "cuda"
 NUM_WORKERS = 2
 INFERENCE_BATCH_SIZE = 8  # inference-only; does not affect model weights
 PREFERRED_CHECKPOINT = "best"  # Phase-1 fallback only
-REFINEMENT_CHECKPOINT_NAME = "last.ckpt"
+REFINEMENT_CHECKPOINT_NAME = "last.ckpt"  # choose "best.ckpt" or "last.ckpt"
 REFINEMENT_ENSEMBLE_SIZE = 5
 MIN_FREE_GB = 8  # minimum free GPU memory to consider "idle"
 MAX_GPUS = 1  # set to an int to cap how many GPUs to expose
@@ -639,13 +639,9 @@ def _resolve_refinement_checkpoint(config) -> Path:
     if configured_dir.is_absolute():
         candidates = [configured_dir / REFINEMENT_CHECKPOINT_NAME]
     else:
-        # The refinement notebook runs with cwd=PROJECT_DIR, while YAML paths
-        # are commonly authored relative to REPO_ROOT. Support both meanings.
-        candidates = [
-            (REPO_ROOT / configured_dir / REFINEMENT_CHECKPOINT_NAME).resolve(),
-            (PROJECT_DIR / configured_dir / REFINEMENT_CHECKPOINT_NAME).resolve(),
-        ]
-    candidates = list(dict.fromkeys(candidates))
+        # Config paths are always repository-root-relative. Never probe below
+        # PROJECT_DIR, which could silently reuse an accidentally nested run.
+        candidates = [(REPO_ROOT / configured_dir / REFINEMENT_CHECKPOINT_NAME).resolve()]
     existing = [path for path in candidates if path.is_file()]
     if len(existing) == 1:
         return existing[0]
@@ -666,6 +662,7 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
     config.dl_num_workers = int(NUM_WORKERS) if NUM_WORKERS is not None else config.dl_num_workers
     config.batch_size = int(INFERENCE_BATCH_SIZE) if INFERENCE_BATCH_SIZE is not None else config.batch_size
     config.device_target = DEVICE_TARGET
+    config.path_experiment = str(_resolve_repo_path(config.path_experiment))
     if USE_STATIC is not None:
         config.data.use_static = bool(USE_STATIC)
     if STATIC_PATH:

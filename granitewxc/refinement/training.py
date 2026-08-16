@@ -64,8 +64,7 @@ class RefinementTrainer:
     Args:
         model: an initialised :class:`TwoPhaseDownscalingModel`.
         optimizer / scheduler / scaler: standard PyTorch objects.
-        checkpoint_dir: destination for ``last.ckpt`` / ``best.ckpt`` /
-            ``epoch_XXX.ckpt``.
+        checkpoint_dir: destination for ``last.ckpt`` and ``best.ckpt``.
         phase1_checkpoint: path of the deterministic checkpoint Phase 1 was
             loaded from. Recorded (with its fingerprint) in every refinement
             checkpoint so a mismatch is detected on resume.
@@ -143,7 +142,7 @@ class RefinementTrainer:
         )
         return payload
 
-    def save(self, *, is_best: bool = False, kind: str | None = None, epoch_file: bool = True) -> str:
+    def save(self, *, is_best: bool = False, kind: str | None = None) -> str:
         kind = kind or (
             CHECKPOINT_KIND_COMBINED
             if self.model.refinement_config.joint_finetuning
@@ -153,12 +152,6 @@ class RefinementTrainer:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         last = os.path.join(self.checkpoint_dir, "last.ckpt")
         save_checkpoint_atomic(payload, last, atomic=self.atomic)
-        if epoch_file:
-            save_checkpoint_atomic(
-                payload,
-                os.path.join(self.checkpoint_dir, f"epoch_{self.state.epoch:03d}.ckpt"),
-                atomic=self.atomic,
-            )
         if is_best:
             save_checkpoint_atomic(
                 payload, os.path.join(self.checkpoint_dir, "best.ckpt"), atomic=self.atomic
@@ -315,8 +308,12 @@ class RefinementTrainer:
         num_epochs: int = 1,
         limit_steps_train: int = 0,
         limit_steps_valid: int = 0,
-        save_every: int = 1,
+        save_every: int | None = None,
     ) -> RefinementTrainState:
+        # ``save_every`` is retained as a no-op for compatibility with older
+        # notebooks. Refinement training intentionally keeps only best.ckpt
+        # and the resumable last.ckpt.
+        _ = save_every
         for ep in range(self.state.epoch, self.state.epoch + num_epochs):
             train_loss = self.train_one_epoch(
                 train_loader, limit_steps=limit_steps_train, epoch=ep
@@ -340,6 +337,5 @@ class RefinementTrainer:
             # ``state.epoch`` is advanced *before* saving so a checkpoint records
             # the number of completed epochs, i.e. the epoch to resume at.
             self.state.epoch += 1
-            epoch_file = save_every > 0 and self.state.epoch % save_every == 0
-            self.save(is_best=is_best, epoch_file=epoch_file)
+            self.save(is_best=is_best)
         return self.state

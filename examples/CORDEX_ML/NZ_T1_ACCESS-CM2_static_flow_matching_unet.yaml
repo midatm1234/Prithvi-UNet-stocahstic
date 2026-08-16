@@ -61,10 +61,10 @@ data:
   crop_factor: 256
   downsample_factor: 8
   scalers:
-    inputs_mean: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_scalars/inputs_mean.npy
-    inputs_std: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_scalars/inputs_std.npy
-    targets_mean: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_scalars/targets_mean.npy
-    targets_std: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_scalars/targets_std.npy
+    inputs_mean: ./experiments/NZ_T1_ACCESS-CM2_static_scalars/inputs_mean.npy
+    inputs_std: ./experiments/NZ_T1_ACCESS-CM2_static_scalars/inputs_std.npy
+    targets_mean: ./experiments/NZ_T1_ACCESS-CM2_static_scalars/targets_mean.npy
+    targets_std: ./experiments/NZ_T1_ACCESS-CM2_static_scalars/targets_std.npy
 predictands:
   pr:
     name: pr
@@ -92,10 +92,10 @@ predictands:
       scale_stat: mean
       fixed_scale: null
 model:
-  input_mu: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_scalars/inputs_mean.npy
-  input_sigma: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_scalars/inputs_std.npy
-  target_mu: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_scalars/targets_mean.npy
-  target_sigma: ./examples/CORDEX_ML/experiments/NZ_T1_ACCESS-CM2_static_scalars/targets_std.npy
+  input_mu: ./experiments/NZ_T1_ACCESS-CM2_static_scalars/inputs_mean.npy
+  input_sigma: ./experiments/NZ_T1_ACCESS-CM2_static_scalars/inputs_std.npy
+  target_mu: ./experiments/NZ_T1_ACCESS-CM2_static_scalars/targets_mean.npy
+  target_sigma: ./experiments/NZ_T1_ACCESS-CM2_static_scalars/targets_std.npy
   embed_dim: 1024
   n_blocks_encoder: 8
   mlp_multiplier: 4
@@ -121,7 +121,7 @@ model:
   encoder_shift: false
   unet: true
   phase1:
-    checkpoint: ./examples/CORDEX_ML/experiments/checkpoints/cordex_nz_t1_access_cm2_static/last.ckpt
+    checkpoint: ./experiments/checkpoints/cordex_nz_t1_access_cm2_static/last.ckpt
     freeze: true
     return_prithvi_features: false
     return_unet_features: false
@@ -173,7 +173,7 @@ mask_unit_size:
 mask_ratio_inputs: 0.0
 mask_ratio_targets: 0.0
 max_batch_size: 4
-path_experiment: ./examples/CORDEX_ML/experiments
+path_experiment: ./experiments
 path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET.pt
 backbone_use: true
 backbone_freeze: false
@@ -236,5 +236,5 @@ performance:
     atomic_checkpoints: true
     netcdf_compression: true
     netcdf_compression_level: 4
-checkpoint_dir: ./examples/CORDEX_ML/experiments/refinement_checkpoints/flow_matching_unet
+checkpoint_dir: ./experiments/refinement_checkpoints/flow_matching_unet
 case_name: cordex_nz_t1_access_cm2_static

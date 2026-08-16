@@ -201,7 +201,7 @@ mask_unit_size:
 mask_ratio_inputs: 0.0
 mask_ratio_targets: 0.0
 max_batch_size: 4
-path_experiment: ./examples/CORDEX_ML/experiments
+path_experiment: ./experiments
 path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET.pt
 backbone_use: true
 backbone_freeze: false
@@ -344,5 +344,5 @@ performance:
     atomic_checkpoints: true
     netcdf_compression: true
     netcdf_compression_level: 4
-checkpoint_dir: ./examples/CORDEX_ML/experiments/refinement_checkpoints/SA_T2_ACCESS-CM2_static/flow_matching_transformer
+checkpoint_dir: ./experiments/refinement_checkpoints/SA_T2_ACCESS-CM2_static/flow_matching_transformer
 case_name: cordex_sa_t2_access_cm2_static

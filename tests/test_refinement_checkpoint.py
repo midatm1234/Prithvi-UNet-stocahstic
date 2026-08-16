@@ -238,7 +238,12 @@ def test_save_and_resume_restores_full_training_state(refiner_type, tmp_path):
         seed=7,
         logger=lambda _msg: None,
     )
-    trainer.fit([batch], [batch], num_epochs=2, save_every=1)
+    trainer.fit([batch], [batch], num_epochs=2)
+
+    assert sorted(path.name for path in tmp_path.glob("*.ckpt")) == [
+        "best.ckpt",
+        "last.ckpt",
+    ]
 
     assert trainer.state.epoch == 2
     assert trainer.state.global_step == 2
