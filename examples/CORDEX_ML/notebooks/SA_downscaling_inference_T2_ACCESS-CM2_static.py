@@ -598,6 +598,12 @@ def _resolve_project_path(value: str | os.PathLike) -> Path:
     return path.resolve() if path.is_absolute() else (PROJECT_DIR / path).resolve()
 
 
+def _resolve_yaml_path(value: str | os.PathLike, config_path: Path) -> Path:
+    """Resolve a path using the directory containing its YAML as the base."""
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (config_path.parent / path).resolve()
+
+
 def _resolve_dataset_root(config) -> Path:
     """Derive SA_domain from YAML-owned data paths; never guess it silently."""
     configured = []
@@ -639,21 +645,55 @@ def _resolve_test_predictor(dataset_root: Path, test_split: str, filename: str) 
     raise FileNotFoundError(f"Test predictor not found; tried:\n  {attempted}")
 
 
-def _resolve_refinement_checkpoint(config) -> Path:
-    configured_dir = Path(config.checkpoint_dir).expanduser()
-    if configured_dir.is_absolute():
-        candidates = [configured_dir / REFINEMENT_CHECKPOINT_NAME]
+def _resolve_refinement_checkpoint(config, config_path: Path = CONFIG_PATH) -> Path:
+    """Resolve the refinement checkpoint declared by ``config_path``.
+
+    ``model.refinement.checkpoint`` may name an explicit checkpoint. When it
+    is unset, ``checkpoint_dir/last.ckpt`` is used. Relative paths in both
+    fields are relative to the YAML file, never to the process working
+    directory.
+    """
+    config_path = Path(config_path).expanduser().resolve()
+    refinement_config = getattr(config.model, "refinement", None) or {}
+    explicit_checkpoint = refinement_config.get("checkpoint")
+
+    if explicit_checkpoint:
+        checkpoint_path = _resolve_yaml_path(explicit_checkpoint, config_path)
+        if checkpoint_path.is_dir():
+            checkpoint_path /= REFINEMENT_CHECKPOINT_NAME
+        source = "model.refinement.checkpoint"
     else:
-        # Experiment artifacts are local to this example project.
-        candidates = [(PROJECT_DIR / configured_dir / REFINEMENT_CHECKPOINT_NAME).resolve()]
-    existing = [path for path in candidates if path.is_file()]
-    if len(existing) == 1:
-        return existing[0]
-    if len(existing) > 1:
-        print(f"[checkpoint] multiple last.ckpt candidates found; using {existing[0]}")
-        return existing[0]
-    attempted = "\n  ".join(str(path) for path in candidates)
-    raise FileNotFoundError(f"refinement last.ckpt not found; tried:\n  {attempted}")
+        configured_dir = getattr(config, "checkpoint_dir", None)
+        if not configured_dir:
+            raise ValueError(
+                f"{config_path} must define checkpoint_dir or "
+                "model.refinement.checkpoint"
+            )
+        checkpoint_path = (
+            _resolve_yaml_path(configured_dir, config_path) / REFINEMENT_CHECKPOINT_NAME
+        )
+        source = "checkpoint_dir"
+
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Refinement checkpoint from {source} in {config_path} was not found: "
+            f"{checkpoint_path}"
+        )
+    return checkpoint_path
+
+
+def _load_refinement_checkpoint(path: Path, expected_type: str) -> dict:
+    payload = torch.load(str(path), map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), dict):
+        raise RuntimeError(f"Invalid refinement checkpoint payload: {path}")
+
+    checkpoint_type = payload.get("refinement_type")
+    if checkpoint_type and checkpoint_type != expected_type:
+        raise RuntimeError(
+            f"Refinement checkpoint type mismatch: YAML requests {expected_type!r}, "
+            f"but {path} contains {checkpoint_type!r}"
+        )
+    return payload
 
 
 def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, Path]:
@@ -673,7 +713,7 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
         config.data.static_path = str(Path(STATIC_PATH).resolve())
 
     phase1_path = _resolve_repo_path(config.model.phase1["checkpoint"])
-    refinement_path = _resolve_refinement_checkpoint(config)
+    refinement_path = _resolve_refinement_checkpoint(config, CONFIG_PATH)
     if not phase1_path.is_file():
         raise FileNotFoundError(f"Phase-1 checkpoint not found: {phase1_path}")
     assert_no_eccc_reference(phase1_path)
@@ -682,7 +722,9 @@ def _load_model_and_config() -> tuple[str, Path, Path, object, torch.nn.Module, 
     model = build_two_phase_model(get_finetune_model_UNET(config), config)
     phase1_payload = torch.load(str(phase1_path), map_location="cpu", weights_only=True)
     print(f"[checkpoint] loaded Phase 1: {load_phase1_state_dict(model, phase1_payload).summary()}")
-    refinement_payload = torch.load(str(refinement_path), map_location="cpu", weights_only=True)
+    refinement_payload = _load_refinement_checkpoint(
+        refinement_path, str(config.model.refinement["type"])
+    )
     validate_phase1_reference(refinement_payload, model.phase1.state_dict(), strict=True)
     model._last_checkpoint_payload = refinement_payload
     model._last_checkpoint_loaded = False
