@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 import narr_prism_phase1_cache as cache_module
 from narr_prism_phase1_cache import (
@@ -345,7 +346,9 @@ def test_repair_invalid_deep_validates_existing_file_and_rebuilds(
         "_prepare_manifest",
         lambda *_args, **_kwargs: (manifest, manifest_path),
     )
-    monkeypatch.setattr(cache_module, "_load_model", lambda *_args, **_kwargs: FakeModel())
+    monkeypatch.setattr(
+        cache_module, "_load_model", lambda *_args, **_kwargs: FakeModel()
+    )
     monkeypatch.setattr(
         cache_module,
         "load_target_valid_mask",
@@ -393,7 +396,9 @@ def test_repair_invalid_deep_validates_existing_file_and_rebuilds(
     assert rebuilt == [output_path]
 
 
-def test_parallel_worker_argv_is_registered_and_parseable(monkeypatch, tmp_path):
+def test_parallel_worker_argv_is_registered_and_parseable(
+    monkeypatch, tmp_path
+):
     parser = build_parser()
     direct = parser.parse_args(
         [
@@ -637,9 +642,10 @@ def test_wait_for_cache_completion_polls_active_owner_then_validates(
     )
     assert result is complete
     assert len(statuses) == 1
-    assert statuses[0]["summary"]["splits"]["training"][
-        "observed_present_count"
-    ] == 7
+    assert (
+        statuses[0]["summary"]["splits"]["training"]["observed_present_count"]
+        == 7
+    )
     assert validated_calls == [
         (False, True),
         (False, False),
@@ -663,7 +669,9 @@ def test_wait_for_cache_completion_requests_resume_when_unowned(
             }
         ),
     )
-    monkeypatch.setattr(cache_module, "describe_cache", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        cache_module, "describe_cache", lambda *args, **kwargs: {}
+    )
     monkeypatch.setattr(
         cache_module,
         "cache_build_activity",
@@ -753,7 +761,6 @@ def test_describe_reports_observed_progress_without_claiming_completion(
     assert validated["splits"]["validation"]["observed_invalid_examples"]
 
 
-
 def test_inherited_worker_lease_blocks_resume_until_orphan_exits(tmp_path):
     lease = CacheWorkerLease(tmp_path, command=["original-parent"]).acquire()
     child = Popen(
@@ -801,3 +808,62 @@ def test_sigterm_handler_stops_children_before_releasing_worker_lease():
         assert released == [True]
     finally:
         _restore_signal_handlers(previous)
+
+
+def test_cache_builder_numeric_policy_is_explicit(monkeypatch):
+    prior_matmul_precision = torch.get_float32_matmul_precision()
+    prior_matmul_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
+    prior_cudnn_tf32 = bool(torch.backends.cudnn.allow_tf32)
+    prior_benchmark = bool(torch.backends.cudnn.benchmark)
+    prior_deterministic = bool(torch.backends.cudnn.deterministic)
+    prior_algorithms = torch.are_deterministic_algorithms_enabled()
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    try:
+        policy = cache_module.configure_phase1_cache_numerics()
+        assert policy == {
+            "dtype": "float32",
+            "autocast": False,
+            "allow_tf32": False,
+            "float32_matmul_precision": "highest",
+            "deterministic_algorithms": True,
+            "cudnn_deterministic": True,
+            "cudnn_benchmark": False,
+            "cublas_workspace_config": ":4096:8",
+        }
+    finally:
+        torch.set_float32_matmul_precision(prior_matmul_precision)
+        torch.backends.cuda.matmul.allow_tf32 = prior_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = prior_cudnn_tf32
+        torch.backends.cudnn.benchmark = prior_benchmark
+        torch.backends.cudnn.deterministic = prior_deterministic
+        torch.use_deterministic_algorithms(prior_algorithms)
+
+
+def test_cache_builder_rejects_conflicting_cublas_policy(monkeypatch):
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    with pytest.raises(RuntimeError, match="requires CUBLAS_WORKSPACE_CONFIG"):
+        cache_module.configure_phase1_cache_numerics()
+
+
+def test_complete_inventory_validation_can_report_progress(
+    tmp_path, monkeypatch
+):
+    manifest, manifest_path, split_dates = _manifest(tmp_path)
+    _write_days(manifest, manifest_path, split_dates)
+    finalize_cache(manifest_path)
+    calls = []
+
+    def fake_tqdm(values, **kwargs):
+        materialized = list(values)
+        calls.append((kwargs["desc"], kwargs["unit"], len(materialized)))
+        return materialized
+
+    monkeypatch.setattr(cache_module, "tqdm", fake_tqdm)
+    loaded = load_and_validate_manifest(
+        manifest_path, show_inventory_progress=True
+    )
+    assert loaded["state"] == "complete"
+    assert calls == [
+        ("Validate Phase1 cache (training)", "day", 2),
+        ("Validate Phase1 cache (validation)", "day", 1),
+    ]

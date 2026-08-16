@@ -137,6 +137,44 @@ TARGET_SPACE_NAME = "phase1_normalized_target_space"
 RESIDUAL_DEFINITION = (
     "encode(PRISM_target_physical)-encode(Phase1_deterministic_physical)"
 )
+PHASE1_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+
+
+def configure_phase1_cache_numerics() -> dict[str, Any]:
+    """Apply the exact FP32 CUDA policy used to create cached Phase-1 fields.
+
+    PyTorch's CUDA defaults are process-dependent.  In particular, cuDNN may
+    enable TF32 even when the YAML requests FP32.  A live parity check must use
+    the same backend policy as cache generation; otherwise identical weights
+    and inputs can differ solely because a different convolution kernel was
+    selected.
+    """
+    existing_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    if existing_workspace not in (None, PHASE1_CUBLAS_WORKSPACE_CONFIG):
+        raise RuntimeError(
+            "The Phase-1 cache requires CUBLAS_WORKSPACE_CONFIG="
+            f"{PHASE1_CUBLAS_WORKSPACE_CONFIG}, but this process has "
+            f"{existing_workspace!r}. Start a fresh process with the cache "
+            "workspace policy so live Phase-1 values remain reproducible."
+        )
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = PHASE1_CUBLAS_WORKSPACE_CONFIG
+    torch.set_float32_matmul_precision("highest")
+    if torch.backends.cuda.is_built():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+    return {
+        "dtype": "float32",
+        "autocast": False,
+        "allow_tf32": False,
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
+    }
 
 
 def _utc_now() -> str:
@@ -1003,13 +1041,21 @@ def _inventory(
     manifest_path: Path,
     *,
     verify_content: bool = False,
+    show_progress: bool = False,
 ) -> dict[str, Any]:
     cache_dir = manifest_path.parent
     result: dict[str, Any] = {}
     for split, record in manifest["splits"].items():
         digest = hashlib.sha256()
         count = 0
-        for sample_date in record["expected_dates"]:
+        dates: Any = record["expected_dates"]
+        if show_progress and tqdm is not None:
+            dates = tqdm(
+                dates,
+                desc=f"Validate Phase1 cache ({split})",
+                unit="day",
+            )
+        for sample_date in dates:
             path = daily_cache_path(cache_dir, split, sample_date)
             metadata = validate_daily_cache(
                 path,
@@ -1038,6 +1084,7 @@ def load_and_validate_manifest(
     require_complete: bool = True,
     validate_inventory: bool = True,
     verify_daily_content: bool = False,
+    show_inventory_progress: bool = False,
 ) -> dict[str, Any]:
     """Load and fail-closed validate a cache manifest.
 
@@ -1099,7 +1146,10 @@ def load_and_validate_manifest(
         )
     if validate_inventory:
         observed_inventory = _inventory(
-            manifest, manifest_path, verify_content=verify_daily_content
+            manifest,
+            manifest_path,
+            verify_content=verify_daily_content,
+            show_progress=show_inventory_progress,
         )
         if manifest.get("state") == CACHE_STATE_COMPLETE:
             for split, observed in observed_inventory.items():
@@ -1731,7 +1781,6 @@ def _build_worker(args: argparse.Namespace) -> int:
         character not in "0123456789abcdef" for character in state_fingerprint
     ):
         raise ValueError("--phase1-fingerprint must be a lowercase SHA-256")
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     args._phase1_fingerprint = state_fingerprint
     splits = _parse_splits(args.splits)
     output_root = _resolve_output_root(cfg, args.output_root)
@@ -1752,13 +1801,12 @@ def _build_worker(args: argparse.Namespace) -> int:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    torch.set_float32_matmul_precision("highest")
-    if torch.backends.cuda.is_built():
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
+    numeric_policy = configure_phase1_cache_numerics()
+    print(
+        "[phase1-cache] numerical policy: "
+        + json.dumps(numeric_policy, sort_keys=True),
+        flush=True,
+    )
     model = _load_model(config, checkpoint, device, data_parallel=False)
     if any(
         parameter.dtype != torch.float32 for parameter in model.parameters()

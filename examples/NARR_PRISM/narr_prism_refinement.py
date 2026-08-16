@@ -34,16 +34,22 @@ Examples::
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import math
 import os
 import random
+import socket
 import sys
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -143,7 +149,14 @@ def _require_checkpoint_path(path: str | None, *, label: str) -> str:
     return str(candidate.resolve())
 
 
-def build_model(config, config_path: str, phase1_checkpoint: str | None, device: torch.device):
+def build_model(
+    config,
+    config_path: str,
+    phase1_checkpoint: str | None,
+    device: torch.device,
+    *,
+    verbose: bool = True,
+):
     """Build the two-phase model and load the deterministic Phase-1 weights."""
     log_case_context(config, "refinement")
     assert_scalars_available(config, role="refinement")
@@ -151,7 +164,7 @@ def build_model(config, config_path: str, phase1_checkpoint: str | None, device:
 
     refinement = resolve_refinement_config(config)
     performance = resolve_performance_config(config)
-    phase1 = create_finetune_model(config, verbose=True)
+    phase1 = create_finetune_model(config, verbose=verbose)
     model = TwoPhaseDownscalingModel(phase1, refinement=refinement, performance=performance)
 
     if refinement.is_active:
@@ -161,7 +174,8 @@ def build_model(config, config_path: str, phase1_checkpoint: str | None, device:
 
     fingerprint = None
     if phase1_checkpoint:
-        print(f"[refinement] loading Phase-1 checkpoint (read-only): {phase1_checkpoint}")
+        if verbose:
+            print(f"[refinement] loading Phase-1 checkpoint (read-only): {phase1_checkpoint}")
         checkpoint = torch.load(phase1_checkpoint, map_location="cpu", mmap=True, weights_only=False)
         # Validate channel ordering, dates, grid/scaler hashes, transforms and
         # architecture semantics before a single checkpoint tensor is applied.
@@ -169,14 +183,16 @@ def build_model(config, config_path: str, phase1_checkpoint: str | None, device:
             config, checkpoint, role="NARR refinement Phase-1 load"
         )
         report = load_phase1_state_dict(model, checkpoint)
-        print(f"[refinement] Phase-1 load: {report.summary()}")
+        if verbose:
+            print(f"[refinement] Phase-1 load: {report.summary()}")
         unexplained = [k for k in report.missing if not k.startswith("refiner.")]
         if unexplained:
             raise RuntimeError(f"Unexplained missing Phase-1 keys: {unexplained[:8]}")
         fingerprint = phase1_state_fingerprint(
             {k[len("phase1.") :]: v for k, v in model.state_dict().items() if k.startswith("phase1.")}
         )
-        print(f"[refinement] Phase-1 fingerprint: {fingerprint}")
+        if verbose:
+            print(f"[refinement] Phase-1 fingerprint: {fingerprint}")
 
     model.to(device)
     return model, fingerprint
@@ -201,6 +217,40 @@ def _seed_training(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _configure_phase1_cache_runtime(
+    performance, *, role: str, verbose: bool = True
+) -> dict[str, Any] | None:
+    """Apply the YAML precision policy before any live Phase-1 CUDA forward."""
+    precision = performance.precision
+    allow_tf32 = bool(precision.allow_tf32)
+    if performance.phase1_cache.enabled and (
+        str(precision.mode).lower() != "fp32" or allow_tf32
+    ):
+        raise RuntimeError(
+            "The Phase-1 residual cache was generated in strict FP32 with TF32 "
+            "disabled; the active performance.precision contract must use "
+            "mode=fp32 and allow_tf32=false."
+        )
+    torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+    if torch.backends.cuda.is_built():
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+    policy = {
+        "mode": str(precision.mode).lower(),
+        "allow_tf32": allow_tf32,
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+    }
+    if verbose:
+        print(
+            f"[refinement] {role} precision policy: "
+            + json.dumps(policy, sort_keys=True),
+            flush=True,
+        )
+    return policy
+
+
 def _load_phase1_cache(
     *,
     config,
@@ -208,6 +258,8 @@ def _load_phase1_cache(
     phase1_checkpoint: str,
     phase1_fingerprint: str,
     performance,
+    validate_inventory: bool = True,
+    show_inventory_progress: bool = True,
 ):
     """Open and authenticate the immutable daily Phase-1/residual cache."""
     cache_cfg = performance.phase1_cache
@@ -223,7 +275,10 @@ def _load_phase1_cache(
             config=config,
             phase1_checkpoint=phase1_checkpoint,
             phase1_fingerprint=phase1_fingerprint,
-            validate_inventory=True,
+            validate_inventory=validate_inventory,
+            show_inventory_progress=(
+                validate_inventory and show_inventory_progress
+            ),
         )
     except Exception as exc:
         raise RuntimeError(
@@ -442,20 +497,279 @@ def _validate_phase1_cache_parity(
     )
 
 
+class _RefinementLossModule(torch.nn.Module):
+    """Expose the custom refinement objective through DDP's forward path."""
+
+    def __init__(self, model: TwoPhaseDownscalingModel) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self, batch: Mapping[str, Any], generator: torch.Generator
+    ) -> torch.Tensor:
+        return self.model.training_step(batch, generator=generator).losses["loss"]
+
+
+class _SilentProgress:
+    def update(self, _amount: int) -> None:
+        pass
+
+    def set_postfix(self, **_values: Any) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class _DistributedRefinementTrainer(RefinementTrainer):
+    """DDP refinement trainer with rank-zero progress and checkpoint output."""
+
+    def __init__(
+        self,
+        *args,
+        rank: int,
+        world_size: int,
+        global_train_steps: int,
+        global_valid_steps: int,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.global_train_steps = int(global_train_steps)
+        self.global_valid_steps = int(global_valid_steps)
+        self._distributed_model = DistributedDataParallel(
+            _RefinementLossModule(self.model),
+            device_ids=[self.rank],
+            output_device=self.rank,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+        )
+
+    def _reduce_loss(self, total: float, count: int) -> float:
+        statistics = torch.tensor(
+            [total, float(count)], dtype=torch.float64, device=self.device
+        )
+        dist.all_reduce(statistics, op=dist.ReduceOp.SUM)
+        return float((statistics[0] / statistics[1].clamp_min(1.0)).item())
+
+    def _optimizer_step(self) -> None:
+        if self.max_grad_norm:
+            if self.scaler is not None and self.scaler.is_enabled():
+                self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                [parameter for parameter in self.model.parameters() if parameter.requires_grad],
+                self.max_grad_norm,
+            )
+        if self.scaler is not None and self.scaler.is_enabled():
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.state.global_step += 1
+        if self.state.global_step < self.warmup_steps:
+            factor = float(self.state.global_step + 1) / float(self.warmup_steps)
+            for group, base_lr in zip(
+                self.optimizer.param_groups, self._base_lrs, strict=True
+            ):
+                group["lr"] = base_lr * factor
+        elif self.scheduler is not None:
+            self.scheduler.step()
+
+    def train_one_epoch(
+        self,
+        loader,
+        limit_steps: int = 0,
+        epoch: int = 0,
+        progress_bar: Any | None = None,
+    ) -> float:
+        self.model.train()
+        self._distributed_model.train()
+        sampler = getattr(loader, "sampler", None)
+        if callable(getattr(sampler, "set_epoch", None)):
+            sampler.set_epoch(epoch)
+        n = min(len(loader), limit_steps) if limit_steps else len(loader)
+        bar = progress_bar or _SilentProgress()
+        total, count = 0.0, 0
+        self.optimizer.zero_grad(set_to_none=True)
+        bar.set_postfix(stage="train")
+        for step, batch in enumerate(loader):
+            if step >= n:
+                break
+            batch = _to_device(batch, self.device)
+            group_start = (step // self.accum) * self.accum
+            group_size = min(self.accum, n - group_start)
+            boundary = (step + 1) % self.accum == 0 or (step + 1) == n
+            sync_context = nullcontext() if boundary else self._distributed_model.no_sync()
+            with sync_context:
+                with self._autocast():
+                    loss = self._distributed_model(batch, self._generator)
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        f"Non-finite refinement loss at rank={self.rank} step={step}: "
+                        f"{loss.item()}"
+                    )
+                scaled = loss / max(1, group_size)
+                if self.scaler is not None and self.scaler.is_enabled():
+                    self.scaler.scale(scaled).backward()
+                else:
+                    scaled.backward()
+            if boundary:
+                self._optimizer_step()
+            total += float(loss.detach())
+            count += 1
+            if self.rank == 0:
+                completed_before = min(self.global_train_steps, step * self.world_size)
+                bar.update(min(self.world_size, self.global_train_steps - completed_before))
+                if count % self.log_every == 0:
+                    bar.set_postfix(
+                        stage="train",
+                        train_loss=f"{total / count:.4f}",
+                        lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                    )
+        return self._reduce_loss(total, count)
+
+    @torch.no_grad()
+    def validate(
+        self,
+        loader,
+        limit_steps: int = 0,
+        epoch: int = 0,
+        progress_bar: Any | None = None,
+    ) -> float:
+        self.model.eval()
+        self._distributed_model.eval()
+        sampler = getattr(loader, "sampler", None)
+        if callable(getattr(sampler, "set_epoch", None)):
+            sampler.set_epoch(epoch)
+        n = min(len(loader), limit_steps) if limit_steps else len(loader)
+        bar = progress_bar or _SilentProgress()
+        total, count = 0.0, 0
+        bar.set_postfix(stage="validation")
+        for step, batch in enumerate(loader):
+            if step >= n:
+                break
+            batch = _to_device(batch, self.device)
+            with self._autocast():
+                loss = self._distributed_model(batch, self._generator)
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"Non-finite refinement validation loss at rank={self.rank} "
+                    f"step={step}: {loss.item()}"
+                )
+            total += float(loss.detach())
+            count += 1
+            if self.rank == 0:
+                completed_before = min(self.global_valid_steps, step * self.world_size)
+                bar.update(min(self.world_size, self.global_valid_steps - completed_before))
+        return self._reduce_loss(total, count)
+
+    def fit(
+        self,
+        train_loader,
+        val_loader=None,
+        *,
+        num_epochs: int = 1,
+        limit_steps_train: int = 0,
+        limit_steps_valid: int = 0,
+        save_every: int = 1,
+    ):
+        final_epoch = self.state.epoch + num_epochs
+        for epoch in range(self.state.epoch, final_epoch):
+            if self.rank == 0:
+                bar = tqdm(
+                    total=self.global_train_steps + self.global_valid_steps,
+                    desc=f"Epoch {epoch + 1:03d}/{final_epoch:03d}",
+                    unit="batch",
+                    ascii=" #",
+                    ncols=100,
+                    leave=True,
+                    mininterval=1.0,
+                )
+            else:
+                bar = _SilentProgress()
+            try:
+                train_loss = self.train_one_epoch(
+                    train_loader,
+                    limit_steps=limit_steps_train,
+                    epoch=epoch,
+                    progress_bar=bar,
+                )
+                self.state.train_loss_history.append(train_loss)
+                val_loss = None
+                if val_loader is not None:
+                    bar.set_postfix(stage="validation", train_loss=f"{train_loss:.4f}")
+                    val_loss = self.validate(
+                        val_loader,
+                        limit_steps=limit_steps_valid,
+                        epoch=epoch,
+                        progress_bar=bar,
+                    )
+                    self.state.val_loss_history.append(val_loss)
+                final_postfix = {
+                    "stage": "complete",
+                    "train_loss": f"{train_loss:.4f}",
+                    "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}",
+                }
+                if val_loss is not None:
+                    final_postfix["val_loss"] = f"{val_loss:.4f}"
+                bar.set_postfix(**final_postfix)
+            finally:
+                bar.close()
+            is_best = val_loss is not None and (
+                self.state.best_val_loss is None
+                or val_loss < self.state.best_val_loss
+            )
+            if is_best:
+                self.state.best_val_loss = val_loss
+            if self.rank == 0:
+                val_text = "n/a" if val_loss is None else f"{val_loss:.4f}"
+                best_text = (
+                    "" if self.state.best_val_loss is None
+                    else f"  best={self.state.best_val_loss:.4f}"
+                )
+                marker = "  *** new best ***" if is_best else ""
+                print(
+                    f"Ep {epoch + 1:03d}  train={train_loss:.4f}  "
+                    f"val={val_text}{best_text}{marker}"
+                )
+            self.state.epoch += 1
+            if self.rank == 0:
+                epoch_file = save_every > 0 and self.state.epoch % save_every == 0
+                self.save(is_best=is_best, epoch_file=epoch_file)
+            dist.barrier()
+        return self.state
+
+
+def _available_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _rank_limit(global_limit: int, world_size: int) -> int:
+    return math.ceil(global_limit / world_size) if global_limit > 0 else 0
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
 
 
-def cmd_train(args) -> int:
+def _run_train(args, *, rank: int = 0, world_size: int = 1) -> int:
     config = get_config(args.config)
-    device = torch.device(args.device)
+    distributed = world_size > 1
+    device = torch.device(f"cuda:{rank}" if distributed else args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     refinement = resolve_refinement_config(config)
     performance = resolve_performance_config(config)
+    _configure_phase1_cache_runtime(performance, role="training", verbose=rank == 0)
     # This must precede model construction, DataLoader creation/iteration and
     # lazy refiner initialization. The notebook runs this command in a child
     # process, so its parent-kernel RNG state cannot provide reproducibility.
-    _seed_training(refinement.seed)
+    _seed_training(refinement.seed + rank)
     if not refinement.is_active:
         raise SystemExit(
             "This configuration has no active refinement section. Use the "
@@ -465,7 +779,9 @@ def cmd_train(args) -> int:
         _phase1_checkpoint(config, args.phase1_checkpoint),
         label="Phase-1 deterministic",
     )
-    model, fingerprint = build_model(config, args.config, phase1_checkpoint, device)
+    model, fingerprint = build_model(
+        config, args.config, phase1_checkpoint, device, verbose=rank == 0
+    )
     raw_config = load_yaml(args.config)
     raw_config["_config_path"] = str(Path(args.config).resolve())
 
@@ -475,9 +791,12 @@ def cmd_train(args) -> int:
         phase1_checkpoint=phase1_checkpoint,
         phase1_fingerprint=fingerprint,
         performance=performance,
+        validate_inventory=(rank == 0),
+        show_inventory_progress=(rank == 0),
     )
     train_loader, val_loader = get_dataloaders(
-        args.config, config, phase1_cache_reader=cache_reader
+        args.config, config, rank=rank, world_size=world_size,
+        phase1_cache_reader=cache_reader,
     )
     probe = _to_device(_first_batch(train_loader), device)
     model.initialize_from_batch(probe)
@@ -486,7 +805,9 @@ def cmd_train(args) -> int:
     cache_statistics = None
     if cache_manifest is not None:
         cache_statistics = _validated_cache_statistics(model, cache_manifest)
-        if performance.phase1_cache.validate_cache:
+        if (
+            performance.phase1_cache.validate_cache and rank == 0
+        ):
             _validate_phase1_cache_parity(
                 model,
                 train_loader,
@@ -497,6 +818,11 @@ def cmd_train(args) -> int:
         if not args.resume:
             _install_cache_statistics(model, cache_statistics)
     elif residual_norm.enabled and not args.resume:
+        if distributed:
+            raise RuntimeError(
+                "Multi-GPU refinement requires the authenticated Phase-1 cache "
+                "when residual normalization must be fitted. Build the cache first."
+            )
         fit_limit = int(residual_norm.fit_batches)
         print(
             "[refinement] fitting ordered per-variable residual normalization "
@@ -506,18 +832,20 @@ def cmd_train(args) -> int:
             train_loader,
             device=device,
             max_batches=fit_limit or None,
-            show_progress=True,
+            show_progress=(rank == 0),
         )
-        print(f"[refinement] residual normalization: {json.dumps(metadata, indent=2)}")
-    print(f"[refinement] {json.dumps(model.describe()['refinement'], indent=2)}")
-    summary = model.describe()
-    print(
-        "[refinement] checkpoint/model summary: "
-        f"deterministic_loaded_fingerprint={fingerprint} "
-        f"new_refinement_keys={len(summary['new_refinement_keys'])} "
-        f"frozen_parameters={summary['frozen_parameters']:,} "
-        f"trainable_parameters={summary['trainable_parameters']:,}"
-    )
+        if rank == 0:
+            print(f"[refinement] residual normalization: {json.dumps(metadata, indent=2)}")
+    if rank == 0:
+        print(f"[refinement] {json.dumps(model.describe()['refinement'], indent=2)}")
+        summary = model.describe()
+        print(
+            "[refinement] checkpoint/model summary: "
+            f"deterministic_loaded_fingerprint={fingerprint} "
+            f"new_refinement_keys={len(summary['new_refinement_keys'])} "
+            f"frozen_parameters={summary['frozen_parameters']:,} "
+            f"trainable_parameters={summary['trainable_parameters']:,}"
+        )
 
     trainable = model.trainable_parameters()
     learning_rate = float(getattr(config, "learning_rate", 1e-4))
@@ -530,14 +858,26 @@ def cmd_train(args) -> int:
         args.limit_steps or getattr(config, "limit_steps_train", 0) or 0
     )
     limit_steps_valid = int(getattr(config, "limit_steps_valid", 0) or 0)
-    steps = max(
-        1,
-        min(
-            len(train_loader),
-            limit_steps_train or len(train_loader),
-        ),
-    )
+    available_global_train_steps = len(train_loader) * world_size
+    available_global_valid_steps = len(val_loader) * world_size
+    steps = max(1, min(
+        available_global_train_steps,
+        limit_steps_train or available_global_train_steps,
+    ))
+    valid_steps = max(1, min(
+        available_global_valid_steps,
+        limit_steps_valid or available_global_valid_steps,
+    ))
     accumulation = int(getattr(config, "gradient_accumulation_steps", 1))
+    if distributed and accumulation % world_size:
+        raise ValueError(
+            "gradient_accumulation_steps must be divisible by the selected GPU "
+            f"count to preserve the configured global batch ({accumulation} % "
+            f"{world_size} != 0)"
+        )
+    local_accumulation = max(1, accumulation // world_size)
+    local_limit_steps_train = _rank_limit(limit_steps_train, world_size)
+    local_limit_steps_valid = _rank_limit(limit_steps_valid, world_size)
     optimizer_steps = max(1, math.ceil(steps / max(1, accumulation)))
     scheduler_t_max = max(1, epochs * optimizer_steps)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -554,7 +894,17 @@ def cmd_train(args) -> int:
     )
     checkpoint_dir = _resolve(checkpoint_dir)
 
-    trainer = RefinementTrainer(
+    trainer_class = _DistributedRefinementTrainer if distributed else RefinementTrainer
+    distributed_trainer_kwargs = (
+        {
+            "rank": rank,
+            "world_size": world_size,
+            "global_train_steps": steps,
+            "global_valid_steps": valid_steps,
+        }
+        if distributed else {}
+    )
+    trainer = trainer_class(
         model,
         optimizer,
         scheduler=scheduler,
@@ -591,10 +941,11 @@ def cmd_train(args) -> int:
             "config_path": os.path.abspath(args.config),
         },
         case_name=get_case_name(config),
-        gradient_accumulation_steps=accumulation,
+        gradient_accumulation_steps=local_accumulation,
         max_grad_norm=max_grad_norm,
         seed=model.refinement_config.seed,
         warmup_steps=warmup_steps,
+        **distributed_trainer_kwargs,
     )
     if fingerprint:
         trainer._phase1_fingerprint = fingerprint
@@ -608,12 +959,17 @@ def cmd_train(args) -> int:
                 cache_statistics,
                 tolerance=performance.phase1_cache.validate_tolerance,
             )
+    if distributed and rank != 0:
+        trainer._generator.manual_seed(
+            model.refinement_config.seed + rank + trainer.state.global_step
+        )
+
 
     # ``epochs`` is the total run budget, not a number of extra epochs.  An
     # interrupted run therefore completes only the remaining epochs after the
     # scheduler/optimizer state has been restored.
     epochs_remaining = max(0, epochs - trainer.state.epoch)
-    if args.resume:
+    if args.resume and rank == 0:
         print(
             "[refinement] resume epoch budget: "
             f"completed={trainer.state.epoch} total={epochs} "
@@ -623,9 +979,54 @@ def cmd_train(args) -> int:
         train_loader,
         val_loader,
         num_epochs=epochs_remaining,
-        limit_steps_train=limit_steps_train,
-        limit_steps_valid=limit_steps_valid,
+        limit_steps_train=local_limit_steps_train,
+        limit_steps_valid=local_limit_steps_valid,
         save_every=int(args.save_every),
+    )
+    return 0
+
+
+def _distributed_train_entry(
+    rank: int, world_size: int, args: argparse.Namespace, port: int
+) -> None:
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        _run_train(args, rank=rank, world_size=world_size)
+    finally:
+        dist.destroy_process_group()
+
+
+def cmd_train(args) -> int:
+    requested = int(getattr(args, "num_gpus", 1) or 1)
+    if requested < 1:
+        raise ValueError("--num-gpus must be at least 1")
+    if requested == 1:
+        return _run_train(args)
+    if not torch.cuda.is_available() or not str(args.device).startswith("cuda"):
+        raise RuntimeError("Multi-GPU refinement requires CUDA and --device cuda:0")
+    visible = torch.cuda.device_count()
+    if requested > visible:
+        raise RuntimeError(
+            f"Requested {requested} GPUs, but only {visible} are visible. "
+            "Check CUDA_VISIBLE_DEVICES."
+        )
+    print(
+        f"[refinement] distributed training: GPUs={requested} "
+        f"visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', 'all')}"
+    )
+    mp.spawn(
+        _distributed_train_entry,
+        args=(requested, args, _available_port()),
+        nprocs=requested,
+        join=True,
     )
     return 0
 
@@ -634,6 +1035,8 @@ def cmd_infer(args) -> int:
     config = get_config(args.config)
     device = torch.device(args.device)
     refinement = resolve_refinement_config(config)
+    performance = resolve_performance_config(config)
+    _configure_phase1_cache_runtime(performance, role="inference")
     if not refinement.is_active:
         raise SystemExit("infer requires an active model.refinement configuration")
     phase1_checkpoint = _require_checkpoint_path(
@@ -703,6 +1106,12 @@ def main() -> int:
     train = sub.add_parser("train", parents=[common], help="train the configured Phase-2 refiner")
     train.add_argument("--resume", nargs="?", const=True, default=False)
     train.add_argument("--num-epochs", type=int, default=None)
+    train.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="number of visible CUDA devices to use with DDP",
+    )
     train.add_argument("--limit-steps", type=int, default=0)
     train.add_argument("--save-every", type=int, default=1)
     train.add_argument("--checkpoint-dir", default=None, help="override the YAML checkpoint_dir")

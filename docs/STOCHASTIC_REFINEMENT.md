@@ -729,9 +729,18 @@ fresh run, manifest statistics are installed directly and the old complete
 live-loader normalization scan is skipped. On resume, checkpoint statistics
 are restored first and then required to match the manifest. A configurable
 small live parity sample (four tiles by default) compares cached baselines and
-residuals with the frozen model before training. Date-grouped sampling and a
-per-worker daily reader ensure that all same-day tiles share one NetCDF open;
-Phase 1 is not executed during refinement epochs.
+residuals with the frozen model before training. The Phase-2 CLI applies the
+configured TF32 policy to both CUDA matmul and cuDNN before this check. This is
+required: leaving cuDNN TF32 enabled while the cache was built with TF32 off
+caused a `0.00225335` normalized mismatch; honoring `allow_tf32: false` reduced
+it to `2.74181e-06` without weakening the `1e-5` tolerance. Date-grouped
+sampling and a per-worker daily reader ensure that all same-day tiles share one
+NetCDF open; Phase 1 is not executed during refinement epochs.
+
+The trainer displays the one-time complete-cache inventory validation before
+epoch 1. The notebook avoids a duplicate scan and saves every streamed child
+command under its output directory's `command_logs/`; failures include that log
+path and a retained traceback tail.
 
 `granitewxc.refinement.cache.Phase1ConditioningCache`, the older generic
 one-`.pt`-entry API, remains available to library callers and parity tests. It

@@ -219,6 +219,7 @@ and 2016–2025 observations are never used to fit them.
 | Artifact directories were committed as absolute links to themselves | A branch checkout replaced ignored checkpoints/products with cyclic links and removed the local artifacts | Recover the exact checkpoint/scalars, regenerate daily products, and route tracked relative links through an ignored external portal |
 | `data.use_static` contradicted the recovered Phase-1 contract | Elevation was already input channel 16; claiming a separate static tensor made the YAML semantically incompatible | Set `use_static: false` in Phase 1 and all four refiners while retaining `elev` and `mask_elev` in the ordered 32-channel input |
 | Phase-2 accepted an absent Phase-1 checkpoint | Training/inference could run against random deterministic weights | Active training/inference require an accessible regular Phase-1 file |
+| `performance.precision.allow_tf32: false` was parsed but not applied to cuDNN | A live FP32 cache check used TF32 convolutions and falsely failed before epoch 1 (`0.00225335` normalized; `0.01850 degC`) | Apply the YAML policy to CUDA matmul and cuDNN before model construction; keep the `1e-5` parity guard |
 | Only tensor shape/key checks were used | Same-shaped weights with different variables, scalers, dates, or grid could be accepted | Run `validate_prism_checkpoint_contract` before tensor loading |
 | Key-level `model.`/Lightning roots were not normalized | Valid deterministic checkpoints failed or were partially mapped | Strip only uniform known roots, then require complete deterministic coverage |
 | Unrestricted non-strict semantics were possible | Missing deterministic weights could be hidden as “new Phase 2” | Non-strict load occurs only after proving every missing key is `refiner.*`; shapes/unexpected keys fail |
@@ -369,7 +370,17 @@ figures with shared comparison scales.
 
 ```bash
 mamba run -n Prithvi python -m pytest -q
-# 738 passed, 1 warning in 305.36s (0:05:05)
+# 748 passed, 1 warning in 284.97s (0:04:44)
+
+mamba run -n Prithvi python -m pytest -q \
+  examples/NARR_PRISM/test_narr_prism_phase1_cache.py \
+  tests/test_narr_prism_phase1_cache_training.py \
+  tests/test_narr_prism_refinement_inference.py \
+  tests/test_narr_prism_refinement_notebook.py \
+  tests/test_refinement_checkpoint.py \
+  tests/test_refinement_normalizer_progress.py \
+  tests/test_refinement_phase2_contract.py
+# 131 passed in 80.49s (0:01:20)
 
 mamba run -n Prithvi python -m pytest -q \
   tests/test_refinement_evaluation.py \
@@ -378,7 +389,7 @@ mamba run -n Prithvi python -m pytest -q \
 
 mamba run -n Prithvi python -m pytest -q \
   tests/test_narr_prism_refinement_notebook.py
-# 22 passed in 42.79s
+# 25 passed in 36.88s
 
 mamba run -n Prithvi python -m pytest -q \
   tests/test_prism_source_rebind.py \
@@ -506,6 +517,24 @@ resume restores checkpoint statistics and verifies them against the manifest.
 Date-grouped tile sampling and a per-worker daily-file cache then train every
 head without a Phase-1 forward during epochs. A small configurable live parity
 check remains at startup and is not a normalization epoch.
+
+The completed production cache contains all 6,575 training and 730 validation
+days. A subsequent real startup diagnosis found that the trainer had left
+`torch.backends.cudnn.allow_tf32=True` despite the YAML's `allow_tf32: false`.
+The same cached tiles differed by as much as `0.00225335` in normalized space
+(`0.01850 degC`) under that unintended backend policy. Applying TF32=false to
+both CUDA matmul and cuDNN reduced the discrepancy to `2.74181e-06`, within the
+existing `1e-5` guard; the full deterministic cache-builder policy was bitwise
+equal. Batch sizes 1 and 8 gave the same conclusion, so cache batching was not
+the cause and the tolerance was not weakened.
+
+A final bounded run through the production CLI and real artifacts validated all
+6,575 training plus 730 validation cache files, measured live parity of
+`3.36766e-06` for the normalized baseline and `1.90735e-06` for the residual,
+completed one Diffusion Transformer training batch and one held-out validation
+batch (`train=1.9168`, `val=2.2066`), and wrote a resumable `last.ckpt`. It used
+one combined train/validation tqdm bar for the epoch. This is an implementation
+check, not evidence of scientific improvement.
 
 Additional tests cover residual sign, exact zero-residual reconstruction,
 normalization inversion, invalid masks, finite gradients, output dimensions,

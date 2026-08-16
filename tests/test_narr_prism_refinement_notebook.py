@@ -9,7 +9,9 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import nbformat
 import pytest
@@ -270,6 +272,8 @@ def test_notebook_has_one_parameter_cell_and_complete_workflow_sections():
         "REFINEMENT_CHECKPOINT",
         "REFINEMENT_CHECKPOINT_DIR",
         "RESUME_CHECKPOINT",
+        "AUTO_RESUME_EXISTING",
+        "FRESH_START",
         "ENSEMBLE_SIZE",
         "SMOKE_TEST",
         "PREDICTION_SPLIT",
@@ -299,6 +303,13 @@ def test_notebook_has_one_parameter_cell_and_complete_workflow_sections():
         "RUN_TRAINING = _env_flag('NARR_PRISM_RUN_TRAINING', not SMOKE_TEST)"
         in parameters
     )
+    assert "NARR_PRISM_AUTO_RESUME', True" in parameters
+    assert "NARR_PRISM_FRESH_START', False" in parameters
+    assert (
+        "RESUME_CHECKPOINT = os.environ.get('NARR_PRISM_RESUME_CHECKPOINT') or None"
+        in parameters
+    )
+    assert "or REFINEMENT_CHECKPOINT" not in parameters
     assert (
         "examples/NARR_PRISM/experiments/refinement_notebook" not in parameters
     )
@@ -316,8 +327,13 @@ def test_notebook_has_one_parameter_cell_and_complete_workflow_sections():
     assert "'scientific_validation': not SMOKE_TEST" not in text
     assert "'scientific_validation': scientific_validation_completed" in text
     assert "scientific_validation_report.is_file()" in text
-    assert "one live combined train-and-validation `tqdm` bar" in text
-    assert "run_streaming_command(train_command, cwd=REPO_ROOT)" in text
+    assert "one plain-text `tqdm` bar for the full training run" in text
+    assert "from tqdm import tqdm as progress_factory" in text
+    assert "file=sys.stdout, ascii=True, dynamic_ncols=False" in text
+    assert (
+        "train_command, cwd=REPO_ROOT, log_dir=OUTPUT_PATH / 'command_logs'"
+        in text
+    )
     assert "subprocess.run(train_command" not in text
 
 
@@ -333,15 +349,19 @@ def test_notebook_attaches_to_active_phase1_cache_without_duplicate_build():
     assert "status_callback=report_cache_wait" in training_cell
     assert "observed_present_count" in training_cell
     assert "except CacheBuildNotActiveError:" in training_cell
-    assert "except subprocess.CalledProcessError as build_exc:" in training_cell
+    assert (
+        "except subprocess.CalledProcessError as build_exc:" in training_cell
+    )
     assert "raise build_exc" in training_cell
     assert (
         "Notebook wait interrupted; the external cache builder continues safely."
         in training_cell
     )
-    wait_offset = training_cell.index("cache_manifest = wait_for_existing_cache()")
+    wait_offset = training_cell.index(
+        "cache_manifest = wait_for_existing_cache()"
+    )
     launch_offset = training_cell.index(
-        "run_streaming_command(cache_command, cwd=REPO_ROOT)"
+        "cache_command, cwd=REPO_ROOT, log_dir=OUTPUT_PATH / 'command_logs'"
     )
     assert wait_offset < launch_offset
 
@@ -349,13 +369,16 @@ def test_notebook_attaches_to_active_phase1_cache_without_duplicate_build():
 def test_streaming_command_forwards_carriage_returns_and_failures(
     tmp_path, capsys
 ):
+    log_dir = tmp_path / "command-logs"
     runner = _notebook_function(
         "run_streaming_command",
         {
             "codecs": codecs,
             "os": os,
+            "Path": Path,
             "subprocess": subprocess,
             "sys": sys,
+            "time": time,
         },
     )
     completed = runner(
@@ -369,18 +392,198 @@ def test_streaming_command_forwards_carriage_returns_and_failures(
             ),
         ],
         cwd=tmp_path,
+        log_dir=log_dir,
     )
     rendered = capsys.readouterr().out
+    success_logs = list(log_dir.glob("*.log"))
     assert completed.returncode == 0
     assert "epoch 1: 1/2\r" in rendered
     assert "epoch 1: 2/2\n" in rendered
+    assert len(success_logs) == 1
+    assert success_logs[0].read_bytes() == (b"epoch 1: 1/2\repoch 1: 2/2\n")
 
+    noisy_prefix = "discarded-prefix-" + ("x" * 512)
+    failure_program = (
+        "import sys; "
+        f"sys.stderr.write({noisy_prefix!r}); "
+        "sys.stderr.write('\\nTraceback (most recent call last):"
+        "\\nRuntimeError: parity root cause\\n'); "
+        "raise SystemExit(7)"
+    )
     with pytest.raises(subprocess.CalledProcessError) as exc_info:
         runner(
-            [sys.executable, "-c", "raise SystemExit(7)"],
+            [sys.executable, "-c", failure_program],
             cwd=tmp_path,
+            log_dir=log_dir,
+            tail_bytes=128,
         )
-    assert exc_info.value.returncode == 7
+    error = exc_info.value
+    assert error.returncode == 7
+    assert Path(error.log_path).parent == log_dir
+    failure_log = Path(error.log_path)
+    assert failure_log.is_file()
+    persisted = failure_log.read_text()
+    assert noisy_prefix in persisted
+    assert "Traceback (most recent call last)" in persisted
+    assert noisy_prefix not in error.output
+    assert "RuntimeError: parity root cause" in error.output
+    assert str(error.log_path) in str(error)
+    assert "Retained output tail:" in str(error)
+
+
+
+def test_streaming_command_renders_one_text_bar_for_all_epochs(
+    tmp_path, capsys
+):
+    bars = []
+
+    class FakeTextBar:
+        def __init__(self, **kwargs):
+            self.total = kwargs["total"]
+            self.description = kwargs["desc"]
+            self.unit = kwargs["unit"]
+            self.n = 0
+            self.postfixes = []
+            self.closed = False
+            bars.append(self)
+
+        def update(self, amount):
+            self.n += amount
+
+        def reset(self, total):
+            self.total = total
+            self.n = 0
+
+        def set_postfix_str(self, value, refresh=True):
+            self.postfixes.append((value, refresh))
+
+        def close(self):
+            self.closed = True
+
+    runner = _notebook_function(
+        "run_streaming_command",
+        {
+            "codecs": codecs,
+            "os": os,
+            "Path": Path,
+            "subprocess": subprocess,
+            "sys": sys,
+            "time": time,
+        },
+    )
+    records = (
+        "model ready\n"
+        "\rEpoch 001/002:   0%| | 0/10 [00:00<?, ?batch/s, stage=train]"
+        "\rEpoch 001/002:  50%|#| 5/10 [00:01<00:01, 5batch/s, stage=train]"
+        "\rEpoch 001/002: 100%|#| 10/10 [00:02<00:00, 5batch/s, stage=complete]\n"
+        "\rEpoch 002/002:   0%| | 0/10 [00:00<?, ?batch/s, stage=train]"
+        "\rEpoch 002/002: 100%|#| 10/10 [00:02<00:00, 5batch/s, stage=complete]\n"
+    )
+    completed = runner(
+        [
+            sys.executable,
+            "-c",
+            f"import sys; sys.stderr.write({records!r}); sys.stderr.flush()",
+        ],
+        cwd=tmp_path,
+        log_dir=tmp_path / "command-logs",
+        progress_factory=lambda **kwargs: FakeTextBar(**kwargs),
+    )
+
+    rendered = capsys.readouterr().out
+    assert completed.returncode == 0
+    assert "model ready\n" in rendered
+    assert "Epoch 001/002" not in rendered
+    assert "\r" not in rendered
+    assert [bar.description for bar in bars] == ["Training epochs"]
+    assert [bar.total for bar in bars] == [2]
+    assert [bar.n for bar in bars] == [2]
+    assert [bar.unit for bar in bars] == ["epoch"]
+    assert all(bar.closed for bar in bars)
+    assert any(
+        "stage=complete" in value for bar in bars for value, _ in bar.postfixes
+    )
+    assert all(not refresh for bar in bars for _, refresh in bar.postfixes)
+    [log_path] = (tmp_path / "command-logs").glob("*.log")
+    assert log_path.read_bytes() == records.encode()
+
+
+def test_streaming_command_terminates_child_and_retains_log_on_interrupt(
+    tmp_path, capsys
+):
+    class FakeStdout:
+        def fileno(self):
+            return 91
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = FakeStdout()
+            self.returncode = None
+            self.terminated = False
+            self.killed = False
+            self.wait_timeouts = []
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            return self.returncode
+
+    fake_process = FakeProcess()
+
+    def interrupt_read(_file_descriptor, _size):
+        raise KeyboardInterrupt
+
+    fake_os = SimpleNamespace(
+        environ={},
+        getpid=lambda: 17,
+        read=interrupt_read,
+    )
+    fake_subprocess = SimpleNamespace(
+        Popen=lambda *args, **kwargs: fake_process,
+        PIPE=subprocess.PIPE,
+        STDOUT=subprocess.STDOUT,
+        TimeoutExpired=subprocess.TimeoutExpired,
+        CalledProcessError=subprocess.CalledProcessError,
+        CompletedProcess=subprocess.CompletedProcess,
+    )
+    runner = _notebook_function(
+        "run_streaming_command",
+        {
+            "codecs": codecs,
+            "os": fake_os,
+            "Path": Path,
+            "subprocess": fake_subprocess,
+            "sys": sys,
+            "time": SimpleNamespace(time_ns=lambda: 123),
+        },
+    )
+    log_dir = tmp_path / "interrupt-logs"
+
+    with pytest.raises(KeyboardInterrupt):
+        runner(
+            ["fake-python", "train.py"],
+            cwd=tmp_path,
+            log_dir=log_dir,
+        )
+
+    assert fake_process.terminated is True
+    assert fake_process.killed is False
+    assert fake_process.wait_timeouts == [5]
+    logs = list(log_dir.glob("*.log"))
+    assert len(logs) == 1
+    assert logs[0].read_bytes() == b""
+    rendered_error = capsys.readouterr().err
+    assert f"Command interrupted; retained output: {logs[0]}" in rendered_error
 
 
 def test_production_subprocesses_release_eager_gpu_state_after_diagnostics():
@@ -405,15 +608,11 @@ def test_production_subprocesses_release_eager_gpu_state_after_diagnostics():
     assert "torch.cuda.empty_cache()" in inspection_cell
 
     command_invocations = (
-        "run_streaming_command(train_command, cwd=REPO_ROOT)",
-        (
-            "subprocess.run(infer_command, cwd=REPO_ROOT, check=True)"
-        ),
+        "train_command, cwd=REPO_ROOT, log_dir=OUTPUT_PATH / 'command_logs'",
+        ("subprocess.run(infer_command, cwd=REPO_ROOT, check=True)"),
     )
     for invocation in command_invocations:
-        command_cell = _cell_source_containing(
-            invocation
-        )
+        command_cell = _cell_source_containing(invocation)
         release_offset = command_cell.index(
             "release_production_inspection_state()"
         )
@@ -434,7 +633,7 @@ def test_combined_training_and_inference_defers_checkpoint_requirement():
         in training_cell
     )
     train_offset = training_cell.index(
-        "run_streaming_command(train_command, cwd=REPO_ROOT)"
+        "train_command, cwd=REPO_ROOT, log_dir=OUTPUT_PATH / 'command_logs'"
     )
     selection_offset = training_cell.index(
         "REFINEMENT_PATH = select_trained_refinement_checkpoint"
@@ -473,6 +672,57 @@ def test_new_training_checkpoint_selection_prefers_best_then_last(tmp_path):
         FileNotFoundError, match="neither best.ckpt nor last.ckpt"
     ):
         select_checkpoint(tmp_path)
+
+
+def test_training_resume_selection_is_automatic_and_fail_safe(tmp_path):
+    select_resume = _notebook_function(
+        "select_training_resume_checkpoint", {"Path": Path}
+    )
+
+    assert select_resume(
+        tmp_path, requested=False, requested_path=None,
+        auto_resume=True, fresh_start=False,
+    ) is None
+
+    last = tmp_path / "last.ckpt"
+    last.touch()
+    assert select_resume(
+        tmp_path, requested=False, requested_path=None,
+        auto_resume=True, fresh_start=False,
+    ) == last
+
+    with pytest.raises(RuntimeError, match="automatic resume is disabled"):
+        select_resume(
+            tmp_path, requested=False, requested_path=None,
+            auto_resume=False, fresh_start=False,
+        )
+    assert select_resume(
+        tmp_path, requested=False, requested_path=None,
+        auto_resume=False, fresh_start=True,
+    ) is None
+
+    explicit = tmp_path / "epoch_002.ckpt"
+    explicit.touch()
+    assert select_resume(
+        tmp_path, requested=True, requested_path=explicit,
+        auto_resume=False, fresh_start=False,
+    ) == explicit
+    with pytest.raises(FileNotFoundError, match="resume was requested"):
+        select_resume(
+            tmp_path, requested=True, requested_path=tmp_path / "missing.ckpt",
+            auto_resume=True, fresh_start=False,
+        )
+    with pytest.raises(ValueError, match="Fresh-start mode conflicts"):
+        select_resume(
+            tmp_path, requested=True, requested_path=explicit,
+            auto_resume=True, fresh_start=True,
+        )
+
+    training_cell = _cell_source_containing("TRAINED_CHECKPOINT_PRIORITY")
+    assert "train_command.extend(['--resume', str(TRAINING_RESUME_PATH)])" in training_cell
+    assert "Phase-2 training will resume from:" in training_cell
+    assert "preferably with a new checkpoint directory" in training_cell
+
 
 
 @pytest.mark.parametrize("config_name", CONFIGS)

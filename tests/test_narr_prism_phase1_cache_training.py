@@ -110,7 +110,9 @@ def test_cache_statistics_install_fresh_and_match_resume(tmp_path):
     model = SimpleNamespace(
         target_space=SimpleNamespace(num_channels=3),
         refinement_config=SimpleNamespace(
-            residual_normalization=SimpleNamespace(enabled=True, epsilon=1.0e-6)
+            residual_normalization=SimpleNamespace(
+                enabled=True, epsilon=1.0e-6
+            )
         ),
         refiner=FakeRefiner(),
     )
@@ -168,7 +170,9 @@ def test_cache_loader_fails_closed_with_builder_command(tmp_path, monkeypatch):
     performance = SimpleNamespace(
         phase1_cache=SimpleNamespace(enabled=True, path=str(tmp_path))
     )
-    with pytest.raises(RuntimeError, match="missing, incomplete.*phase1_cache.py build"):
+    with pytest.raises(
+        RuntimeError, match="missing, incomplete.*phase1_cache.py build"
+    ):
         refinement_cli._load_phase1_cache(
             config=SimpleNamespace(),
             raw_config={"_config_path": "refinement.yaml"},
@@ -182,7 +186,9 @@ class _ParityModel:
     def __init__(self, baseline):
         self.baseline = baseline
         self.training = True
-        self.target_space = SimpleNamespace(residual_target=self._residual_target)
+        self.target_space = SimpleNamespace(
+            residual_target=self._residual_target
+        )
 
     def eval(self):
         self.training = False
@@ -198,7 +204,9 @@ class _ParityModel:
     def _residual_target(target, baseline, scaler_offset=None):
         del scaler_offset
         valid = torch.isfinite(target)
-        residual = torch.where(valid, target - baseline, torch.zeros_like(target))
+        residual = torch.where(
+            valid, target - baseline, torch.zeros_like(target)
+        )
         return residual, valid
 
 
@@ -235,4 +243,40 @@ def test_live_cache_parity_rejects_stale_baseline():
             device=torch.device("cpu"),
             samples=1,
             tolerance=1.0e-6,
+        )
+
+
+def test_phase1_cache_runtime_honors_yaml_tf32_false():
+    prior_matmul_precision = torch.get_float32_matmul_precision()
+    prior_matmul_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
+    prior_cudnn_tf32 = bool(torch.backends.cudnn.allow_tf32)
+    performance = SimpleNamespace(
+        phase1_cache=SimpleNamespace(enabled=True),
+        precision=SimpleNamespace(mode="fp32", allow_tf32=False),
+    )
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        policy = refinement_cli._configure_phase1_cache_runtime(
+            performance, role="test"
+        )
+        assert policy["mode"] == "fp32"
+        assert policy["allow_tf32"] is False
+        assert policy["float32_matmul_precision"] == "highest"
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+    finally:
+        torch.set_float32_matmul_precision(prior_matmul_precision)
+        torch.backends.cuda.matmul.allow_tf32 = prior_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = prior_cudnn_tf32
+
+
+def test_phase1_cache_runtime_rejects_incompatible_precision():
+    performance = SimpleNamespace(
+        phase1_cache=SimpleNamespace(enabled=True),
+        precision=SimpleNamespace(mode="fp32", allow_tf32=True),
+    )
+    with pytest.raises(RuntimeError, match="strict FP32 with TF32 disabled"):
+        refinement_cli._configure_phase1_cache_runtime(
+            performance, role="test"
         )
