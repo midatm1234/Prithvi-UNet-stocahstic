@@ -3,7 +3,7 @@ __pycache__/
 runs/
 examples/
 notebooks/.ipynb_checkpoints/
-experiments/**/weights/
+experiments/
 *.pt
 *.ckpt
 *.pkl
