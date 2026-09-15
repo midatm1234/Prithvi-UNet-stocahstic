@@ -1,0 +1,834 @@
+{
+  "variables": [
+    "pr",
+    "tasmax"
+  ],
+  "variants": {
+    "spatial_ft": {
+      "variables": {
+        "pr": {
+          "primary": {
+            "lag-1 autocorr error |.| reduced >=10%": {
+              "status": "pass",
+              "baseline": 0.02490263479864474,
+              "variant": -0.0069227383868112335,
+              "measure": 0.722008,
+              "threshold": 0.1
+            },
+            "lag-2 autocorr error |.| reduced >=5%": {
+              "status": "pass",
+              "baseline": 0.014082260862163687,
+              "variant": -0.002557833704431439,
+              "measure": 0.818365,
+              "threshold": 0.05
+            },
+            "day-to-day tendency RMSE reduced >=2%": {
+              "status": "FAIL",
+              "baseline": 11.299755988421198,
+              "variant": 11.599340209550492,
+              "measure": -0.026512,
+              "threshold": 0.02
+            },
+            "3-day accumulation RMSE reduced >=1%": {
+              "status": "FAIL",
+              "baseline": 14.20563244329674,
+              "variant": 14.860791145391769,
+              "measure": -0.04612,
+              "threshold": 0.01
+            }
+          },
+          "guardrail": {
+            "per-frame RMSE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 8.0883631849157,
+              "variant": 8.362271764294576,
+              "measure": 0.033865,
+              "threshold": 0.01
+            },
+            "MAE not worse by >1%": {
+              "status": "pass",
+              "baseline": 2.696112833523274,
+              "variant": 2.7187935651822857,
+              "measure": 0.008412,
+              "threshold": 0.01
+            },
+            "daily spatial correlation not worse by >0.005": {
+              "status": "FAIL",
+              "baseline": 0.5301031557913051,
+              "variant": 0.5088659625204646,
+              "measure": 0.021237,
+              "threshold": 0.005
+            },
+            "99th-pct bias |.| not worse by >5%": {
+              "status": "unavailable",
+              "baseline": null,
+              "variant": null
+            },
+            "std ratio not moved toward 0 by >2%": {
+              "status": "pass",
+              "baseline": 0.6224474417495249,
+              "variant": 0.7002407390650526,
+              "measure": -0.077793,
+              "threshold": 0.02
+            },
+            "tendency std ratio not reduced by >2%": {
+              "status": "pass",
+              "baseline": 0.5483503693313843,
+              "variant": 0.6349886091089169,
+              "measure": -0.086638,
+              "threshold": 0.02
+            }
+          }
+        },
+        "tasmax": {
+          "primary": {
+            "lag-1 autocorr error |.| reduced >=10%": {
+              "status": "FAIL",
+              "baseline": 0.004865723648623144,
+              "variant": 0.010093379258572677,
+              "measure": -1.074384,
+              "threshold": 0.1
+            },
+            "lag-2 autocorr error |.| reduced >=5%": {
+              "status": "FAIL",
+              "baseline": 0.00041992172530369576,
+              "variant": 0.01810956342579728,
+              "measure": -42.126045,
+              "threshold": 0.05
+            },
+            "day-to-day tendency RMSE reduced >=2%": {
+              "status": "FAIL",
+              "baseline": 1.5297078105645048,
+              "variant": 1.6778324895974208,
+              "measure": -0.096832,
+              "threshold": 0.02
+            },
+            "3-day accumulation RMSE reduced >=1%": {
+              "status": "FAIL",
+              "baseline": 3.767752694769378,
+              "variant": 4.955390586440948,
+              "measure": -0.315211,
+              "threshold": 0.01
+            }
+          },
+          "guardrail": {
+            "per-frame RMSE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 1.5525976608749934,
+              "variant": 1.9360289556842945,
+              "measure": 0.246961,
+              "threshold": 0.01
+            },
+            "MAE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 1.1696179872387211,
+              "variant": 1.483862035893346,
+              "measure": 0.268672,
+              "threshold": 0.01
+            },
+            "daily spatial correlation not worse by >0.005": {
+              "status": "FAIL",
+              "baseline": 0.9382902022495815,
+              "variant": 0.9321701984230262,
+              "measure": 0.00612,
+              "threshold": 0.005
+            },
+            "99th-pct bias |.| not worse by >5%": {
+              "status": "unavailable",
+              "baseline": null,
+              "variant": null
+            },
+            "std ratio not moved toward 0 by >2%": {
+              "status": "FAIL",
+              "baseline": 1.0071486919900923,
+              "variant": 0.9675214777819893,
+              "measure": 0.039627,
+              "threshold": 0.02
+            },
+            "tendency std ratio not reduced by >2%": {
+              "status": "pass",
+              "baseline": 0.9293246139225286,
+              "variant": 0.9164523831494469,
+              "measure": 0.012872,
+              "threshold": 0.02
+            }
+          }
+        }
+      },
+      "pass_primary": false,
+      "pass_guardrail": false,
+      "accepted": false,
+      "scientific_acceptance": null
+    },
+    "time_only": {
+      "variables": {
+        "pr": {
+          "primary": {
+            "lag-1 autocorr error |.| reduced >=10%": {
+              "status": "pass",
+              "baseline": 0.02490263479864474,
+              "variant": -0.009712302261479344,
+              "measure": 0.609989,
+              "threshold": 0.1
+            },
+            "lag-2 autocorr error |.| reduced >=5%": {
+              "status": "FAIL",
+              "baseline": 0.014082260862163687,
+              "variant": -0.017134063421556767,
+              "measure": -0.216713,
+              "threshold": 0.05
+            },
+            "day-to-day tendency RMSE reduced >=2%": {
+              "status": "FAIL",
+              "baseline": 11.299755988421198,
+              "variant": 11.431122567849147,
+              "measure": -0.011626,
+              "threshold": 0.02
+            },
+            "3-day accumulation RMSE reduced >=1%": {
+              "status": "FAIL",
+              "baseline": 14.20563244329674,
+              "variant": 14.69495790560896,
+              "measure": -0.034446,
+              "threshold": 0.01
+            }
+          },
+          "guardrail": {
+            "per-frame RMSE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 8.0883631849157,
+              "variant": 8.250201514361125,
+              "measure": 0.020009,
+              "threshold": 0.01
+            },
+            "MAE not worse by >1%": {
+              "status": "pass",
+              "baseline": 2.696112833523274,
+              "variant": 2.5781502261142375,
+              "measure": -0.043753,
+              "threshold": 0.01
+            },
+            "daily spatial correlation not worse by >0.005": {
+              "status": "FAIL",
+              "baseline": 0.5301031557913051,
+              "variant": 0.512919160063964,
+              "measure": 0.017184,
+              "threshold": 0.005
+            },
+            "99th-pct bias |.| not worse by >5%": {
+              "status": "unavailable",
+              "baseline": null,
+              "variant": null
+            },
+            "std ratio not moved toward 0 by >2%": {
+              "status": "pass",
+              "baseline": 0.6224474417495249,
+              "variant": 0.6116427165251102,
+              "measure": 0.010805,
+              "threshold": 0.02
+            },
+            "tendency std ratio not reduced by >2%": {
+              "status": "pass",
+              "baseline": 0.5483503693313843,
+              "variant": 0.5573160999501905,
+              "measure": -0.008966,
+              "threshold": 0.02
+            }
+          }
+        },
+        "tasmax": {
+          "primary": {
+            "lag-1 autocorr error |.| reduced >=10%": {
+              "status": "pass",
+              "baseline": 0.004865723648623144,
+              "variant": -0.0033334053781918227,
+              "measure": 0.314921,
+              "threshold": 0.1
+            },
+            "lag-2 autocorr error |.| reduced >=5%": {
+              "status": "FAIL",
+              "baseline": 0.00041992172530369576,
+              "variant": -0.008472290338047306,
+              "measure": -19.17588,
+              "threshold": 0.05
+            },
+            "day-to-day tendency RMSE reduced >=2%": {
+              "status": "FAIL",
+              "baseline": 1.5297078105645048,
+              "variant": 1.700449583747086,
+              "measure": -0.111617,
+              "threshold": 0.02
+            },
+            "3-day accumulation RMSE reduced >=1%": {
+              "status": "FAIL",
+              "baseline": 3.767752694769378,
+              "variant": 4.347346852857725,
+              "measure": -0.15383,
+              "threshold": 0.01
+            }
+          },
+          "guardrail": {
+            "per-frame RMSE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 1.5525976608749934,
+              "variant": 1.7759002629444505,
+              "measure": 0.143825,
+              "threshold": 0.01
+            },
+            "MAE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 1.1696179872387211,
+              "variant": 1.3943226233873194,
+              "measure": 0.192118,
+              "threshold": 0.01
+            },
+            "daily spatial correlation not worse by >0.005": {
+              "status": "pass",
+              "baseline": 0.9382902022495815,
+              "variant": 0.9363504614155158,
+              "measure": 0.00194,
+              "threshold": 0.005
+            },
+            "99th-pct bias |.| not worse by >5%": {
+              "status": "unavailable",
+              "baseline": null,
+              "variant": null
+            },
+            "std ratio not moved toward 0 by >2%": {
+              "status": "pass",
+              "baseline": 1.0071486919900923,
+              "variant": 0.9881978237089563,
+              "measure": 0.018951,
+              "threshold": 0.02
+            },
+            "tendency std ratio not reduced by >2%": {
+              "status": "pass",
+              "baseline": 0.9293246139225286,
+              "variant": 0.9833972657153556,
+              "measure": -0.054073,
+              "threshold": 0.02
+            }
+          }
+        }
+      },
+      "pass_primary": false,
+      "pass_guardrail": false,
+      "accepted": false,
+      "scientific_acceptance": null
+    },
+    "convgru": {
+      "variables": {
+        "pr": {
+          "primary": {
+            "lag-1 autocorr error |.| reduced >=10%": {
+              "status": "FAIL",
+              "baseline": 0.02490263479864474,
+              "variant": -0.02258957545821849,
+              "measure": 0.092884,
+              "threshold": 0.1
+            },
+            "lag-2 autocorr error |.| reduced >=5%": {
+              "status": "FAIL",
+              "baseline": 0.014082260862163687,
+              "variant": -0.027322586322088005,
+              "measure": -0.940213,
+              "threshold": 0.05
+            },
+            "day-to-day tendency RMSE reduced >=2%": {
+              "status": "FAIL",
+              "baseline": 11.299755988421198,
+              "variant": 11.429540279721094,
+              "measure": -0.011486,
+              "threshold": 0.02
+            },
+            "3-day accumulation RMSE reduced >=1%": {
+              "status": "FAIL",
+              "baseline": 14.20563244329674,
+              "variant": 14.887948433603775,
+              "measure": -0.048031,
+              "threshold": 0.01
+            }
+          },
+          "guardrail": {
+            "per-frame RMSE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 8.0883631849157,
+              "variant": 8.289622691112532,
+              "measure": 0.024883,
+              "threshold": 0.01
+            },
+            "MAE not worse by >1%": {
+              "status": "pass",
+              "baseline": 2.696112833523274,
+              "variant": 2.520356397092135,
+              "measure": -0.065189,
+              "threshold": 0.01
+            },
+            "daily spatial correlation not worse by >0.005": {
+              "status": "FAIL",
+              "baseline": 0.5301031557913051,
+              "variant": 0.5129145656203608,
+              "measure": 0.017189,
+              "threshold": 0.005
+            },
+            "99th-pct bias |.| not worse by >5%": {
+              "status": "unavailable",
+              "baseline": null,
+              "variant": null
+            },
+            "std ratio not moved toward 0 by >2%": {
+              "status": "FAIL",
+              "baseline": 0.6224474417495249,
+              "variant": 0.5673661809678539,
+              "measure": 0.055081,
+              "threshold": 0.02
+            },
+            "tendency std ratio not reduced by >2%": {
+              "status": "FAIL",
+              "baseline": 0.5483503693313843,
+              "variant": 0.5178081673572585,
+              "measure": 0.030542,
+              "threshold": 0.02
+            }
+          }
+        },
+        "tasmax": {
+          "primary": {
+            "lag-1 autocorr error |.| reduced >=10%": {
+              "status": "FAIL",
+              "baseline": 0.004865723648623144,
+              "variant": -0.02498185792724328,
+              "measure": -4.134253,
+              "threshold": 0.1
+            },
+            "lag-2 autocorr error |.| reduced >=5%": {
+              "status": "FAIL",
+              "baseline": 0.00041992172530369576,
+              "variant": -0.055604616483147906,
+              "measure": -131.416622,
+              "threshold": 0.05
+            },
+            "day-to-day tendency RMSE reduced >=2%": {
+              "status": "FAIL",
+              "baseline": 1.5297078105645048,
+              "variant": 2.0267693589187235,
+              "measure": -0.324939,
+              "threshold": 0.02
+            },
+            "3-day accumulation RMSE reduced >=1%": {
+              "status": "FAIL",
+              "baseline": 3.767752694769378,
+              "variant": 5.347056596674093,
+              "measure": -0.419163,
+              "threshold": 0.01
+            }
+          },
+          "guardrail": {
+            "per-frame RMSE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 1.5525976608749934,
+              "variant": 2.180929725956932,
+              "measure": 0.404697,
+              "threshold": 0.01
+            },
+            "MAE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 1.1696179872387211,
+              "variant": 1.5958746921645315,
+              "measure": 0.364441,
+              "threshold": 0.01
+            },
+            "daily spatial correlation not worse by >0.005": {
+              "status": "FAIL",
+              "baseline": 0.9382902022495815,
+              "variant": 0.9019084667018946,
+              "measure": 0.036382,
+              "threshold": 0.005
+            },
+            "99th-pct bias |.| not worse by >5%": {
+              "status": "unavailable",
+              "baseline": null,
+              "variant": null
+            },
+            "std ratio not moved toward 0 by >2%": {
+              "status": "pass",
+              "baseline": 1.0071486919900923,
+              "variant": 1.0755517387884623,
+              "measure": -0.068403,
+              "threshold": 0.02
+            },
+            "tendency std ratio not reduced by >2%": {
+              "status": "pass",
+              "baseline": 0.9293246139225286,
+              "variant": 1.1690116558951735,
+              "measure": -0.239687,
+              "threshold": 0.02
+            }
+          }
+        }
+      },
+      "pass_primary": false,
+      "pass_guardrail": false,
+      "accepted": false,
+      "versus_controls": {
+        "spatial_ft": {
+          "beats": false,
+          "detail": {
+            "pr": {
+              "lag-1 autocorr error |.| reduced >=10%": {
+                "status": "FAIL",
+                "convgru": -0.02258957545821849,
+                "spatial_ft": -0.0069227383868112335
+              },
+              "lag-2 autocorr error |.| reduced >=5%": {
+                "status": "FAIL",
+                "convgru": -0.027322586322088005,
+                "spatial_ft": -0.002557833704431439
+              },
+              "day-to-day tendency RMSE reduced >=2%": {
+                "status": "pass",
+                "convgru": 11.429540279721094,
+                "spatial_ft": 11.599340209550492
+              },
+              "3-day accumulation RMSE reduced >=1%": {
+                "status": "FAIL",
+                "convgru": 14.887948433603775,
+                "spatial_ft": 14.860791145391769
+              }
+            },
+            "tasmax": {
+              "lag-1 autocorr error |.| reduced >=10%": {
+                "status": "FAIL",
+                "convgru": -0.02498185792724328,
+                "spatial_ft": 0.010093379258572677
+              },
+              "lag-2 autocorr error |.| reduced >=5%": {
+                "status": "FAIL",
+                "convgru": -0.055604616483147906,
+                "spatial_ft": 0.01810956342579728
+              },
+              "day-to-day tendency RMSE reduced >=2%": {
+                "status": "FAIL",
+                "convgru": 2.0267693589187235,
+                "spatial_ft": 1.6778324895974208
+              },
+              "3-day accumulation RMSE reduced >=1%": {
+                "status": "FAIL",
+                "convgru": 5.347056596674093,
+                "spatial_ft": 4.955390586440948
+              }
+            }
+          }
+        },
+        "time_only": {
+          "beats": false,
+          "detail": {
+            "pr": {
+              "lag-1 autocorr error |.| reduced >=10%": {
+                "status": "FAIL",
+                "convgru": -0.02258957545821849,
+                "time_only": -0.009712302261479344
+              },
+              "lag-2 autocorr error |.| reduced >=5%": {
+                "status": "FAIL",
+                "convgru": -0.027322586322088005,
+                "time_only": -0.017134063421556767
+              },
+              "day-to-day tendency RMSE reduced >=2%": {
+                "status": "pass",
+                "convgru": 11.429540279721094,
+                "time_only": 11.431122567849147
+              },
+              "3-day accumulation RMSE reduced >=1%": {
+                "status": "FAIL",
+                "convgru": 14.887948433603775,
+                "time_only": 14.69495790560896
+              }
+            },
+            "tasmax": {
+              "lag-1 autocorr error |.| reduced >=10%": {
+                "status": "FAIL",
+                "convgru": -0.02498185792724328,
+                "time_only": -0.0033334053781918227
+              },
+              "lag-2 autocorr error |.| reduced >=5%": {
+                "status": "FAIL",
+                "convgru": -0.055604616483147906,
+                "time_only": -0.008472290338047306
+              },
+              "day-to-day tendency RMSE reduced >=2%": {
+                "status": "FAIL",
+                "convgru": 2.0267693589187235,
+                "time_only": 1.700449583747086
+              },
+              "3-day accumulation RMSE reduced >=1%": {
+                "status": "FAIL",
+                "convgru": 5.347056596674093,
+                "time_only": 4.347346852857725
+              }
+            }
+          }
+        }
+      },
+      "beats_all_controls": false,
+      "scientific_acceptance": false
+    },
+    "mamba": {
+      "variables": {
+        "pr": {
+          "primary": {
+            "lag-1 autocorr error |.| reduced >=10%": {
+              "status": "pass",
+              "baseline": 0.02490263479864474,
+              "variant": 0.002692746988304462,
+              "measure": 0.891869,
+              "threshold": 0.1
+            },
+            "lag-2 autocorr error |.| reduced >=5%": {
+              "status": "pass",
+              "baseline": 0.014082260862163687,
+              "variant": -0.011712243350747553,
+              "measure": 0.168298,
+              "threshold": 0.05
+            },
+            "day-to-day tendency RMSE reduced >=2%": {
+              "status": "FAIL",
+              "baseline": 11.299755988421198,
+              "variant": 11.497905299782905,
+              "measure": -0.017536,
+              "threshold": 0.02
+            },
+            "3-day accumulation RMSE reduced >=1%": {
+              "status": "FAIL",
+              "baseline": 14.20563244329674,
+              "variant": 15.29845226448415,
+              "measure": -0.076929,
+              "threshold": 0.01
+            }
+          },
+          "guardrail": {
+            "per-frame RMSE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 8.0883631849157,
+              "variant": 8.412458573217279,
+              "measure": 0.040069,
+              "threshold": 0.01
+            },
+            "MAE not worse by >1%": {
+              "status": "pass",
+              "baseline": 2.696112833523274,
+              "variant": 2.524047026247863,
+              "measure": -0.06382,
+              "threshold": 0.01
+            },
+            "daily spatial correlation not worse by >0.005": {
+              "status": "FAIL",
+              "baseline": 0.5301031557913051,
+              "variant": 0.5164631138942494,
+              "measure": 0.01364,
+              "threshold": 0.005
+            },
+            "99th-pct bias |.| not worse by >5%": {
+              "status": "unavailable",
+              "baseline": null,
+              "variant": null
+            },
+            "std ratio not moved toward 0 by >2%": {
+              "status": "FAIL",
+              "baseline": 0.6224474417495249,
+              "variant": 0.45500883693970673,
+              "measure": 0.167439,
+              "threshold": 0.02
+            },
+            "tendency std ratio not reduced by >2%": {
+              "status": "FAIL",
+              "baseline": 0.5483503693313843,
+              "variant": 0.40409154383479723,
+              "measure": 0.144259,
+              "threshold": 0.02
+            }
+          }
+        },
+        "tasmax": {
+          "primary": {
+            "lag-1 autocorr error |.| reduced >=10%": {
+              "status": "pass",
+              "baseline": 0.004865723648623144,
+              "variant": 0.0025569860373202413,
+              "measure": 0.47449,
+              "threshold": 0.1
+            },
+            "lag-2 autocorr error |.| reduced >=5%": {
+              "status": "FAIL",
+              "baseline": 0.00041992172530369576,
+              "variant": -0.008436262055958488,
+              "measure": -19.090082,
+              "threshold": 0.05
+            },
+            "day-to-day tendency RMSE reduced >=2%": {
+              "status": "FAIL",
+              "baseline": 1.5297078105645048,
+              "variant": 1.6492478973593159,
+              "measure": -0.078146,
+              "threshold": 0.02
+            },
+            "3-day accumulation RMSE reduced >=1%": {
+              "status": "FAIL",
+              "baseline": 3.767752694769378,
+              "variant": 4.768351933484765,
+              "measure": -0.265569,
+              "threshold": 0.01
+            }
+          },
+          "guardrail": {
+            "per-frame RMSE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 1.5525976608749934,
+              "variant": 1.8706443057620126,
+              "measure": 0.204848,
+              "threshold": 0.01
+            },
+            "MAE not worse by >1%": {
+              "status": "FAIL",
+              "baseline": 1.1696179872387211,
+              "variant": 1.463041013935113,
+              "measure": 0.250871,
+              "threshold": 0.01
+            },
+            "daily spatial correlation not worse by >0.005": {
+              "status": "pass",
+              "baseline": 0.9382902022495815,
+              "variant": 0.9375850352012567,
+              "measure": 0.000705,
+              "threshold": 0.005
+            },
+            "99th-pct bias |.| not worse by >5%": {
+              "status": "unavailable",
+              "baseline": null,
+              "variant": null
+            },
+            "std ratio not moved toward 0 by >2%": {
+              "status": "FAIL",
+              "baseline": 1.0071486919900923,
+              "variant": 0.9192415051882097,
+              "measure": 0.087907,
+              "threshold": 0.02
+            },
+            "tendency std ratio not reduced by >2%": {
+              "status": "FAIL",
+              "baseline": 0.9293246139225286,
+              "variant": 0.824841439601149,
+              "measure": 0.104483,
+              "threshold": 0.02
+            }
+          }
+        }
+      },
+      "pass_primary": false,
+      "pass_guardrail": false,
+      "accepted": false,
+      "versus_controls": {
+        "spatial_ft": {
+          "beats": false,
+          "detail": {
+            "pr": {
+              "lag-1 autocorr error |.| reduced >=10%": {
+                "status": "pass",
+                "mamba": 0.002692746988304462,
+                "spatial_ft": -0.0069227383868112335
+              },
+              "lag-2 autocorr error |.| reduced >=5%": {
+                "status": "FAIL",
+                "mamba": -0.011712243350747553,
+                "spatial_ft": -0.002557833704431439
+              },
+              "day-to-day tendency RMSE reduced >=2%": {
+                "status": "pass",
+                "mamba": 11.497905299782905,
+                "spatial_ft": 11.599340209550492
+              },
+              "3-day accumulation RMSE reduced >=1%": {
+                "status": "FAIL",
+                "mamba": 15.29845226448415,
+                "spatial_ft": 14.860791145391769
+              }
+            },
+            "tasmax": {
+              "lag-1 autocorr error |.| reduced >=10%": {
+                "status": "pass",
+                "mamba": 0.0025569860373202413,
+                "spatial_ft": 0.010093379258572677
+              },
+              "lag-2 autocorr error |.| reduced >=5%": {
+                "status": "pass",
+                "mamba": -0.008436262055958488,
+                "spatial_ft": 0.01810956342579728
+              },
+              "day-to-day tendency RMSE reduced >=2%": {
+                "status": "pass",
+                "mamba": 1.6492478973593159,
+                "spatial_ft": 1.6778324895974208
+              },
+              "3-day accumulation RMSE reduced >=1%": {
+                "status": "pass",
+                "mamba": 4.768351933484765,
+                "spatial_ft": 4.955390586440948
+              }
+            }
+          }
+        },
+        "time_only": {
+          "beats": false,
+          "detail": {
+            "pr": {
+              "lag-1 autocorr error |.| reduced >=10%": {
+                "status": "pass",
+                "mamba": 0.002692746988304462,
+                "time_only": -0.009712302261479344
+              },
+              "lag-2 autocorr error |.| reduced >=5%": {
+                "status": "pass",
+                "mamba": -0.011712243350747553,
+                "time_only": -0.017134063421556767
+              },
+              "day-to-day tendency RMSE reduced >=2%": {
+                "status": "FAIL",
+                "mamba": 11.497905299782905,
+                "time_only": 11.431122567849147
+              },
+              "3-day accumulation RMSE reduced >=1%": {
+                "status": "FAIL",
+                "mamba": 15.29845226448415,
+                "time_only": 14.69495790560896
+              }
+            },
+            "tasmax": {
+              "lag-1 autocorr error |.| reduced >=10%": {
+                "status": "pass",
+                "mamba": 0.0025569860373202413,
+                "time_only": -0.0033334053781918227
+              },
+              "lag-2 autocorr error |.| reduced >=5%": {
+                "status": "pass",
+                "mamba": -0.008436262055958488,
+                "time_only": -0.008472290338047306
+              },
+              "day-to-day tendency RMSE reduced >=2%": {
+                "status": "pass",
+                "mamba": 1.6492478973593159,
+                "time_only": 1.700449583747086
+              },
+              "3-day accumulation RMSE reduced >=1%": {
+                "status": "FAIL",
+                "mamba": 4.768351933484765,
+                "time_only": 4.347346852857725
+              }
+            }
+          }
+        }
+      },
+      "beats_all_controls": false,
+      "scientific_acceptance": false
+    }
+  }
+}

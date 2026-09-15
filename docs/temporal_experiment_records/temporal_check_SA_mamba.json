@@ -1,0 +1,104 @@
+{
+  "config": "examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_mamba.yaml",
+  "device": "cuda",
+  "time_features": {
+    "dim": 5,
+    "names": [
+      "season_sin",
+      "season_cos",
+      "log_gap_excess",
+      "is_sequence_start",
+      "state_age"
+    ]
+  },
+  "migration": {
+    "source": "./examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/phase1_unet/best.ckpt",
+    "kind": "spatial_init",
+    "n_loaded": 208,
+    "missing_temporal": [
+      "temporal_adapter.gate",
+      "temporal_adapter.pre_norm.weight",
+      "temporal_adapter.pre_norm.bias",
+      "temporal_adapter.in_proj.weight",
+      "temporal_adapter.in_proj.bias",
+      "temporal_adapter.backend.film.mlp.0.weight",
+      "temporal_adapter.backend.film.mlp.0.bias",
+      "temporal_adapter.backend.film.mlp.2.weight",
+      "temporal_adapter.backend.film.mlp.2.bias",
+      "temporal_adapter.backend.blocks.0.A_log",
+      "temporal_adapter.backend.blocks.0.D",
+      "temporal_adapter.backend.blocks.0.dt_bias",
+      "temporal_adapter.backend.blocks.0.norm.weight",
+      "temporal_adapter.backend.blocks.0.norm.bias",
+      "temporal_adapter.backend.blocks.0.spatial.0.weight",
+      "temporal_adapter.backend.blocks.0.spatial.0.bias",
+      "temporal_adapter.backend.blocks.0.spatial.1.weight",
+      "temporal_adapter.backend.blocks.0.spatial.1.bias",
+      "temporal_adapter.backend.blocks.0.in_proj.weight",
+      "temporal_adapter.backend.blocks.0.conv_time.weight",
+      "temporal_adapter.backend.blocks.0.conv_time.bias",
+      "temporal_adapter.backend.blocks.0.out_proj.weight",
+      "temporal_adapter.backend.blocks.1.A_log",
+      "temporal_adapter.backend.blocks.1.D",
+      "temporal_adapter.backend.blocks.1.dt_bias",
+      "temporal_adapter.backend.blocks.1.norm.weight",
+      "temporal_adapter.backend.blocks.1.norm.bias",
+      "temporal_adapter.backend.blocks.1.spatial.0.weight",
+      "temporal_adapter.backend.blocks.1.spatial.0.bias",
+      "temporal_adapter.backend.blocks.1.spatial.1.weight",
+      "temporal_adapter.backend.blocks.1.spatial.1.bias",
+      "temporal_adapter.backend.blocks.1.in_proj.weight",
+      "temporal_adapter.backend.blocks.1.conv_time.weight",
+      "temporal_adapter.backend.blocks.1.conv_time.bias",
+      "temporal_adapter.backend.blocks.1.out_proj.weight",
+      "temporal_adapter.out_proj.weight",
+      "temporal_adapter.out_proj.bias"
+    ],
+    "missing_other": [],
+    "unexpected": [],
+    "shape_mismatch": [],
+    "contract_problems": [],
+    "checkpoint_epoch": 9,
+    "checkpoint_global_step": 4570,
+    "trained_temporal_steps": 0
+  },
+  "temporal_parameters": 1516576,
+  "legacy_parity_gate_zero": {
+    "bitwise_identical": true,
+    "max_abs_diff": 0.0
+  },
+  "near_identity_default_gate": {
+    "adapter_init_gate": 0.001,
+    "mean_relative_deviation": 9.328537998953834e-06
+  },
+  "gradient_flow": {
+    "n_temporal_tensors": 37,
+    "n_zero_gradient": 0,
+    "zero_gradient_examples": []
+  },
+  "causality": {
+    "earlier_frames_bitwise_unchanged": true,
+    "last_frame_changed": true
+  },
+  "history_sensitivity": {
+    "note": "gate temporarily set to 1.0 to measure the pathway, not accuracy",
+    "max_abs_change_final_frame": 0.10286521911621094,
+    "field_scale": 151.72430419921875,
+    "time_features_identical": true
+  },
+  "chunk_consistency": {
+    "n_frames": 12,
+    "chunks": {
+      "12": {
+        "max_abs_diff": 0.0,
+        "reference": true
+      },
+      "4": {
+        "max_abs_diff": 0.0,
+        "reference": false
+      }
+    },
+    "max_abs_diff_overall": 0.0,
+    "exact": true
+  }
+}

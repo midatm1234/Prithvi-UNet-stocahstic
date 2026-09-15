@@ -1,0 +1,369 @@
+{
+  "created_utc": "2026-09-15T06:50:54Z",
+  "device": "cuda",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "training_windows": 600,
+  "validation_windows": 60,
+  "epochs": 1,
+  "test_period": [
+    "1981-01-01",
+    "1983-12-31"
+  ],
+  "acceptance_tolerances": {
+    "primary_temporal": [
+      {
+        "label": "lag-1 autocorr error |.| reduced >=10%",
+        "metric": "paired.autocorr_lag1_error",
+        "mode": "rel_improve",
+        "threshold": 0.1
+      },
+      {
+        "label": "lag-2 autocorr error |.| reduced >=5%",
+        "metric": "paired.autocorr_lag2_error",
+        "mode": "rel_improve",
+        "threshold": 0.05
+      },
+      {
+        "label": "day-to-day tendency RMSE reduced >=2%",
+        "metric": "paired.tendency_rmse",
+        "mode": "rel_improve",
+        "threshold": 0.02
+      },
+      {
+        "label": "3-day accumulation RMSE reduced >=1%",
+        "metric": "paired.acc3d_rmse",
+        "mode": "rel_improve",
+        "threshold": 0.01
+      }
+    ],
+    "guardrail_spatial": [
+      {
+        "label": "per-frame RMSE not worse by >1%",
+        "metric": "paired.rmse",
+        "mode": "rel_degrade",
+        "threshold": 0.01
+      },
+      {
+        "label": "MAE not worse by >1%",
+        "metric": "paired.mae",
+        "mode": "rel_degrade",
+        "threshold": 0.01
+      },
+      {
+        "label": "daily spatial correlation not worse by >0.005",
+        "metric": "paired.spatial_r_daily_mean",
+        "mode": "abs_degrade",
+        "threshold": 0.005
+      },
+      {
+        "label": "99th-pct bias |.| not worse by >5%",
+        "metric": "paired.q0.99_bias",
+        "mode": "rel_degrade",
+        "threshold": 0.05
+      },
+      {
+        "label": "std ratio not moved toward 0 by >2%",
+        "metric": "paired.std_ratio",
+        "mode": "abs_degrade",
+        "threshold": 0.02
+      },
+      {
+        "label": "tendency std ratio not reduced by >2%",
+        "metric": "paired.tendency_std_ratio",
+        "mode": "abs_degrade",
+        "threshold": 0.02
+      }
+    ]
+  },
+  "must_beat": [
+    "spatial_ft",
+    "time_only"
+  ],
+  "variants": {
+    "baseline": {
+      "trained": false,
+      "source": "examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_recurrent.yaml",
+      "checkpoint": "./examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/phase1_unet/best.ckpt",
+      "migration": {
+        "source": "./examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/phase1_unet/best.ckpt",
+        "kind": "spatial_init",
+        "n_loaded": 208,
+        "missing_temporal": [
+          "temporal_adapter.gate",
+          "temporal_adapter.pre_norm.weight",
+          "temporal_adapter.pre_norm.bias",
+          "temporal_adapter.in_proj.weight",
+          "temporal_adapter.in_proj.bias",
+          "temporal_adapter.backend.film.mlp.0.weight",
+          "temporal_adapter.backend.film.mlp.0.bias",
+          "temporal_adapter.backend.film.mlp.2.weight",
+          "temporal_adapter.backend.film.mlp.2.bias",
+          "temporal_adapter.backend.norms.0.weight",
+          "temporal_adapter.backend.norms.0.bias",
+          "temporal_adapter.backend.norms.1.weight",
+          "temporal_adapter.backend.norms.1.bias",
+          "temporal_adapter.backend.cells.0.gates.weight",
+          "temporal_adapter.backend.cells.0.gates.bias",
+          "temporal_adapter.backend.cells.0.candidate.weight",
+          "temporal_adapter.backend.cells.0.candidate.bias",
+          "temporal_adapter.backend.cells.1.gates.weight",
+          "temporal_adapter.backend.cells.1.gates.bias",
+          "temporal_adapter.backend.cells.1.candidate.weight",
+          "temporal_adapter.backend.cells.1.candidate.bias",
+          "temporal_adapter.out_proj.weight",
+          "temporal_adapter.out_proj.bias"
+        ],
+        "missing_other": [],
+        "unexpected": [],
+        "shape_mismatch": [],
+        "contract_problems": [],
+        "checkpoint_epoch": 9,
+        "checkpoint_global_step": 4570,
+        "trained_temporal_steps": 0
+      },
+      "inference_seconds": 410.81059980392456,
+      "n_dates": 1095
+    },
+    "spatial_ft": {
+      "trained": true,
+      "source": "examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_recurrent.yaml",
+      "train_seconds": 3506.644496679306,
+      "history": [
+        {
+          "epoch": 0,
+          "global_step": 600,
+          "trained_temporal_steps": 600,
+          "trainable": {
+            "backbone": false,
+            "encoder": false,
+            "decoder": true,
+            "temporal": false,
+            "other": true
+          },
+          "train": {
+            "per_frame": 4.89059282720089,
+            "tendency": 0.1638632924730579,
+            "accumulation": 0.4800797222120066,
+            "occurrence": 0.15371055841445924,
+            "lag_autocorr": 0.0,
+            "tmax_tmin": 0.0,
+            "total": 4.970865825215975,
+            "seconds": 3336.7640533447266,
+            "n_batches": 600
+          },
+          "validation": {
+            "per_frame": 4.619341584046682,
+            "tendency": 0.1536328334361315,
+            "accumulation": 0.41786653821667036,
+            "occurrence": 0.06450695246458053,
+            "lag_autocorr": 0.0,
+            "tmax_tmin": 0.0,
+            "total": 4.687398560841879
+          }
+        }
+      ],
+      "variable_scales": {
+        "pr": 16.066404342651367,
+        "tasmax": 6.340047836303711
+      },
+      "trained_temporal_steps": 600,
+      "checkpoint": "examples\\CORDEX_ML\\runs_temporal\\experiment\\spatial_ft\\checkpoints\\best.ckpt",
+      "migration": {
+        "source": "examples\\CORDEX_ML\\runs_temporal\\experiment\\spatial_ft\\checkpoints\\best.ckpt",
+        "kind": "temporal_resume",
+        "n_loaded": 231,
+        "missing_temporal": [],
+        "missing_other": [],
+        "unexpected": [],
+        "shape_mismatch": [],
+        "contract_problems": [],
+        "checkpoint_epoch": 0,
+        "checkpoint_global_step": 600,
+        "trained_temporal_steps": 600
+      },
+      "inference_seconds": 411.7495496273041,
+      "n_dates": 1095
+    },
+    "time_only": {
+      "trained": true,
+      "source": "examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_recurrent.yaml",
+      "train_seconds": 2994.2511167526245,
+      "history": [
+        {
+          "epoch": 0,
+          "global_step": 600,
+          "trained_temporal_steps": 600,
+          "trainable": {
+            "backbone": false,
+            "encoder": false,
+            "decoder": true,
+            "temporal": true,
+            "other": true
+          },
+          "train": {
+            "per_frame": 4.904402783314387,
+            "tendency": 0.1647093265876174,
+            "accumulation": 0.4805941572692245,
+            "occurrence": 0.1532204711313049,
+            "lag_autocorr": 0.0,
+            "tmax_tmin": 0.0,
+            "total": 4.98482961555322,
+            "seconds": 2825.092456102371,
+            "n_batches": 600
+          },
+          "validation": {
+            "per_frame": 4.479928572972615,
+            "tendency": 0.15170353067417938,
+            "accumulation": 0.3969488116602103,
+            "occurrence": 0.05386923576394717,
+            "lag_autocorr": 0.0,
+            "tmax_tmin": 0.0,
+            "total": 4.545072436332703
+          }
+        }
+      ],
+      "variable_scales": {
+        "pr": 16.066404342651367,
+        "tasmax": 6.340047836303711
+      },
+      "trained_temporal_steps": 600,
+      "checkpoint": "examples\\CORDEX_ML\\runs_temporal\\experiment\\time_only\\checkpoints\\best.ckpt",
+      "migration": {
+        "source": "examples\\CORDEX_ML\\runs_temporal\\experiment\\time_only\\checkpoints\\best.ckpt",
+        "kind": "temporal_resume",
+        "n_loaded": 231,
+        "missing_temporal": [],
+        "missing_other": [],
+        "unexpected": [],
+        "shape_mismatch": [],
+        "contract_problems": [],
+        "checkpoint_epoch": 0,
+        "checkpoint_global_step": 600,
+        "trained_temporal_steps": 600
+      },
+      "inference_seconds": 407.6086919307709,
+      "n_dates": 1095
+    },
+    "convgru": {
+      "trained": true,
+      "source": "examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_recurrent.yaml",
+      "train_seconds": 3497.798084259033,
+      "history": [
+        {
+          "epoch": 0,
+          "global_step": 600,
+          "trained_temporal_steps": 600,
+          "trainable": {
+            "backbone": false,
+            "encoder": false,
+            "decoder": true,
+            "temporal": true,
+            "other": true
+          },
+          "train": {
+            "per_frame": 4.896959531406561,
+            "tendency": 0.16534587717925509,
+            "accumulation": 0.47805348933984837,
+            "occurrence": 0.15357338454574346,
+            "lag_autocorr": 0.0,
+            "tmax_tmin": 0.0,
+            "total": 4.977245439887047,
+            "seconds": 3328.4454221725464,
+            "n_batches": 600
+          },
+          "validation": {
+            "per_frame": 4.627182610829672,
+            "tendency": 0.16755384244024754,
+            "accumulation": 0.3987386440237363,
+            "occurrence": 0.05178228877484799,
+            "lag_autocorr": 0.0,
+            "tmax_tmin": 0.0,
+            "total": 4.694778593381246
+          }
+        }
+      ],
+      "variable_scales": {
+        "pr": 16.066404342651367,
+        "tasmax": 6.340047836303711
+      },
+      "trained_temporal_steps": 600,
+      "checkpoint": "examples\\CORDEX_ML\\runs_temporal\\experiment\\convgru\\checkpoints\\best.ckpt",
+      "migration": {
+        "source": "examples\\CORDEX_ML\\runs_temporal\\experiment\\convgru\\checkpoints\\best.ckpt",
+        "kind": "temporal_resume",
+        "n_loaded": 231,
+        "missing_temporal": [],
+        "missing_other": [],
+        "unexpected": [],
+        "shape_mismatch": [],
+        "contract_problems": [],
+        "checkpoint_epoch": 0,
+        "checkpoint_global_step": 600,
+        "trained_temporal_steps": 600
+      },
+      "inference_seconds": 411.4343056678772,
+      "n_dates": 1095
+    },
+    "mamba": {
+      "trained": true,
+      "source": "examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_mamba.yaml",
+      "train_seconds": 3511.750988960266,
+      "history": [
+        {
+          "epoch": 0,
+          "global_step": 600,
+          "trained_temporal_steps": 600,
+          "trainable": {
+            "backbone": false,
+            "encoder": false,
+            "decoder": true,
+            "temporal": true,
+            "other": true
+          },
+          "train": {
+            "per_frame": 4.881023645102978,
+            "tendency": 0.1638819678251942,
+            "accumulation": 0.4762703478087982,
+            "occurrence": 0.15598555992046992,
+            "lag_autocorr": 0.0,
+            "tmax_tmin": 0.0,
+            "total": 4.961032270689805,
+            "seconds": 3342.75360250473,
+            "n_batches": 600
+          },
+          "validation": {
+            "per_frame": 4.652837948004405,
+            "tendency": 0.14513709601014851,
+            "accumulation": 0.4134983689834674,
+            "occurrence": 0.05026237530012925,
+            "lag_autocorr": 0.0,
+            "tmax_tmin": 0.0,
+            "total": 4.718471491336823
+          }
+        }
+      ],
+      "variable_scales": {
+        "pr": 16.066404342651367,
+        "tasmax": 6.340047836303711
+      },
+      "trained_temporal_steps": 600,
+      "checkpoint": "examples\\CORDEX_ML\\runs_temporal\\experiment\\mamba\\checkpoints\\best.ckpt",
+      "migration": {
+        "source": "examples\\CORDEX_ML\\runs_temporal\\experiment\\mamba\\checkpoints\\best.ckpt",
+        "kind": "temporal_resume",
+        "n_loaded": 245,
+        "missing_temporal": [],
+        "missing_other": [],
+        "unexpected": [],
+        "shape_mismatch": [],
+        "contract_problems": [],
+        "checkpoint_epoch": 0,
+        "checkpoint_global_step": 600,
+        "trained_temporal_steps": 600
+      },
+      "inference_seconds": 413.014098405838,
+      "n_dates": 1095
+    }
+  },
+  "scorecard_path": "examples\\CORDEX_ML\\runs_temporal\\experiment\\scorecard.json"
+}
