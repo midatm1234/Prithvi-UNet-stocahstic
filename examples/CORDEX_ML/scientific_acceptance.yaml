@@ -1,0 +1,164 @@
+schema_version: 1
+contract_name: cordex_sa_four_head_scientific_acceptance_v2
+heads:
+- diffusion_unet
+- diffusion_transformer
+- flow_matching_unet
+- flow_matching_transformer
+variables:
+- pr
+- tasmax
+units:
+  pr: mm/day
+  tasmax: K
+training_seeds:
+- 101
+- 202
+- 303
+screening_seed: 101
+sampling:
+  minimum_members: 20
+  diagnostic_nested_member_counts:
+  - 10
+  - 20
+  - 50
+  seed_rule: sha256(experiment_seed,sample_date_id,member_index,stream_id)
+  physical_member_inverse_transform_before_mean: true
+  member_resampling: forbidden
+splits:
+  component_fit:
+    historical:
+    - 1961
+    - 1976
+    future:
+    - 2080
+    - 2095
+  component_validation:
+    historical:
+    - 1977
+    - 1980
+    future:
+    - 2096
+    - 2099
+  historical_development:
+  - 1981
+  - 2000
+  quarantined_midcentury: true
+  end_to_end_independence_verified: false
+  final_test_years: []
+  year_blocks: complete_calendar_years_on_authenticated_source_calendar
+  phase1_independence_required_for_component_validation: false
+  phase1_independence_required_for_end_to_end_acceptance: true
+aggregation:
+  spatial: equal_valid_gridpoint_weight
+  daily: pooled_valid_cell_day_count
+  climatology: temporal_mean_per_gridpoint_then_equal_valid_gridpoint_reduction
+  training_seeds: arithmetic_mean_of_per_seed_metrics_never_pool_members
+  regimes: equal_four_year_blocks_historical_and_future
+  finite_mask: identical_target_phase1_all_members_and_control_intersection
+  missing_candidate_values: reject_instead_of_shrinking_baseline_support
+  signed_bias: absolute_physical_units_only_never_percentage
+regions:
+  widths:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  required_prefixes:
+  - boundary
+  - interior
+  - north
+  - south
+  - east
+  - west
+  - northeast
+  - northwest
+  - southeast
+  - southwest
+  southeast_precipitation_box:
+    latitude_min: -90.0
+    latitude_max: -31.0
+    longitude_min: 29.0
+    longitude_max: 32.5
+  latitude_orientation: geographic_coordinate_order
+  boundary_definition: rectangular_valid_domain_coordinates_not_missing_data_holes
+  overlap: permitted_never_sum_region_scores
+near_zero_reference:
+  pr: 0.001
+  tasmax: 0.01
+  rule: (candidate-reference)/max(abs(reference),fixed_physical_scale)
+gates:
+  full_daily_rmse_relative_change_max: -0.02
+  full_mean_absolute_climatological_bias_relative_change_max: -0.05
+  full_daily_mae_relative_change_max: 0.01
+  regional_daily_rmse_relative_change_max: 0.01
+  regional_mean_absolute_climatological_bias_relative_change_max: 0.01
+  regime_daily_rmse_relative_change_max: 0.01
+  regime_mean_absolute_climatological_bias_relative_change_max: 0.01
+  full_crps_relative_change_max: 0.0
+  deterministic_control_crps_required_if_mean_component: true
+  minimum_spread_to_phase1_mae: 0.01
+  maximum_fraction_identical_members: 0.95
+  maximum_p99_absolute_error_relative_change: 0.01
+  maximum_observed_p99_event_rmse_relative_change: 0.01
+  edge_fallback_or_suppression: forbidden
+  noninferiority_bound: strict_upper_bound_inside_tolerance
+  superiority_bound: upper_bound_at_or_below_negative_target_and_strictly_below_zero
+  effective_sampled_correction_required: true
+bootstrap:
+  replicates: 1999
+  seed: 7301977
+  confidence: 0.95
+  temporal_unit: whole_calendar_year
+  regime_stratified: true
+  paired_across_products_heads_variables_and_seeds: true
+  training_seed_resampling: paired_hierarchical_with_replacement
+  spatial_fields: retained_intact
+  ensemble_sets: retained_intact_no_member_composition_resampling
+  family: all_four_heads_both_variables_all_registered_mandatory_gates
+  interval: centered_standardized_simultaneous_max_absolute_statistic
+  critical_quantile_method: higher
+  incomplete_family: INCONCLUSIVE_no_smaller_family_promotion
+  zero_bootstrap_standard_error: degenerate_conditional_interval_explicitly_reported
+  limitations: eight_year_blocks_and_three_training_seeds_limit_precision
+diagnostics:
+  configured_wet_day_threshold_mm_day: 0.01
+  wet_day_sensitivity_threshold_mm_day: 1.0
+  required:
+  - seasonal_metrics
+  - regime_metrics
+  - signed_bias
+  - climatological_rmse
+  - pattern_agreement
+  - wet_day_frequency_intensity
+  - wet_day_brier_reliability
+  - member_quantiles_extremes
+  - p99_error_and_observed_p99_event_rmse
+  - ensemble_spread_error
+  - finite_ensemble_interval_coverage
+  - member_spatial_dependence
+  - raw_negative_and_constraint_effects
+  - nested_10_20_50_member_sensitivity
+  - independently_trained_seed_results
+  coverage_interpretation: descriptive_finite_ensemble_order_statistics_not_population_nominal_coverage
+  postprocessed_member_bootstrap: forbidden_as_independent_raw_sampler_confidence
+selection:
+  data_scope: component_validation_only
+  production_acceptance_scope: independently_untouched_end_to_end
+  eligible_candidate: every_variable_and_mandatory_point_guardrail_passes
+  eligible_candidate_is_production_accepted: false
+  ranking: minimize_worst_normalized_gate_margin_then_mean_margin
+  joint_process_loss_selection: forbidden
+  save_last: true
+  best_candidate_name: best_scientific_candidate.ckpt
+  provisional_name: nearest_provisional_candidate.ckpt
+  missing_data_or_provenance_or_seeds: INCONCLUSIVE
+  do_not_modify_contract_after_candidate_inspection: true
+protocol_revision: 2
+protocol_amendment:
+  replaces_contract_sha256: a5747578cf4b7f2eaba89aa5501b5a25d18b9571614f136b5cf7368857772695
+  reason: 'Correct design errors before any candidate experiment: a learned nonunit
+    gate is legitimate if effective corrections and probabilistic added value pass;
+    southeast predicate is latitude <= -31 with no regional lower cutoff.'
+  candidate_results_inspected: false

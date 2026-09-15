@@ -26,7 +26,12 @@ from torch.distributed.fsdp import (
 from functools import partial
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
-from cordex_dataset import CordexDownscaleDataset
+try:
+    # Package import used by tests and library callers.
+    from .cordex_dataset import CordexDownscaleDataset
+except ImportError:  # pragma: no cover - notebook/script execution path
+    # Notebook workflows put examples/CORDEX_ML directly on ``sys.path``.
+    from cordex_dataset import CordexDownscaleDataset
 
 # Notebook workflows execute from examples/CORDEX_ML, so ensure local package
 # imports resolve to this repository instead of an older site-packages install.
@@ -984,11 +989,22 @@ class CordexWrappedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int):
         sample = self.base[idx]
         x = sample["x"]
+        provenance = {
+            key: value
+            for key, value in sample.items()
+            if key.startswith("__sample_") or key == "__target_valid_mask"
+        }
         if not getattr(self.base, "use_static", True):
-            return {"x": x, "y": sample["y"]}
+            return {"x": x, "y": sample["y"], **provenance}
         dynamic = x[:-1]
         static = x[-1:].clone()
-        return {"x": dynamic, "y": sample["y"], "static_x": static, "static_y": static}
+        return {
+            "x": dynamic,
+            "y": sample["y"],
+            "static_x": static,
+            "static_y": static,
+            **provenance,
+        }
 
 
 def build_dataloader(

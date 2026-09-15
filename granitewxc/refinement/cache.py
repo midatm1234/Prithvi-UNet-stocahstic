@@ -154,6 +154,7 @@ class Phase1ConditioningCache:
         *,
         timestamp: Any,
         deterministic_normalized: torch.Tensor | None = None,
+        deterministic_physical: torch.Tensor | None = None,
         features: Mapping[str, torch.Tensor] | None = None,
         masks: torch.Tensor | None = None,
         coordinates: Mapping[str, Any] | None = None,
@@ -173,6 +174,8 @@ class Phase1ConditioningCache:
                     "tensor was supplied."
                 )
             payload["deterministic_normalized"] = deterministic_normalized.detach().cpu()
+        if deterministic_physical is not None:
+            payload["deterministic_physical"] = deterministic_physical.detach().cpu()
         if masks is not None:
             payload["masks"] = masks.detach().cpu()
         features = features or {}
@@ -207,6 +210,8 @@ class Phase1ConditioningCache:
         """Attach cached tensors to a batch under the wrapper's private keys."""
         if "deterministic_normalized" in payload:
             batch["__phase1_normalized"] = payload["deterministic_normalized"]
+        if "deterministic_physical" in payload:
+            batch["__phase1_physical"] = payload["deterministic_physical"]
         if "feature_prithvi" in payload:
             batch["__phase1_feature_prithvi"] = payload["feature_prithvi"]
         if "feature_unet" in payload:
@@ -236,7 +241,7 @@ class Phase1ConditioningCache:
             if cached is None:
                 continue
             with torch.no_grad():
-                _, live, _ = model.run_phase1(batch)
+                live_physical, live, _ = model.run_phase1(batch)
             live = live.detach().cpu().float()
             cached = cached.float()
             if cached.shape != live.shape:
@@ -244,10 +249,29 @@ class Phase1ConditioningCache:
                     f"Cached Phase-1 output for {sample_id!r} has shape {tuple(cached.shape)} "
                     f"but the live pass produced {tuple(live.shape)}."
                 )
-            diff = (cached - live).abs()
-            denom = live.abs().clamp(min=1e-8)
-            max_abs = max(max_abs, float(diff.max()))
-            max_rel = max(max_rel, float((diff / denom).max()))
+            finite = torch.isfinite(live)
+            if not torch.equal(finite, torch.isfinite(cached)):
+                raise RuntimeError("Cached normalized Phase-1 output has an incompatible finite mask.")
+            diff = (cached[finite] - live[finite]).abs()
+            denom = live[finite].abs().clamp(min=1e-8)
+            if diff.numel():
+                max_abs = max(max_abs, float(diff.max()))
+                max_rel = max(max_rel, float((diff / denom).max()))
+            cached_physical = payload.get("deterministic_physical")
+            if cached_physical is None and bool(getattr(model.phase1, "precip_hurdle_enabled", False)):
+                raise RuntimeError("Hurdle precipitation cache is missing its exact physical Phase-1 field.")
+            if cached_physical is not None:
+                live_physical = live_physical.detach().cpu().float()
+                cached_physical = cached_physical.float()
+                if cached_physical.shape != live_physical.shape:
+                    raise RuntimeError("Cached physical Phase-1 output has an incompatible shape.")
+                finite = torch.isfinite(live_physical)
+                if not torch.equal(finite, torch.isfinite(cached_physical)):
+                    raise RuntimeError("Cached physical Phase-1 output has an incompatible finite mask.")
+                physical_diff = (cached_physical[finite] - live_physical[finite]).abs()
+                if physical_diff.numel():
+                    max_abs = max(max_abs, float(physical_diff.max()))
+                    max_rel = max(max_rel, float((physical_diff / live_physical[finite].abs().clamp(min=1e-8)).max()))
             checked += 1
 
         if checked and max_abs > tol:

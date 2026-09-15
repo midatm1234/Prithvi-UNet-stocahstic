@@ -45,6 +45,7 @@ __all__ = [
     "ConditioningConfig",
     "DiffusionConfig",
     "FlowMatchingConfig",
+    "ResidualNormalizationConfig",
     "TransformerConfig",
     "RefinementConfig",
     "PerformanceConfig",
@@ -95,8 +96,10 @@ _PREDICTION_TYPES = ("epsilon", "velocity", "sample")
 _SCHEDULES = ("cosine", "linear", "scaled_linear")
 _SOLVERS = ("euler", "heun", "midpoint")
 _SOURCE_DISTRIBUTIONS = ("gaussian",)
+_NONNEGATIVE_ENSEMBLE_STRATEGIES = ("memberwise", "mean_preserving")
 _POSITIONAL_ENCODINGS = ("learned_2d", "sincos_2d")
 _ATTENTION_IMPLEMENTATIONS = ("auto", "sdpa", "math")
+_RESIDUAL_NORMALIZATION_METHODS = ("standardize", "identity")
 _PRECISION_MODES = ("fp32", "bf16", "fp16")
 
 
@@ -197,6 +200,8 @@ class ConditioningConfig:
     unet_features: bool = False
     static_fields: bool = True
     masks: bool = True
+    # Explicit learned-conditioning change; retain raw legacy fields by default.
+    normalize_predictors: bool = False
 
     _KEYS = (
         "deterministic_output",
@@ -205,6 +210,7 @@ class ConditioningConfig:
         "unet_features",
         "static_fields",
         "masks",
+        "normalize_predictors",
     )
 
     @classmethod
@@ -217,7 +223,7 @@ class ConditioningConfig:
             for key in cls._KEYS
         }
         out = cls(**kwargs)
-        if not any(getattr(out, key) for key in cls._KEYS):
+        if not any(getattr(out, key) for key in cls._KEYS if key != "normalize_predictors"):
             raise ConfigValidationError(
                 "refinement.conditioning disables every input; the refiner would have "
                 "no conditioning at all. Enable at least one conditioning source."
@@ -238,7 +244,11 @@ class DiffusionConfig:
 
     training_timesteps: int = 1000
     inference_steps: int = 50
-    prediction_type: str = "epsilon"
+    # Direct clean-residual prediction is the schema-2 default. Epsilon
+    # prediction is mathematically supported, but small errors at the high-noise
+    # endpoint are divided by sqrt(alpha_bar) and produced the observed
+    # 15--20 mm/day white-noise failure before residual gating.
+    prediction_type: str = "sample"
     schedule: str = "cosine"
     beta_start: float = 1e-4
     beta_end: float = 0.02
@@ -299,9 +309,10 @@ class DiffusionConfig:
 class FlowMatchingConfig:
     """Conditional flow-matching settings for the ``flow_matching_*`` refiners.
 
-    ``t`` is the interpolation coordinate of the probability path, integrated
-    from 0 (source distribution) to 1 (residual distribution).  It is a purely
-    mathematical integration variable.
+    ``t`` is the interpolation coordinate of the regularized probability path,
+    integrated from 0 (source distribution) to 1 (residual distribution with
+    ``sigma_min`` endpoint regularization). It is a purely mathematical
+    integration variable.
     """
 
     integration_steps: int = 50
@@ -312,6 +323,9 @@ class FlowMatchingConfig:
     time_sampling: str = "uniform"
     logit_normal_mean: float = -0.5
     logit_normal_std: float = 1.2
+    # Optional deterministic zero-source trajectory supervision.  Keeping the
+    # default at zero preserves existing checkpoints and training objectives.
+    mean_path_loss_weight: float = 0.0
 
     _KEYS = (
         "integration_steps",
@@ -322,6 +336,7 @@ class FlowMatchingConfig:
         "time_sampling",
         "logit_normal_mean",
         "logit_normal_std",
+        "mean_path_loss_weight",
     )
 
     @classmethod
@@ -339,6 +354,90 @@ class FlowMatchingConfig:
             time_sampling=_as_choice(sec, "time_sampling", raw.get("time_sampling"), d.time_sampling, ("uniform", "logit_normal")),
             logit_normal_mean=_as_float(sec, "logit_normal_mean", raw.get("logit_normal_mean"), d.logit_normal_mean),
             logit_normal_std=_as_float(sec, "logit_normal_std", raw.get("logit_normal_std"), d.logit_normal_std, minimum=1e-6),
+            mean_path_loss_weight=_as_float(
+                sec,
+                "mean_path_loss_weight",
+                raw.get("mean_path_loss_weight"),
+                d.mean_path_loss_weight,
+                minimum=0.0,
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {key: getattr(self, key) for key in self._KEYS}
+
+
+@dataclass(frozen=True)
+class ResidualNormalizationConfig:
+    """Training-statistics normalization of physical Phase-2 residuals.
+
+    ``standardize`` is the scientifically safe default: per-channel mean and
+    standard deviation are fitted once on the training split with the frozen
+    Phase-1 checkpoint and persisted in the refinement checkpoint. Validation
+    and inference never recompute these statistics. ``identity`` exists only
+    as an explicit compatibility mode for legacy refinement checkpoints.
+    """
+
+    method: str = "standardize"
+    epsilon: float = 1e-6
+    minimum_scale: float = 1e-4
+    require_fitted: bool = True
+    # Opt-in, per-channel signed-log ("symlog") compression of the physical
+    # residual for predictands with a non-negativity constraint (precipitation),
+    # applied before standardization. ``sign(r) * log1p(|r| / scale)``, inverted
+    # exactly by ``sign(z) * expm1(|z|) * scale``. This is the transform used by
+    # Hafner et al., "Mastering Diverse Domains through World Models" (DreamerV3,
+    # arXiv:2301.04104) for heavy-tailed/large-dynamic-range regression targets
+    # (see danijar/dreamerv3, embodied/jax/nets.py: symlog/symexp), adapted here
+    # to residual precipitation corrections whose loss is otherwise dominated by
+    # a small fraction of extreme wet-cell errors. Temperature and any other
+    # channel without a non-negativity constraint are unaffected.
+    signed_log_nonnegative_channels: bool = False
+    signed_log_scale: float = 1.0
+
+    _KEYS = (
+        "method", "epsilon", "minimum_scale", "require_fitted",
+        "signed_log_nonnegative_channels", "signed_log_scale",
+    )
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "ResidualNormalizationConfig":
+        raw = _as_mapping(data)
+        _reject_unknown("refinement.residual_normalization", raw, cls._KEYS)
+        d = cls()
+        sec = "refinement.residual_normalization"
+        method = _as_choice(
+            sec, "method", raw.get("method"), d.method,
+            _RESIDUAL_NORMALIZATION_METHODS,
+        )
+        signed_log = _as_bool(
+            sec, "signed_log_nonnegative_channels",
+            raw.get("signed_log_nonnegative_channels"),
+            d.signed_log_nonnegative_channels,
+        )
+        if signed_log and method != "standardize":
+            raise ConfigValidationError(
+                "refinement.residual_normalization.signed_log_nonnegative_channels "
+                "requires method='standardize'; its transformed-residual "
+                "statistics have no defined meaning under method='identity'."
+            )
+        return cls(
+            method=method,
+            epsilon=_as_float(
+                sec, "epsilon", raw.get("epsilon"), d.epsilon, minimum=0.0
+            ),
+            minimum_scale=_as_float(
+                sec, "minimum_scale", raw.get("minimum_scale"),
+                d.minimum_scale, minimum=1e-12,
+            ),
+            require_fitted=_as_bool(
+                sec, "require_fitted", raw.get("require_fitted"), d.require_fitted
+            ),
+            signed_log_nonnegative_channels=signed_log,
+            signed_log_scale=_as_float(
+                sec, "signed_log_scale", raw.get("signed_log_scale"),
+                d.signed_log_scale, minimum=1e-6,
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -365,7 +464,9 @@ class TransformerConfig:
     max_tokens_lon: int = 256
     gradient_checkpointing: bool = False
     optimized_attention: str = "auto"
-    zero_init_output: bool = False
+    zero_init_output: bool = True
+    # Geometry is learned: coordinate-aligned resizing requires retraining.
+    spatial_alignment: str = "legacy"
 
     _KEYS = (
         "patch_size",
@@ -382,6 +483,7 @@ class TransformerConfig:
         "gradient_checkpointing",
         "optimized_attention",
         "zero_init_output",
+        "spatial_alignment",
     )
 
     @classmethod
@@ -436,6 +538,10 @@ class TransformerConfig:
             gradient_checkpointing=_as_bool(sec, "gradient_checkpointing", raw.get("gradient_checkpointing"), d.gradient_checkpointing),
             optimized_attention=_as_choice(sec, "optimized_attention", raw.get("optimized_attention"), d.optimized_attention, _ATTENTION_IMPLEMENTATIONS),
             zero_init_output=_as_bool(sec, "zero_init_output", raw.get("zero_init_output"), d.zero_init_output),
+            spatial_alignment=_as_choice(
+                sec, "spatial_alignment", raw.get("spatial_alignment"),
+                d.spatial_alignment, ("legacy", "coordinates"),
+            ),
         )
         if int(embedding_dim // num_heads) % 2 != 0:
             raise ConfigValidationError(
@@ -457,6 +563,8 @@ class TransformerConfig:
             "max_tokens_lon": self.max_tokens_lon,
             "gradient_checkpointing": self.gradient_checkpointing,
             "optimized_attention": self.optimized_attention,
+            "zero_init_output": self.zero_init_output,
+            "spatial_alignment": self.spatial_alignment,
         }
         return data
 
@@ -472,6 +580,8 @@ class UNetRefinerConfig:
     bottleneck_attention: bool = True
     attention_heads: int = 4
     zero_init_output: bool = True
+    # Geometry is learned: coordinate-aligned resizing requires retraining.
+    spatial_alignment: str = "legacy"
 
     _KEYS = (
         "hidden_channels",
@@ -481,6 +591,7 @@ class UNetRefinerConfig:
         "bottleneck_attention",
         "attention_heads",
         "zero_init_output",
+        "spatial_alignment",
     )
 
     @classmethod
@@ -497,6 +608,10 @@ class UNetRefinerConfig:
             bottleneck_attention=_as_bool(sec, "bottleneck_attention", raw.get("bottleneck_attention"), d.bottleneck_attention),
             attention_heads=_as_int(sec, "attention_heads", raw.get("attention_heads"), d.attention_heads),
             zero_init_output=_as_bool(sec, "zero_init_output", raw.get("zero_init_output"), d.zero_init_output),
+            spatial_alignment=_as_choice(
+                sec, "spatial_alignment", raw.get("spatial_alignment"),
+                d.spatial_alignment, ("legacy", "coordinates"),
+            ),
         )
         if out.time_embedding_dim % 2 != 0:
             raise ConfigValidationError(
@@ -527,8 +642,20 @@ class RefinementConfig:
     train_on_residual: bool = True
     ensemble_size: int = 1
     loss: str = "mse"
+    reconstruction_loss_weight: float = 0.25
+    multiscale_loss_weight: float = 0.10
+    gradient_loss_weight: float = 0.05
+    mean_bias_loss_weight: float = 0.01
+    # ``memberwise`` is the historical behaviour. ``mean_preserving`` removes
+    # the Jensen shift caused by independently clipping precipitation members,
+    # while retaining non-negative members and leaving unconstrained channels
+    # unchanged.
+    nonnegative_ensemble_strategy: str = "memberwise"
     seed: int | None = None
     conditioning: ConditioningConfig = field(default_factory=ConditioningConfig)
+    residual_normalization: ResidualNormalizationConfig = field(
+        default_factory=ResidualNormalizationConfig
+    )
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     flow_matching: FlowMatchingConfig = field(default_factory=FlowMatchingConfig)
     transformer: TransformerConfig = field(default_factory=TransformerConfig)
@@ -543,8 +670,14 @@ class RefinementConfig:
         "train_on_residual",
         "ensemble_size",
         "loss",
+        "reconstruction_loss_weight",
+        "multiscale_loss_weight",
+        "gradient_loss_weight",
+        "mean_bias_loss_weight",
+        "nonnegative_ensemble_strategy",
         "seed",
         "conditioning",
+        "residual_normalization",
         "diffusion",
         "flow_matching",
         "transformer",
@@ -578,8 +711,14 @@ class RefinementConfig:
             "train_on_residual": self.train_on_residual,
             "ensemble_size": self.ensemble_size,
             "loss": self.loss,
+            "reconstruction_loss_weight": self.reconstruction_loss_weight,
+            "multiscale_loss_weight": self.multiscale_loss_weight,
+            "gradient_loss_weight": self.gradient_loss_weight,
+            "mean_bias_loss_weight": self.mean_bias_loss_weight,
+            "nonnegative_ensemble_strategy": self.nonnegative_ensemble_strategy,
             "seed": self.seed,
             "conditioning": self.conditioning.to_dict(),
+            "residual_normalization": self.residual_normalization.to_dict(),
             "diffusion": self.diffusion.to_dict(),
             "flow_matching": self.flow_matching.to_dict(),
             "transformer": self.transformer.to_dict(),
@@ -891,15 +1030,20 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         )
     if joint:
         freeze_phase1 = False
+    if enabled and (joint or not freeze_phase1):
+        raise ConfigValidationError(
+            "Active Phase-2 residual refinement requires a frozen Phase-1 model; "
+            "refinement.joint_finetuning must be false. Joint fine-tuning changes "
+            "the base while residual targets and their "
+            "training statistics are being defined."
+        )
 
     train_on_residual = _as_bool("refinement", "train_on_residual", raw.get("train_on_residual"), True)
     if not train_on_residual and enabled:
-        warnings.warn(
-            "refinement.train_on_residual=false makes Phase 2 predict the full "
-            "normalized target instead of the residual. This is a scientific "
-            "change, not an optimization.",
-            RuntimeWarning,
-            stacklevel=2,
+        raise ConfigValidationError(
+            "refinement.train_on_residual=false violates the Phase-2 contract. "
+            "Every active refinement head must model ground_truth - frozen_phase1; "
+            "full-field generation cannot be reconstructed as a residual."
         )
 
     ensemble_size = _as_int("refinement", "ensemble_size", raw.get("ensemble_size"), 1)
@@ -915,8 +1059,34 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
         train_on_residual=train_on_residual,
         ensemble_size=ensemble_size,
         loss=_as_choice("refinement", "loss", raw.get("loss"), "mse", ("mse", "l1", "huber")),
+        reconstruction_loss_weight=_as_float(
+            "refinement", "reconstruction_loss_weight",
+            raw.get("reconstruction_loss_weight"), 0.25, minimum=0.0,
+        ),
+        multiscale_loss_weight=_as_float(
+            "refinement", "multiscale_loss_weight",
+            raw.get("multiscale_loss_weight"), 0.10, minimum=0.0,
+        ),
+        gradient_loss_weight=_as_float(
+            "refinement", "gradient_loss_weight",
+            raw.get("gradient_loss_weight"), 0.05, minimum=0.0,
+        ),
+        mean_bias_loss_weight=_as_float(
+            "refinement", "mean_bias_loss_weight",
+            raw.get("mean_bias_loss_weight"), 0.01, minimum=0.0,
+        ),
+        nonnegative_ensemble_strategy=_as_choice(
+            "refinement",
+            "nonnegative_ensemble_strategy",
+            raw.get("nonnegative_ensemble_strategy"),
+            "memberwise",
+            _NONNEGATIVE_ENSEMBLE_STRATEGIES,
+        ),
         seed=seed,
         conditioning=ConditioningConfig.from_mapping(raw.get("conditioning")),
+        residual_normalization=ResidualNormalizationConfig.from_mapping(
+            raw.get("residual_normalization")
+        ),
         diffusion=DiffusionConfig.from_mapping(raw.get("diffusion")),
         flow_matching=FlowMatchingConfig.from_mapping(raw.get("flow_matching")),
         transformer=TransformerConfig.from_mapping(raw.get("transformer")),

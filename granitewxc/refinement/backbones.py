@@ -48,6 +48,51 @@ __all__ = [
 ]
 
 
+def _resize_from_centers(
+    field: torch.Tensor,
+    centers_y: torch.Tensor,
+    centers_x: torch.Tensor,
+    output_size: tuple[int, int],
+) -> torch.Tensor:
+    """Interpolate at actual fine-grid coordinates, extending nearest borders.
+
+    Strided overlapping convolutions center token i at i*stride, whereas
+    ordinary resize assumes centers at (i+0.5)*stride-0.5.
+    Ceil-mode pooling also has a shortened trailing cell on odd domains.
+    Explicit center coordinates remove both implicit shifts without changing
+    the established nonperiodic nearest-border extension convention.
+    """
+    def fractional_index(centers: torch.Tensor, size: int) -> torch.Tensor:
+        positions = torch.arange(size, device=field.device, dtype=torch.float32)
+        centers = centers.to(device=field.device, dtype=torch.float32)
+        if centers.numel() == 1:
+            return torch.zeros_like(positions)
+        upper = torch.searchsorted(centers, positions).clamp(1, centers.numel() - 1)
+        lower = upper - 1
+        fraction = (positions - centers[lower]) / (centers[upper] - centers[lower])
+        return (lower + fraction).clamp(0, centers.numel() - 1)
+
+    height, width = output_size
+    y = fractional_index(centers_y, height)
+    x = fractional_index(centers_x, width)
+    y = 2.0 * (y + 0.5) / field.shape[-2] - 1.0
+    x = 2.0 * (x + 0.5) / field.shape[-1] - 1.0
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0).expand(field.shape[0], -1, -1, -1)
+    work = field.float() if field.dtype in {torch.float16, torch.bfloat16} else field
+    return F.grid_sample(
+        work, grid.to(work.dtype), mode="bilinear",
+        padding_mode="border", align_corners=False,
+    ).to(field.dtype)
+
+
+def _pooled_centers(size: int, device: torch.device) -> torch.Tensor:
+    centers = torch.arange((size + 1) // 2, device=device, dtype=torch.float32) * 2 + 0.5
+    if size % 2:
+        centers[-1] = size - 1
+    return centers
+
+
 def _num_groups(channels: int, max_groups: int = 8) -> int:
     for g in range(min(max_groups, channels), 0, -1):
         if channels % g == 0:
@@ -139,13 +184,16 @@ class ConditionalResidualUNet(nn.Module):
         dropout: dropout probability inside conv blocks.
         bottleneck_attention: enable spatial self-attention at the coarsest level.
         attention_heads: heads for the bottleneck attention.
-        zero_init_output: zero-initialise the output projection so the refiner is
-            the identity at construction (predicted residual == 0).
+        zero_init_output: zero-initialise the network's output projection.
+            A zero noise/velocity prediction does not imply zero sampled residual.
+        spatial_alignment: "legacy" preserves trained resize geometry;
+            "coordinates" interpolates using actual pooling-cell centers and
+            requires refinement retraining.
 
     The network is fully convolutional, so rectangular and non-power-of-two
-    grids work.  Feature maps are padded to an even size before each
-    downsampling step and cropped back on the way up, so the output height and
-    width always equal the input height and width exactly.
+    grids work. Ceil-mode pooling retains trailing cells; the coordinate
+    alignment option handles their shortened cells explicitly when upsampling.
+    Both conventions preserve the exact input height and width.
     """
 
     def __init__(
@@ -162,8 +210,12 @@ class ConditionalResidualUNet(nn.Module):
         attention_heads: int = 4,
         zero_init_output: bool = True,
         time_embedding_kind: str = "sinusoidal",
+        spatial_alignment: str = "legacy",
     ) -> None:
         super().__init__()
+        self.spatial_alignment = str(spatial_alignment).lower()
+        if self.spatial_alignment not in {"legacy", "coordinates"}:
+            raise ValueError(f"Unsupported spatial_alignment {spatial_alignment!r}")
         if num_levels < 1:
             raise ValueError(f"num_levels must be >= 1, got {num_levels}")
         self.in_channels = int(in_channels)
@@ -216,7 +268,13 @@ class ConditionalResidualUNet(nn.Module):
 
         for block in self.up_blocks:
             skip = skips.pop()
-            h = F.interpolate(h, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+            if self.spatial_alignment == "coordinates":
+                h = _resize_from_centers(
+                    h, _pooled_centers(skip.shape[-2], h.device),
+                    _pooled_centers(skip.shape[-1], h.device), skip.shape[-2:],
+                )
+            else:
+                h = F.interpolate(h, size=skip.shape[-2:], mode="bilinear", align_corners=False)
             h = block(torch.cat([h, skip], dim=1), t_emb)
 
         return self.out_proj(h)
@@ -352,6 +410,10 @@ class _DiTBlock(nn.Module):
 
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float, implementation: str) -> None:
         super().__init__()
+        # Re-inject spatial conditioning at every depth instead of relying on
+        # a single input concatenation that deep blocks can forget.
+        self.cond_norm = nn.LayerNorm(dim, eps=1e-6)
+        self.cond_proj = nn.Linear(dim, dim)
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.attn = _SpatialAttention(dim, num_heads, dropout, implementation)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -367,7 +429,18 @@ class _DiTBlock(nn.Module):
         nn.init.zeros_(self.ada_ln[1].weight)
         nn.init.zeros_(self.ada_ln[1].bias)
 
-    def forward(self, x: torch.Tensor, cond_emb: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond_emb: torch.Tensor,
+        spatial_cond: torch.Tensor,
+    ) -> torch.Tensor:
+        if spatial_cond.shape != x.shape:
+            raise ValueError(
+                "Spatial conditioning tokens must match the state-token shape; "
+                f"got {tuple(spatial_cond.shape)} and {tuple(x.shape)}."
+            )
+        x = x + self.cond_proj(self.cond_norm(spatial_cond))
         params = self.ada_ln(cond_emb.to(x.dtype)).chunk(6, dim=-1)
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = (p.unsqueeze(1) for p in params)
         h = self.norm1(x) * (1 + scale_a) + shift_a
@@ -379,20 +452,13 @@ class _DiTBlock(nn.Module):
 class SpatialResidualTransformer(nn.Module):
     """DiT-style Transformer refiner operating on 2-D spatial tokens only.
 
-    Pipeline for each sample::
-
-        conditioning + noisy residual  [B, C, H, W]
-          -> reflect-pad to a multiple of the patch size
-          -> patchify into (grid_h x grid_w) 2-D tokens
-          -> linear token projection + 2-D positional encoding
-          -> N x (spatial self-attention + MLP) with adaLN process-time conditioning
-          -> linear projection back to patch pixels
-          -> unpatchify
-          -> crop to the exact original (H, W)
-
-    Padding is applied symmetrically at the trailing edges and removed by an
-    exact crop, so the returned field has the original latitude/longitude
-    dimensions and token order is preserved throughout.
+    State and conditioning fields pass through separate convolutional stems and
+    overlapping patch embeddings.  Full-domain attention operates on the 2-D
+    token grid, with spatial conditioning re-injected at every block.  Tokens
+    are reshaped back to that grid, bilinearly resized, and decoded by local
+    convolutions with full-resolution stem skips.  Trailing-edge padding is
+    cropped exactly, preserving the original latitude/longitude orientation and
+    avoiding independent per-patch pixel reconstruction.
     """
 
     def __init__(
@@ -414,8 +480,12 @@ class SpatialResidualTransformer(nn.Module):
         optimized_attention: str = "auto",
         time_embedding_kind: str = "sinusoidal",
         zero_init_output: bool = True,
+        spatial_alignment: str = "legacy",
     ) -> None:
         super().__init__()
+        self.spatial_alignment = str(spatial_alignment).lower()
+        if self.spatial_alignment not in {"legacy", "coordinates"}:
+            raise ValueError(f"Unsupported spatial_alignment {spatial_alignment!r}")
         self.patch_h, self.patch_w = int(patch_size[0]), int(patch_size[1])
         if self.patch_h < 1 or self.patch_w < 1:
             raise ValueError(f"patch size must be positive, got {patch_size!r}")
@@ -428,9 +498,69 @@ class SpatialResidualTransformer(nn.Module):
         self.max_tokens_lat = int(max_tokens_lat)
         self.max_tokens_lon = int(max_tokens_lon)
 
-        token_in = (self.in_channels + self.cond_channels) * self.patch_h * self.patch_w
-        token_out = self.out_channels * self.patch_h * self.patch_w
-        self.token_proj = nn.Linear(token_in, self.embedding_dim)
+        # A local convolutional representation before global attention gives
+        # precipitation residuals a stable spatial inductive bias.  State and
+        # conditioning remain separate so conditioning can be injected at every
+        # Transformer depth.
+        self.stem_dim = max(32, self.embedding_dim // 4)
+        self.state_stem = nn.Sequential(
+            nn.Conv2d(
+                self.in_channels,
+                self.stem_dim,
+                3,
+                padding=1,
+                padding_mode="replicate",
+            ),
+            nn.SiLU(),
+            nn.Conv2d(
+                self.stem_dim,
+                self.stem_dim,
+                3,
+                padding=1,
+                padding_mode="replicate",
+            ),
+            nn.SiLU(),
+        )
+        self.condition_stem = nn.Sequential(
+            nn.Conv2d(
+                self.cond_channels,
+                self.stem_dim,
+                3,
+                padding=1,
+                padding_mode="replicate",
+            ),
+            nn.SiLU(),
+            nn.Conv2d(
+                self.stem_dim,
+                self.stem_dim,
+                3,
+                padding=1,
+                padding_mode="replicate",
+            ),
+            nn.SiLU(),
+        )
+
+        # kernel=(2*patch-1), stride=patch produces overlapping receptive
+        # fields while retaining exactly one token per padded patch cell.
+        overlap_kernel = (2 * self.patch_h - 1, 2 * self.patch_w - 1)
+        overlap_padding = (self.patch_h - 1, self.patch_w - 1)
+        patch_stride = (self.patch_h, self.patch_w)
+        self.state_patch_embed = nn.Conv2d(
+            self.stem_dim,
+            self.embedding_dim,
+            kernel_size=overlap_kernel,
+            stride=patch_stride,
+            padding=overlap_padding,
+            padding_mode="replicate",
+        )
+        self.condition_patch_embed = nn.Conv2d(
+            self.stem_dim,
+            self.embedding_dim,
+            kernel_size=overlap_kernel,
+            stride=patch_stride,
+            padding=overlap_padding,
+            padding_mode="replicate",
+        )
         self.time_embed = ProcessTimeEmbedding(self.embedding_dim, kind=time_embedding_kind)
 
         if self.positional_encoding == "learned_2d":
@@ -458,7 +588,35 @@ class SpatialResidualTransformer(nn.Module):
         self.final_ada_ln = nn.Sequential(nn.SiLU(), nn.Linear(self.embedding_dim, 2 * self.embedding_dim))
         nn.init.zeros_(self.final_ada_ln[1].weight)
         nn.init.zeros_(self.final_ada_ln[1].bias)
-        self.out_proj = nn.Linear(self.embedding_dim, token_out)
+        # Reshape tokens to their 2-D grid, use bilinear resize,
+        # and decode with local convolutions plus full-resolution stem skips.
+        # This replaces the former independent Linear output for every pixel
+        # position inside a non-overlapping patch.
+        self.decoder = nn.Sequential(
+            nn.Conv2d(
+                self.embedding_dim + 2 * self.stem_dim,
+                self.stem_dim,
+                3,
+                padding=1,
+                padding_mode="replicate",
+            ),
+            nn.SiLU(),
+            nn.Conv2d(
+                self.stem_dim,
+                self.stem_dim,
+                3,
+                padding=1,
+                padding_mode="replicate",
+            ),
+            nn.SiLU(),
+        )
+        self.out_proj = nn.Conv2d(
+            self.stem_dim,
+            self.out_channels,
+            3,
+            padding=1,
+            padding_mode="replicate",
+        )
         if zero_init_output:
             nn.init.zeros_(self.out_proj.weight)
             nn.init.zeros_(self.out_proj.bias)
@@ -490,37 +648,101 @@ class SpatialResidualTransformer(nn.Module):
 
     # -- forward ---------------------------------------------------------
     def forward(self, x: torch.Tensor, cond: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4 or cond.ndim != 4:
+            raise ValueError(
+                "SpatialResidualTransformer expects BCHW state and conditioning "
+                f"tensors, got {tuple(x.shape)} and {tuple(cond.shape)}."
+            )
+        if x.shape[0] != cond.shape[0]:
+            raise ValueError(
+                f"State batch {x.shape[0]} does not match conditioning batch {cond.shape[0]}."
+            )
+        if x.shape[1] != self.in_channels or cond.shape[1] != self.cond_channels:
+            raise ValueError(
+                "Transformer channel mismatch: expected "
+                f"state/conditioning ({self.in_channels}, {self.cond_channels}), got "
+                f"({x.shape[1]}, {cond.shape[1]})."
+            )
         if x.shape[-2:] != cond.shape[-2:]:
             raise ValueError(
                 f"Residual field {tuple(x.shape[-2:])} and conditioning "
                 f"{tuple(cond.shape[-2:])} must share the spatial grid."
             )
         b, _, h, w = x.shape
-        stacked = torch.cat([x, cond], dim=1)
+        if t.reshape(-1).numel() != b:
+            raise ValueError(
+                f"Process time must provide one value per sample ({b}), got {tuple(t.shape)}."
+            )
 
-        pad_h = (-h) % self.patch_h
-        pad_w = (-w) % self.patch_w
+        # The overlapping strided convolutions already produce ceil(H/p)
+        # tokens, each centered on a real cell. Coordinate mode needs no
+        # divisibility padding, so ghost cells never enter stems or attention.
+        pad_h = (-h) % self.patch_h if self.spatial_alignment == "legacy" else 0
+        pad_w = (-w) % self.patch_w if self.spatial_alignment == "legacy" else 0
         if pad_h or pad_w:
-            # Replicate padding avoids inventing boundary gradients; the padded
-            # rows/columns are cropped away exactly after unpatchify.
-            stacked = F.pad(stacked, (0, pad_w, 0, pad_h), mode="replicate")
+            # Preserve the learned legacy boundary convention exactly.
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+            cond = F.pad(cond, (0, pad_w, 0, pad_h), mode="replicate")
 
-        tokens, grid_h, grid_w = patchify_2d(stacked, self.patch_h, self.patch_w)
-        tokens = self.token_proj(tokens)
+        padded_h, padded_w = x.shape[-2:]
+        state_features = self.state_stem(x)
+        condition_features = self.condition_stem(cond)
+        state_grid = self.state_patch_embed(state_features)
+        condition_grid = self.condition_patch_embed(condition_features)
+        if state_grid.shape != condition_grid.shape:
+            raise RuntimeError(
+                "State and conditioning patch embeddings disagree: "
+                f"{tuple(state_grid.shape)} versus {tuple(condition_grid.shape)}."
+            )
+        grid_h, grid_w = state_grid.shape[-2:]
+        expected_grid = (
+            (padded_h + self.patch_h - 1) // self.patch_h,
+            (padded_w + self.patch_w - 1) // self.patch_w,
+        )
+        if (grid_h, grid_w) != expected_grid:
+            raise RuntimeError(
+                f"Overlapping patch embedding produced {(grid_h, grid_w)}, expected "
+                f"{expected_grid} for padded grid {(padded_h, padded_w)}."
+            )
+        tokens = state_grid.flatten(2).transpose(1, 2)
+        spatial_cond = condition_grid.flatten(2).transpose(1, 2)
+        tokens = tokens + spatial_cond
         tokens = tokens + self._positional(grid_h, grid_w, tokens.device, tokens.dtype).unsqueeze(0)
 
         cond_emb = self.time_embed(t).to(tokens.dtype)
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
-                tokens = checkpoint(block, tokens, cond_emb, use_reentrant=False)
+                tokens = checkpoint(
+                    block,
+                    tokens,
+                    cond_emb,
+                    spatial_cond,
+                    use_reentrant=False,
+                )
             else:
-                tokens = block(tokens, cond_emb)
+                tokens = block(tokens, cond_emb, spatial_cond)
 
         shift, scale = self.final_ada_ln(cond_emb).chunk(2, dim=-1)
         tokens = self.final_norm(tokens) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-        tokens = self.out_proj(tokens)
-
-        out = unpatchify_2d(tokens, self.out_channels, grid_h, grid_w, self.patch_h, self.patch_w)
+        token_grid = tokens.transpose(1, 2).reshape(
+            b, self.embedding_dim, grid_h, grid_w
+        )
+        if self.spatial_alignment == "coordinates":
+            decoded = _resize_from_centers(
+                token_grid,
+                torch.arange(grid_h, device=token_grid.device) * self.patch_h,
+                torch.arange(grid_w, device=token_grid.device) * self.patch_w,
+                (h, w),
+            )
+        else:
+            decoded = F.interpolate(
+                token_grid, size=(padded_h, padded_w),
+                mode="bilinear", align_corners=False,
+            )
+        decoded = self.decoder(
+            torch.cat([decoded, state_features, condition_features], dim=1)
+        )
+        out = self.out_proj(decoded)
         if pad_h or pad_w:
             out = out[..., :h, :w]
         if out.shape != (b, self.out_channels, h, w):

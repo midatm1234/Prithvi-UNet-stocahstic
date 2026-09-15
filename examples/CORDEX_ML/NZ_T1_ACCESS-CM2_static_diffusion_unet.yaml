@@ -10,16 +10,16 @@
 data:
   type: cordex
   training_predictor_paths:
-  - ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980_regridded.nc
+  - D:/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980.nc
   training_target_paths:
-  - ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc
+  - D:/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc
   validation_predictor_paths:
-  - ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980_regridded.nc
+  - D:/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/ACCESS-CM2_1961-1980.nc
   validation_target_paths:
-  - ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc
+  - D:/CORDEX/NZ_domain/train/ESD_pseudo_reality/target/pr_tasmax_ACCESS-CM2_1961-1980.nc
   test_predictor_paths: []
   test_target_paths: []
-  static_path: ./granite-geospatial-wxc-downscaling/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc
+  static_path: D:/CORDEX/NZ_domain/train/ESD_pseudo_reality/predictors/Static_fields.nc
   use_static: true
   input_vars:
   - u
@@ -121,7 +121,7 @@ model:
   encoder_shift: false
   unet: true
   phase1:
-    checkpoint: ./experiments/checkpoints/cordex_nz_t1_access_cm2_static/last.ckpt
+    checkpoint: ./examples/CORDEX_ML/experiments/checkpoints/cordex_nz_t1_access_cm2_static/last.ckpt
     freeze: true
     return_prithvi_features: false
     return_unet_features: false
@@ -141,13 +141,25 @@ model:
       masks: true
     ensemble_size: 10
     loss: mse
+    reconstruction_loss_weight: 0.25
+    multiscale_loss_weight: 0.10
+    gradient_loss_weight: 0.05
+    mean_bias_loss_weight: 0.01
+    residual_normalization:
+      method: standardize
+      epsilon: 1.0e-6
+      minimum_scale: 1.0e-4
+      require_fitted: true
     seed: 1234
     diffusion:
       training_timesteps: 1000
       inference_steps: 50
-      prediction_type: epsilon
+      prediction_type: sample
       schedule: cosine
+      cosine_s: 0.008
       eta: 0.0
+      clip_sample: false
+      clip_sample_range: 10.0
     unet:
       hidden_channels: 64
       num_levels: 3

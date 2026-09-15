@@ -54,6 +54,9 @@ def test_dimensions_units_and_coordinates_are_preserved():
     assert dataset.sizes["member"] == 4
     assert dataset["ppt"].attrs["units"] == "mm"
     assert dataset["tmax"].attrs["units"] == "degC"
+    assert dataset["ppt_residual"].attrs["units"] == "mm"
+    assert dataset["tmax_residual"].attrs["units"] == "degC"
+    assert "same physical units" in dataset["ppt_residual"].attrs["comment"]
     assert dataset.attrs["case_name"] == "unit_test"
     np.testing.assert_allclose(dataset["lat"].values, outputs["coords"]["lat"])
     np.testing.assert_allclose(dataset["lon"].values, outputs["coords"]["lon"])

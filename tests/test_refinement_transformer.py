@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from granitewxc.refinement import backbones, diffusion, flow_matching, two_phase
+from granitewxc.refinement.two_phase import _align_to
 from granitewxc.refinement.backbones import (
     SpatialResidualTransformer,
     patchify_2d,
@@ -304,6 +305,67 @@ def test_mismatched_conditioning_grid_raises():
     model = make_transformer()
     with pytest.raises(ValueError, match="share the spatial grid"):
         model(torch.randn(1, 2, 8, 8), torch.randn(1, 3, 8, 12), torch.zeros(1))
+
+
+def test_conditioning_alignment_honors_nonzero_output_crop():
+    ramp = torch.arange(12 * 14, dtype=torch.float32).reshape(1, 1, 12, 14)
+    aligned = _align_to(
+        ramp,
+        (5, 6),
+        output_crop=torch.tensor([[3, 4, 5, 6]]),
+        crop_reference_size=(12, 14),
+    )
+    assert torch.equal(aligned, ramp[..., 3:8, 4:10])
+
+
+def test_transformer_uses_overlapping_conv_embedding_and_conv_decoder():
+    model = make_transformer()
+    assert isinstance(model.state_patch_embed, torch.nn.Conv2d)
+    assert isinstance(model.condition_patch_embed, torch.nn.Conv2d)
+    assert isinstance(model.out_proj, torch.nn.Conv2d)
+    assert model.state_patch_embed.kernel_size[0] > model.state_patch_embed.stride[0]
+    assert model.state_patch_embed.kernel_size[1] > model.state_patch_embed.stride[1]
+    assert not any(isinstance(module, torch.nn.ConvTranspose2d) for module in model.modules())
+    assert all(hasattr(block, "cond_proj") for block in model.blocks)
+
+
+def test_zero_initialized_process_projection_is_exactly_zero():
+    model = SpatialResidualTransformer(
+        in_channels=2,
+        cond_channels=3,
+        out_channels=2,
+        patch_size=(4, 4),
+        embedding_dim=32,
+        num_heads=4,
+        num_blocks=2,
+        zero_init_output=True,
+    ).eval()
+    with torch.no_grad():
+        out = model(
+            torch.randn(2, 2, 13, 19),
+            torch.randn(2, 3, 13, 19),
+            torch.tensor([0.0, 500.0]),
+        )
+    assert torch.count_nonzero(out) == 0
+
+
+def test_conditioning_is_reinjected_and_changes_the_output():
+    torch.manual_seed(0)
+    model = activate_conditioning(make_transformer()).eval()
+    state = torch.randn(1, 2, 12, 16)
+    conditioning = torch.randn(1, 3, 12, 16)
+    with torch.no_grad():
+        original = model(state, conditioning, torch.zeros(1))
+        changed = model(state, conditioning + 3.0, torch.zeros(1))
+    assert not torch.allclose(original, changed)
+
+
+def test_transformer_rejects_layout_and_channel_mismatches():
+    model = make_transformer()
+    with pytest.raises(ValueError, match="BCHW"):
+        model(torch.randn(1, 2, 1, 8, 8), torch.randn(1, 3, 8, 8), torch.zeros(1))
+    with pytest.raises(ValueError, match="channel mismatch"):
+        model(torch.randn(1, 1, 8, 8), torch.randn(1, 3, 8, 8), torch.zeros(1))
 
 
 # ---------------------------------------------------------------------------

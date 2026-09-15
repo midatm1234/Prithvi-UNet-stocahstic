@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import warnings
+from pathlib import Path
 
 import pytest
+import yaml
 
 from granitewxc.refinement.config import (
     REFINEMENT_TYPES,
@@ -108,12 +109,11 @@ def test_joint_finetuning_conflicts_with_explicit_freeze():
         )
 
 
-def test_joint_finetuning_implies_unfrozen_phase1():
-    cfg = resolve_refinement_config(
-        {"refinement": {"type": "diffusion_unet", "joint_finetuning": True}}
-    )
-    assert cfg.joint_finetuning is True
-    assert cfg.freeze_phase1 is False
+def test_active_refinement_rejects_joint_finetuning():
+    with pytest.raises(ConfigValidationError, match="requires a frozen Phase-1"):
+        resolve_refinement_config(
+            {"refinement": {"type": "diffusion_unet", "joint_finetuning": True}}
+        )
 
 
 def test_all_conditioning_disabled_raises():
@@ -172,11 +172,87 @@ def test_no_lead_time_field_is_accepted_anywhere():
                 resolve_performance_config({"performance": {"lead_time_hours": 24}})
 
 
-def test_train_on_residual_false_warns():
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        cfg = resolve_refinement_config(
+def test_train_on_residual_false_is_rejected():
+    with pytest.raises(ConfigValidationError, match="ground_truth - frozen_phase1"):
+        resolve_refinement_config(
             {"refinement": {"type": "diffusion_unet", "train_on_residual": False}}
         )
-    assert cfg.train_on_residual is False
-    assert any("train_on_residual" in str(w.message) for w in caught)
+
+
+def test_transformer_is_zero_initialized_and_serializes_every_semantic_field():
+    cfg = resolve_refinement_config({"refinement": {"type": "diffusion_transformer"}})
+    assert cfg.transformer.zero_init_output is True
+    serialized = cfg.to_dict()
+    assert serialized["transformer"]["zero_init_output"] is True
+    restored = resolve_refinement_config({"refinement": serialized})
+    assert restored.to_dict() == serialized
+
+
+def test_diffusion_defaults_to_direct_clean_residual_prediction():
+    cfg = resolve_refinement_config(
+        {"refinement": {"type": "diffusion_transformer"}}
+    )
+    assert cfg.diffusion.prediction_type == "sample"
+
+
+def test_all_shipped_diffusion_recipes_lock_clean_residual_prediction():
+    root = Path(__file__).resolve().parents[1]
+    recipes = (
+        "examples/CORDEX_ML/NZ_T1_ACCESS-CM2_static_diffusion_unet.yaml",
+        "examples/CORDEX_ML/SA_T2_ACCESS-CM2_static_diffusion_unet.yaml",
+        "examples/CORDEX_ML/SA_T2_ACCESS-CM2_static_diffusion_transformer.yaml",
+        "examples/MERRA_PRISM/MERRA_PRISM_diffusion_unet.yaml",
+        "examples/NARR_PRISM/NARR_PRISM_diffusion_unet.yaml",
+        "examples/NARR_PRISM/NARR_PRISM_diffusion_transformer.yaml",
+    )
+    for relative in recipes:
+        path = root / relative
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        cfg = resolve_refinement_config(payload)
+        assert cfg.diffusion.prediction_type == "sample", path
+        assert cfg.diffusion.clip_sample is False, path
+
+
+def test_residual_normalization_defaults_to_training_statistics():
+    cfg = resolve_refinement_config({"refinement": {"type": "flow_matching_transformer"}})
+    assert cfg.residual_normalization.method == "standardize"
+    assert cfg.residual_normalization.require_fitted is True
+    assert cfg.reconstruction_loss_weight == pytest.approx(0.25)
+    assert cfg.multiscale_loss_weight == pytest.approx(0.10)
+    assert cfg.gradient_loss_weight == pytest.approx(0.05)
+    assert cfg.mean_bias_loss_weight == pytest.approx(0.01)
+    assert cfg.flow_matching.mean_path_loss_weight == 0.0
+    assert cfg.nonnegative_ensemble_strategy == "memberwise"
+
+
+def test_flow_mean_path_and_nonnegative_ensemble_strategy_round_trip():
+    cfg = resolve_refinement_config(
+        {
+            "refinement": {
+                "type": "flow_matching_unet",
+                "nonnegative_ensemble_strategy": "mean_preserving",
+                "flow_matching": {"mean_path_loss_weight": 0.25},
+            }
+        }
+    )
+    assert cfg.flow_matching.mean_path_loss_weight == pytest.approx(0.25)
+    assert cfg.nonnegative_ensemble_strategy == "mean_preserving"
+    restored = resolve_refinement_config({"refinement": cfg.to_dict()})
+    assert restored.to_dict() == cfg.to_dict()
+
+
+@pytest.mark.parametrize(
+    ("section", "value", "message"),
+    (
+        ("flow_matching", {"mean_path_loss_weight": -0.1}, "mean_path_loss_weight"),
+        ("refinement", {"nonnegative_ensemble_strategy": "truncate"}, "nonnegative_ensemble_strategy"),
+    ),
+)
+def test_invalid_flow_mean_path_and_ensemble_strategy_raise(section, value, message):
+    refinement = {"type": "flow_matching_unet"}
+    if section == "flow_matching":
+        refinement[section] = value
+    else:
+        refinement.update(value)
+    with pytest.raises(ConfigValidationError, match=message):
+        resolve_refinement_config({"refinement": refinement})

@@ -269,13 +269,25 @@ model:
       masks: true
     ensemble_size: 10
     loss: mse
+    reconstruction_loss_weight: 0.25
+    multiscale_loss_weight: 0.10
+    gradient_loss_weight: 0.05
+    mean_bias_loss_weight: 0.01
+    residual_normalization:
+      method: standardize
+      epsilon: 1.0e-6
+      minimum_scale: 1.0e-4
+      require_fitted: true
     seed: 1234
     diffusion:
       training_timesteps: 1000
       inference_steps: 50
-      prediction_type: epsilon
+      prediction_type: sample
       schedule: cosine
+      cosine_s: 0.008
       eta: 0.0
+      clip_sample: false
+      clip_sample_range: 10.0
     transformer:
       patch_size: 8
       embedding_dim: 256
@@ -288,6 +300,7 @@ model:
       max_tokens_lon: 256
       gradient_checkpointing: true
       optimized_attention: auto
+      zero_init_output: true
 job_id: NARR_PRISM_diffusion_transformer
 case_name: narr_prism_California
 type_training: full_dataset

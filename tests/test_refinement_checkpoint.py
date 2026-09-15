@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 
@@ -9,6 +11,7 @@ from granitewxc.refinement import build_two_phase_model
 from granitewxc.refinement.checkpoint import (
     CHECKPOINT_KIND_COMBINED,
     CHECKPOINT_KIND_REFINEMENT,
+    CHECKPOINT_SCHEMA_VERSION,
     build_refinement_checkpoint,
     load_phase1_state_dict,
     load_refinement_state_dict,
@@ -32,6 +35,12 @@ def legacy_checkpoint(phase1: TinyPhase1) -> dict:
         "loss": 2.6,
         "val_loss": 2.56,
     }
+
+
+def fit_residual_statistics(model, batch) -> None:
+    """Fit the production residual normalizer for a valid modern checkpoint."""
+    model.update_residual_statistics(batch)
+    model.finalize_residual_statistics()
 
 
 # ---------------------------------------------------------------------------
@@ -152,16 +161,33 @@ def test_shape_mismatch_is_never_silently_ignored():
 
 def test_refinement_checkpoint_excludes_phase1_weights():
     batch = make_batch()
-    model = build("diffusion_unet", batch)
+    model = build(
+        "diffusion_unet", batch,
+        residual_normalization={"method": "standardize"},
+    )
+    fit_residual_statistics(model, batch)
     payload = build_refinement_checkpoint(model, kind=CHECKPOINT_KIND_REFINEMENT)
     assert payload["checkpoint_kind"] == CHECKPOINT_KIND_REFINEMENT
-    assert all(k.startswith("refiner.") for k in payload["model"])
+    assert payload["checkpoint_schema_version"] == CHECKPOINT_SCHEMA_VERSION
+    assert payload["refinement_type"] == "diffusion_unet"
+    assert payload["refinement_contract"]["process"]["family"] == "diffusion"
+    assert (
+        payload["refinement_contract"]["residual_contract"]
+        == "physical_ground_truth_minus_phase1_v1"
+    )
+    assert payload["refinement_contract"]["residual_normalization"]["method"] == "standardize"
+    assert all(
+        k.startswith(("refiner.", "residual_normalizer."))
+        for k in payload["model"]
+    )
+    assert any(k.startswith("residual_normalizer.") for k in payload["model"])
     assert payload["model"], "the refinement checkpoint is empty"
 
 
 def test_combined_checkpoint_is_portable():
     batch = make_batch()
     model = build("flow_matching_unet", batch)
+    fit_residual_statistics(model, batch)
     payload = build_refinement_checkpoint(model, kind=CHECKPOINT_KIND_COMBINED)
     assert any(k.startswith("phase1.") for k in payload["model"])
     assert any(k.startswith("refiner.") for k in payload["model"])
@@ -172,13 +198,15 @@ def test_combined_checkpoint_is_portable():
 
 def test_loading_a_refinement_checkpoint_does_not_alter_phase1():
     batch = make_batch()
-    source = build("diffusion_transformer", batch)
+    normalization = {"residual_normalization": {"method": "standardize"}}
+    source = build("diffusion_transformer", batch, **normalization)
+    fit_residual_statistics(source, batch)
     with torch.no_grad():
         for p in source.refiner.parameters():
             p.add_(torch.randn_like(p) * 0.05)
     payload = build_refinement_checkpoint(source, kind=CHECKPOINT_KIND_REFINEMENT)
 
-    target = build("diffusion_transformer", batch)
+    target = build("diffusion_transformer", batch, **normalization)
     before = {k: v.clone() for k, v in target.state_dict().items() if k.startswith("phase1.")}
     report = load_refinement_state_dict(target, payload)
     assert report.missing == [] and report.unexpected == []
@@ -186,13 +214,213 @@ def test_loading_a_refinement_checkpoint_does_not_alter_phase1():
     for key, value in before.items():
         assert torch.equal(value, after[key])
     for key, value in source.state_dict().items():
-        if key.startswith("refiner."):
+        if key.startswith(("refiner.", "residual_normalizer.")):
             assert torch.equal(value, target.state_dict()[key])
+
+
+def test_unfitted_residual_statistics_cannot_be_checkpointed():
+    batch = make_batch()
+    model = build(
+        "diffusion_transformer", batch,
+        residual_normalization={"method": "standardize"},
+    )
+    with pytest.raises(RuntimeError, match="Residual-normalizer"):
+        build_refinement_checkpoint(model, kind=CHECKPOINT_KIND_REFINEMENT)
+
+
+def test_refinement_loader_rejects_cross_formulation_before_applying_weights():
+    batch = make_batch()
+    source = build("diffusion_transformer", batch)
+    fit_residual_statistics(source, batch)
+    payload = build_refinement_checkpoint(source)
+
+    target = build("flow_matching_transformer", batch)
+    before = {key: value.clone() for key, value in target.state_dict().items()}
+    with pytest.raises(RuntimeError, match="type mismatch"):
+        load_refinement_state_dict(target, payload)
+    for key, value in before.items():
+        assert torch.equal(value, target.state_dict()[key])
+
+
+def test_refinement_loader_rejects_same_shape_scientific_contract_mismatch():
+    batch = make_batch()
+    source = build("diffusion_transformer", batch)
+    fit_residual_statistics(source, batch)
+    payload = build_refinement_checkpoint(source)
+
+    target = build(
+        "diffusion_transformer",
+        batch,
+        diffusion={
+            "training_timesteps": 50,
+            "inference_steps": 3,
+            "prediction_type": "epsilon",
+        },
+    )
+    before = {key: value.clone() for key, value in target.state_dict().items()}
+    with pytest.raises(RuntimeError, match=r"contract mismatch.*prediction_type"):
+        load_refinement_state_dict(target, payload)
+    for key, value in before.items():
+        assert torch.equal(value, target.state_dict()[key])
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda payload: payload.pop("checkpoint_kind"), "checkpoint_kind"),
+        (lambda payload: payload.update(checkpoint_schema_version=999), "Unsupported.*schema"),
+        (lambda payload: payload.pop("refinement_type"), "does not record refinement_type"),
+    ],
+)
+def test_refinement_loader_requires_kind_schema_and_type(mutation, message):
+    batch = make_batch()
+    source = build("flow_matching_unet", batch)
+    fit_residual_statistics(source, batch)
+    payload = build_refinement_checkpoint(source)
+    mutation(payload)
+
+    target = build("flow_matching_unet", batch)
+    with pytest.raises(RuntimeError, match=message):
+        load_refinement_state_dict(target, payload)
+
+
+@pytest.mark.parametrize("failure", ["missing", "unexpected", "shape"])
+def test_refinement_loader_preserves_strict_key_and_shape_checks(failure):
+    batch = make_batch()
+    source = build("flow_matching_unet", batch)
+    payload = copy.deepcopy(build_refinement_checkpoint(source))
+    refiner_key = next(
+        key
+        for key, value in payload["model"].items()
+        if key.startswith("refiner.") and value.numel() > 1
+    )
+    if failure == "missing":
+        del payload["model"][refiner_key]
+        message = "missing key"
+    elif failure == "unexpected":
+        payload["model"]["refiner.unexpected"] = torch.zeros(1)
+        message = "unexpected key"
+    else:
+        payload["model"][refiner_key] = torch.zeros(999)
+        message = "shape mismatch"
+
+    target = build("flow_matching_unet", batch)
+    before = {key: value.clone() for key, value in target.state_dict().items()}
+    with pytest.raises(RuntimeError, match=message):
+        load_refinement_state_dict(target, payload)
+    for key, value in before.items():
+        assert torch.equal(value, target.state_dict()[key])
+
+
+def test_tampered_scientific_contract_is_rejected():
+    batch = make_batch()
+    source = build("diffusion_unet", batch)
+    fit_residual_statistics(source, batch)
+    payload = copy.deepcopy(build_refinement_checkpoint(source))
+    payload["refinement_contract"]["process"]["config"]["prediction_type"] = "x0"
+
+    target = build("diffusion_unet", batch)
+    with pytest.raises(RuntimeError, match="contract fingerprint mismatch"):
+        load_refinement_state_dict(target, payload)
+
+
+def test_default_flow_contract_remains_compatible_without_mean_path_key():
+    batch = make_batch()
+    source = build("flow_matching_unet", batch)
+    fit_residual_statistics(source, batch)
+    payload = build_refinement_checkpoint(source)
+    assert "mean_path_loss_weight" not in payload["refinement_contract"]["process"]["config"]
+
+    target = build("flow_matching_unet", batch)
+    report = load_refinement_state_dict(target, payload)
+    assert report.missing == []
+    assert report.unexpected == []
+
+
+@pytest.mark.parametrize(
+    "source_options",
+    (
+        {"flow_matching": {"integration_steps": 3, "mean_path_loss_weight": 0.25}},
+        {"nonnegative_ensemble_strategy": "mean_preserving"},
+    ),
+)
+def test_opt_in_flow_mean_and_constraint_contracts_must_match(source_options):
+    batch = make_batch()
+    source = build("flow_matching_unet", batch, **source_options)
+    fit_residual_statistics(source, batch)
+    payload = build_refinement_checkpoint(source)
+
+    target = build("flow_matching_unet", batch)
+    with pytest.raises(RuntimeError, match="contract mismatch"):
+        load_refinement_state_dict(target, payload)
+
+
+def test_tampered_residual_statistics_are_rejected():
+    batch = make_batch()
+    normalization = {"residual_normalization": {"method": "standardize"}}
+    source = build("flow_matching_transformer", batch, **normalization)
+    fit_residual_statistics(source, batch)
+    payload = copy.deepcopy(build_refinement_checkpoint(source))
+    payload["model"]["residual_normalizer.mean"].add_(1.0)
+
+    target = build("flow_matching_transformer", batch, **normalization)
+    with pytest.raises(RuntimeError, match="state fingerprint mismatch"):
+        load_refinement_state_dict(target, payload)
+
+
+def test_schema1_refinement_is_rejected_even_with_identity_normalization():
+    batch = make_batch()
+    legacy_options = {
+        "residual_normalization": {"method": "identity"},
+        "reconstruction_loss_weight": 0.0,
+    }
+    source = build("flow_matching_unet", batch, **legacy_options)
+    payload = build_refinement_checkpoint(source)
+    payload["checkpoint_schema_version"] = 1
+    payload["resolved_config"] = {"refinement": source.refinement_config.to_dict()}
+    payload.pop("refinement_contract")
+    payload.pop("refinement_contract_fingerprint")
+    payload.pop("residual_normalizer_state_keys")
+    payload.pop("residual_normalizer_state_fingerprint")
+
+    target = build("flow_matching_unet", batch, **legacy_options)
+    before = {key: value.clone() for key, value in target.state_dict().items()}
+    with pytest.raises(RuntimeError, match="Schema-1 Phase-2 weights must be retrained"):
+        load_refinement_state_dict(target, payload)
+    for key, value in before.items():
+        assert torch.equal(value, target.state_dict()[key])
+
+
+def test_phase1_loader_refuses_combined_checkpoint_without_changing_phase1():
+    batch = make_batch()
+    source = build("diffusion_unet", batch)
+    fit_residual_statistics(source, batch)
+    payload = build_refinement_checkpoint(source, kind=CHECKPOINT_KIND_COMBINED)
+
+    target = build("diffusion_unet", batch)
+    before = {
+        key: value.clone()
+        for key, value in target.state_dict().items()
+        if key.startswith("phase1.")
+    }
+    with pytest.raises(RuntimeError, match="Phase-1 loader requires"):
+        load_phase1_state_dict(target, payload)
+    for key, value in before.items():
+        assert torch.equal(value, target.state_dict()[key])
+
+
+def test_legacy_phase1_loader_refuses_embedded_refiner_keys():
+    checkpoint = legacy_checkpoint(TinyPhase1())
+    checkpoint["model"]["refiner.fake.weight"] = torch.ones(1)
+    target = build_two_phase_model(TinyPhase1(), {"refinement": {"type": "none"}})
+    with pytest.raises(RuntimeError, match="refuses checkpoint keys belonging to Phase 2"):
+        load_phase1_state_dict(target, checkpoint)
 
 
 def test_refinement_checkpoint_records_phase1_identity():
     batch = make_batch()
     model = build("diffusion_unet", batch)
+    fit_residual_statistics(model, batch)
     phase1_state = {
         k[len("phase1.") :]: v for k, v in model.state_dict().items() if k.startswith("phase1.")
     }
@@ -212,6 +440,75 @@ def test_missing_phase1_fingerprint_is_rejected():
         validate_phase1_reference({}, {}, strict=True)
 
 
+def test_fit_creates_one_shared_progress_bar_per_epoch(monkeypatch, tmp_path):
+    batch = make_batch(height=16, width=16)
+    model = build(
+        "diffusion_unet",
+        batch,
+        residual_normalization={"method": "standardize", "require_fitted": True},
+    )
+    assert not model.residual_statistics_ready
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in model.refiner.parameters() if parameter.requires_grad],
+        lr=1e-3,
+    )
+    trainer = RefinementTrainer(
+        model,
+        optimizer,
+        checkpoint_dir=str(tmp_path),
+        phase1_checkpoint="/reference/last.ckpt",
+        resolved_config={"refinement": {"type": "diffusion_unet"}},
+        case_name="progress_test",
+        seed=7,
+        log_every=1,
+        logger=lambda _message: None,
+    )
+    trainer.save = lambda **_kwargs: ""  # type: ignore[method-assign]
+
+    bars = []
+
+    class RecordingBar:
+        def __init__(self, **kwargs):
+            self.total = kwargs["total"]
+            self.n = 0
+            self.closed = 0
+            self.descriptions = [kwargs["desc"]]
+            bars.append(self)
+
+        def update(self, amount):
+            self.n += amount
+
+        def set_description_str(self, description):
+            self.descriptions.append(description)
+
+        def set_postfix(self, *_args, **_kwargs):
+            return None
+
+        def refresh(self):
+            return None
+
+        def close(self):
+            self.closed += 1
+
+    monkeypatch.setattr(
+        "granitewxc.refinement.training.tqdm",
+        lambda **kwargs: RecordingBar(**kwargs),
+    )
+
+    trainer.fit([batch], [batch], num_epochs=2, show_progress=True)
+
+    assert len(bars) == 2
+    # The otherwise-hidden residual-statistics pass is part of the first
+    # epoch's one bar; later epochs contain train + validation only.
+    assert [bar.total for bar in bars] == [3, 2]
+    assert [bar.n for bar in bars] == [3, 2]
+    assert [bar.closed for bar in bars] == [1, 1]
+    assert all(any("val" in description for description in bar.descriptions) for bar in bars)
+
+    trainer.fit([batch], [batch], num_epochs=1, show_progress=False)
+    assert len(bars) == 2
+
+
 # ---------------------------------------------------------------------------
 # Resume
 # ---------------------------------------------------------------------------
@@ -221,6 +518,7 @@ def test_missing_phase1_fingerprint_is_rejected():
 def test_save_and_resume_restores_full_training_state(refiner_type, tmp_path):
     batch = make_batch(height=16, width=16)
     model = build(refiner_type, batch)
+    fit_residual_statistics(model, batch)
     params = [p for p in model.refiner.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
@@ -285,6 +583,7 @@ def test_save_and_resume_restores_full_training_state(refiner_type, tmp_path):
 def test_resume_detects_a_different_phase1(tmp_path):
     batch = make_batch(height=16, width=16)
     model = build("diffusion_unet", batch)
+    fit_residual_statistics(model, batch)
     optimizer = torch.optim.AdamW(model.refiner.parameters(), lr=1e-3)
     trainer = RefinementTrainer(
         model, optimizer, checkpoint_dir=str(tmp_path), logger=lambda _m: None

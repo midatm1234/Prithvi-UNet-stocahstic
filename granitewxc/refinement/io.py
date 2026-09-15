@@ -5,7 +5,7 @@ coordinates, variable names, units, calendar, masks, fill values and attributes
 — and adds the Phase-2 products:
 
 * ``<var>``                deterministic Phase-1 prediction
-* ``<var>_residual``       predicted residual (normalized target space)
+* ``<var>_residual``       effective predicted residual in physical units
 * ``<var>_refined``        refined prediction (ensemble mean when N > 1)
 * ``<var>_members``        every ensemble member, with an explicit ``member`` dim
 * ``<var>_ensemble_mean``  ensemble mean
@@ -25,9 +25,6 @@ import numpy as np
 
 __all__ = ["build_refined_dataset", "write_refined_netcdf"]
 
-_RESIDUAL_UNITS = "1 (normalized target space)"
-
-
 def _as_numpy(value):
     if hasattr(value, "detach"):
         return value.detach().to("cpu").numpy()
@@ -42,6 +39,11 @@ def build_refined_dataset(
     refined=None,
     residual=None,
     members=None,
+    members_unbounded=None,
+    member_residuals=None,
+    member_residuals_physical=None,
+    sampling_states=None,
+    sampling_steps=None,
     ensemble_mean=None,
     ensemble_spread=None,
     truth=None,
@@ -58,15 +60,24 @@ def build_refined_dataset(
 
     * ``deterministic`` / ``refined`` / ``residual`` / ``ensemble_*`` / ``truth``:
       ``[time, variable, lat, lon]``
-    * ``members``: ``[time, member, variable, lat, lon]`` in draw order
+    * Member products: ``[time, member, variable, lat, lon]`` in draw order.
+    * ``sampling_states``: ``[time, step, member, variable, lat, lon]``;
+      ``sampling_steps`` identifies the actual saved integration/noise levels.
     """
     import xarray as xr
 
     variables = list(variables)
+    if not variables or len(variables) != len(set(variables)):
+        raise ValueError("variables must be nonempty and unique.")
     units = dict(units or {})
+    deterministic_shape = _as_numpy(deterministic).shape
+    if len(deterministic_shape) != 4:
+        raise ValueError("deterministic must have [time, variable, lat, lon] dimensions.")
 
     def _split(array, name_suffix: str, extra_attrs: Mapping[str, Any] | None = None):
         data = _as_numpy(array)
+        if data.ndim != 4 or data.shape != deterministic_shape:
+            raise ValueError(f"{name_suffix or 'field'} shape {data.shape} does not match deterministic {deterministic_shape}.")
         if data.shape[1] != len(variables):
             raise ValueError(
                 f"{name_suffix or 'field'} has {data.shape[1]} channels but "
@@ -93,11 +104,10 @@ def build_refined_dataset(
                 "_residual",
                 {
                     "long_name": "predicted Phase-2 residual",
-                    "units": _RESIDUAL_UNITS,
                     "comment": (
-                        "Residual is defined and added in the Phase-1 normalized "
-                        "target space; inverse normalization is applied once, "
-                        "afterwards."
+                        "Effective correction in the same physical units as the "
+                        "target variable. It equals refined minus deterministic "
+                        "after per-member physical reconstruction and constraints."
                     ),
                 },
             )
@@ -111,32 +121,66 @@ def build_refined_dataset(
             _split(
                 ensemble_spread,
                 "_ensemble_spread",
-                {"long_name": "ensemble standard deviation (unbiased)"},
+                {"long_name": "physical ensemble standard deviation (unbiased)"},
             )
         )
     if truth is not None:
         data_vars.update(_split(truth, "_truth", {"long_name": "ground truth"}))
 
-    if members is not None:
-        member_data = _as_numpy(members)
+    member_count = None
+    for product, array, representation in (
+        ("members", members, "physical prediction after constraints"),
+        ("members_unbounded", members_unbounded, "physical prediction before constraints"),
+        ("member_residuals", member_residuals, "normalized signed residual"),
+        ("member_residuals_physical", member_residuals_physical, "effective signed physical correction"),
+    ):
+        if array is None:
+            continue
+        member_data = _as_numpy(array)
         if member_data.ndim != 5:
-            raise ValueError(
-                f"members must be [time, member, variable, lat, lon], got shape {member_data.shape}"
-            )
+            raise ValueError(f"{product} must be [time, member, variable, lat, lon], got {member_data.shape}.")
+        if member_data.shape[2] != len(variables):
+            raise ValueError(f"{product} has {member_data.shape[2]} channels but {len(variables)} variables were declared.")
+        if (member_data.shape[0], *member_data.shape[2:]) != deterministic_shape:
+            raise ValueError(f"{product} shape does not match deterministic time/channel/spatial dimensions.")
+        if member_data.shape[1] < 1 or (member_count is not None and member_count != member_data.shape[1]):
+            raise ValueError("All member products must have the same nonempty member axis.")
+        member_count = member_data.shape[1]
         for index, name in enumerate(variables):
-            data_vars[f"{name}_members"] = xr.DataArray(
+            data_vars[f"{name}_{product}"] = xr.DataArray(
                 member_data[:, :, index],
                 dims=(time_dim, member_dim, lat_dim, lon_dim),
                 attrs={
-                    "units": units.get(name, ""),
-                    "long_name": "refined ensemble members in draw order",
+                    "units": "1" if product == "member_residuals" else units.get(name, ""),
+                    "long_name": f"{representation}; ensemble members in draw order",
+                    "representation": representation,
                 },
             )
 
+    if sampling_states is not None:
+        states = _as_numpy(sampling_states)
+        if states.ndim != 6 or (states.shape[0], *states.shape[3:]) != deterministic_shape:
+            raise ValueError("sampling_states must have [time, step, member, variable, lat, lon] dimensions matching deterministic.")
+        if member_count is not None and states.shape[2] != member_count:
+            raise ValueError("sampling_states member count differs from physical members.")
+        steps = np.asarray(sampling_steps)
+        if steps.ndim != 1 or steps.size != states.shape[1]:
+            raise ValueError("sampling_steps must identify each saved sampling state.")
+        coords = dict(coords)
+        coords["sampling_step"] = steps
+        member_count = states.shape[2]
+        for index, name in enumerate(variables):
+            data_vars[f"{name}_sampling_states"] = xr.DataArray(
+                states[:, :, :, index],
+                dims=(time_dim, "sampling_step", member_dim, lat_dim, lon_dim),
+                attrs={"units": "1", "representation": "stochastic state in normalized residual coordinates",
+                       "comment": "Intermediate states are not physical rainfall or temperature."},
+            )
+
     dataset = xr.Dataset(data_vars, coords=dict(coords))
-    if members is not None and member_dim not in dataset.coords:
+    if member_count is not None and member_dim not in dataset.coords:
         dataset = dataset.assign_coords(
-            {member_dim: np.arange(_as_numpy(members).shape[1], dtype="int32")}
+            {member_dim: np.arange(member_count, dtype="int32")}
         )
     dataset.attrs.update(dict(attrs or {}))
     dataset.attrs.setdefault(

@@ -271,13 +271,25 @@ model:
       masks: true
     ensemble_size: 10
     loss: mse
+    reconstruction_loss_weight: 0.25
+    multiscale_loss_weight: 0.10
+    gradient_loss_weight: 0.05
+    mean_bias_loss_weight: 0.01
+    residual_normalization:
+      method: standardize
+      epsilon: 1.0e-6
+      minimum_scale: 1.0e-4
+      require_fitted: true
     seed: 1234
     flow_matching:
       integration_steps: 50
       solver: euler
       source_distribution: gaussian
       stochastic_initialization: true
+      sigma_min: 1.0e-4
       time_sampling: logit_normal
+      logit_normal_mean: -0.5
+      logit_normal_std: 1.2
     transformer:
       patch_size: 8
       embedding_dim: 256
@@ -290,6 +302,7 @@ model:
       max_tokens_lon: 256
       gradient_checkpointing: true
       optimized_attention: auto
+      zero_init_output: true
 job_id: MERRA_PRISM
 case_name: merra_prism_California
 type_training: full_dataset

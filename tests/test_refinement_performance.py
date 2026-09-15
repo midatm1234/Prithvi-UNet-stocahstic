@@ -142,7 +142,10 @@ def test_inference_timesteps_are_descending_and_in_range():
     steps = schedule.inference_timesteps(50, torch.device("cpu"))
     assert steps.shape == (50,)
     assert bool((steps.diff() < 0).all())
-    assert int(steps.max()) < 1000 and int(steps.min()) >= 0
+    assert int(steps[0]) == 999
+    assert int(steps[-1]) == 0
+    assert int(torch.unique(steps).numel()) == 50
+    assert schedule.inference_timesteps(1, torch.device("cpu")).tolist() == [999]
     with pytest.raises(ValueError, match="exceeds"):
         schedule.inference_timesteps(2000, torch.device("cpu"))
 
@@ -242,7 +245,12 @@ def test_cache_entry_records_schema_version(tmp_path):
 
 def test_cached_conditioning_is_refused_when_phase1_is_trainable():
     batch = make_batch(height=16, width=16)
-    model = build("diffusion_unet", batch, joint_finetuning=True)
+    model = build("diffusion_unet", batch)
+    # Active configurations reject joint fine-tuning before construction. Keep
+    # this defense-in-depth test by simulating an accidental later unfreeze.
+    model.phase1_frozen = False
+    for parameter in model.phase1.parameters():
+        parameter.requires_grad_(True)
     batch = dict(batch)
     batch["__phase1_normalized"] = torch.zeros_like(batch["y"])
     with pytest.raises(RuntimeError, match="Phase 1 is trainable"):
@@ -276,3 +284,16 @@ def test_masked_loss_excludes_invalid_cells_from_the_denominator():
     assert float(masked_loss(prediction, target, None, "mse")) == pytest.approx(1.0)
     mask[0, 0, 1, 1] = True
     assert float(masked_loss(prediction, target, mask, "mse")) == pytest.approx(1.0)
+
+
+def test_masked_loss_balances_predictands_before_reduction():
+    from granitewxc.refinement.base import masked_loss
+
+    prediction = torch.zeros(1, 2, 2, 2)
+    target = torch.ones_like(prediction)
+    target[:, 0] = 2.0  # channel losses are 4 and 1
+    mask = torch.ones_like(prediction, dtype=torch.bool)
+    mask[:, 0] = False
+    mask[:, 0, 0, 0] = True  # unequal valid-cell counts must not change weights
+
+    assert float(masked_loss(prediction, target, mask, "mse")) == pytest.approx(2.5)

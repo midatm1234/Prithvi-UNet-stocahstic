@@ -56,8 +56,8 @@ For applications to CORDEX regional climate data, please refer to the [CORDEX ML
 
 ## Two-phase Prithvi-UNet with stochastic residual refinement
 
-The CORDEX_ML, MERRA_PRISM and NARR_PRISM workflows share an optional second
-phase that refines the deterministic Prithvi-UNet prediction with a stochastic
+The CORDEX_ML, MERRA_PRISM and NARR_PRISM configurations share an optional
+second-phase library contract that refines the deterministic Prithvi-UNet prediction with a stochastic
 *residual* model, selected through `model.refinement.type`:
 
 - `none` — deterministic Prithvi-UNet (default, unchanged behaviour)
@@ -66,11 +66,21 @@ phase that refines the deterministic Prithvi-UNet prediction with a stochastic
 - `diffusion_transformer` — spatial-token Transformer, DDPM / DDIM
 - `flow_matching_transformer` — spatial-token Transformer, rectified flow matching
 
-The residual is defined, predicted and added in the Phase-1 normalized target
-space; inverse normalization, precipitation constraints and masking are then
-applied exactly once. Existing YAML files without a `refinement` section keep
-running as deterministic Prithvi-UNet models, and existing deterministic
-checkpoints load unchanged (verified bitwise against the NARR_PRISM checkpoint).
+Every active head follows one physical residual contract:
+`residual = ground_truth - frozen_phase1`. Per-channel residual statistics are
+fitted on the training split, saved in the strict schema-2 Phase-2 checkpoint,
+and inverted exactly once before the physical correction is added to Phase 1.
+Each ensemble member is reconstructed in physical units before aggregation;
+precipitation constraints and prediction masking are applied only after that
+reconstruction.
+
+The Transformer heads retain full-domain spatial attention and now use
+convolutional stems, overlapping patch embeddings, conditioning at every block,
+and an artifact-free convolutional decoder. A zero-initialized output projection
+and learnable correction gate make initialization exactly reproduce Phase 1.
+Existing YAML files without a `refinement` section and deterministic
+checkpoints remain unchanged. Legacy schema-1 **Phase-2** checkpoints require
+retraining and are rejected rather than partially loaded.
 
 This is a spatial downscaling / bias-correction problem: predictors and targets
 always share the same timestamp, there is no forecast lead time, and Transformer
@@ -78,4 +88,4 @@ attention operates over two-dimensional spatial tokens only.
 
 See [docs/STOCHASTIC_REFINEMENT.md](docs/STOCHASTIC_REFINEMENT.md) for the full
 description, configuration schema, example YAMLs, commands, checkpoint
-compatibility notes and benchmarks.
+compatibility notes, domain-runner availability and benchmarks.

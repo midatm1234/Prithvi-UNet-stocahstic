@@ -68,8 +68,8 @@ data:
     targets_mean: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_mean.npy
     targets_std: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_std.npy
   train_random_crop_offset:
-  - 8
-  - 8
+  - 0
+  - 0
 predictands:
   pr:
     name: pr
@@ -164,13 +164,35 @@ model:
       masks: true
     ensemble_size: 10
     loss: mse
+    reconstruction_loss_weight: 0.25
+    multiscale_loss_weight: 0.10
+    gradient_loss_weight: 0.05
+    mean_bias_loss_weight: 0.01
+    residual_normalization:
+      method: standardize
+      epsilon: 1.0e-6
+      minimum_scale: 1.0e-4
+      require_fitted: true
+      # Signed-log ("symlog") compression of the precipitation residual before
+      # standardization: sign(r)*log1p(|r|/scale), exact inverse
+      # sign(z)*expm1(|z|)*scale. Precipitation residuals are heavy-tailed
+      # (a handful of extreme wet cells otherwise dominate the MSE/Huber
+      # process loss); this rebalances gradient signal toward the widespread
+      # modest boundary/southeastern-dry-bias corrections. tasmax (not a
+      # non-negative predictand) is bit-for-bit unaffected. New checkpoint
+      # schema; retrain rather than resume the *_schema2_fixed checkpoint.
+      signed_log_nonnegative_channels: true
+      signed_log_scale: 1.0
     seed: 1234
     diffusion:
       training_timesteps: 1000
       inference_steps: 50
-      prediction_type: epsilon
+      prediction_type: sample
       schedule: cosine
+      cosine_s: 0.008
       eta: 0.0
+      clip_sample: false
+      clip_sample_range: 10.0
     transformer:
       patch_size: 8
       embedding_dim: 256
@@ -183,6 +205,7 @@ model:
       max_tokens_lon: 128
       gradient_checkpointing: true
       optimized_attention: auto
+      zero_init_output: true
 job_id: SA_T2_ACCESS-CM2_static_diffusion_transformer
 type_training: full_dataset
 batch_size: 64
@@ -229,7 +252,7 @@ inference:
       boundary_width: 2
       strength: 0.1
       kernel_size: 3
-    force_full_frame: false
+    force_full_frame: true
     blend_window: hann
     blend_sigma: 0.35
     use_seam_deblocking: false
@@ -242,7 +265,7 @@ inference:
   - 32
   inference_blend_window: hann
   inference_blend_sigma: 0.35
-  force_full_frame: false
+  force_full_frame: true
   use_seam_deblocking: false
   seam_deblocking_strength: 0.1
 training:
@@ -252,7 +275,7 @@ training:
   gradient_accumulation_steps: 32
   auto_resume_if_checkpoint_exists: false
 gradient_accumulation_steps: 32
-resume_training: true
+resume_training: false
 resume_checkpoint_path: null
 precip_model: single_head
 precip_wet_threshold: 0.01
@@ -344,5 +367,5 @@ performance:
     atomic_checkpoints: true
     netcdf_compression: true
     netcdf_compression_level: 4
-checkpoint_dir: ./experiments/refinement_checkpoints/SA_T2_ACCESS-CM2_static/diffusion_transformer
-case_name: cordex_sa_t2_access_cm2_static_diffusion_transformer
+checkpoint_dir: ./runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/SA_T2_ACCESS-CM2_static_diffusion_transformer_schema2_signed_log_fixed
+case_name: cordex_sa_t2_access_cm2_static_diffusion_transformer_schema2_signed_log_fixed

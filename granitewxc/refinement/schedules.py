@@ -27,6 +27,11 @@ __all__ = [
 ]
 
 
+def _process_precision(value: torch.Tensor) -> torch.Tensor:
+    """Keep stochastic-process algebra out of fp16/bfloat16 rounding range."""
+    return value.float() if value.dtype in {torch.float16, torch.bfloat16} else value
+
+
 def sinusoidal_embedding(t: torch.Tensor, dim: int, max_period: float = 10_000.0) -> torch.Tensor:
     """Standard transformer sinusoidal embedding of a scalar process time.
 
@@ -111,6 +116,12 @@ class DiffusionSchedule(nn.Module):
         super().__init__()
         self.num_train_timesteps = int(num_train_timesteps)
         self.schedule = str(schedule).lower()
+        if self.num_train_timesteps < 1:
+            raise ValueError("num_train_timesteps must be positive")
+        if self.schedule in {"linear", "scaled_linear"} and not (
+            0.0 < float(beta_start) < float(beta_end) < 1.0
+        ):
+            raise ValueError("Linear schedules require 0 < beta_start < beta_end < 1")
 
         betas = self._build_betas(
             self.num_train_timesteps, self.schedule, beta_start, beta_end, cosine_s
@@ -148,6 +159,7 @@ class DiffusionSchedule(nn.Module):
         self, clean: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor
     ) -> torch.Tensor:
         """``q(x_t | x_0)``: ``sqrt(a_bar) * x_0 + sqrt(1 - a_bar) * eps``."""
+        clean, noise = _process_precision(clean), _process_precision(noise)
         shape = (-1,) + (1,) * (clean.ndim - 1)
         s_a = self.sqrt_alphas_cumprod.to(clean.device)[timesteps].reshape(shape).to(clean.dtype)
         s_1ma = (
@@ -161,6 +173,7 @@ class DiffusionSchedule(nn.Module):
         self, clean: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor
     ) -> torch.Tensor:
         """``v = sqrt(a_bar) * eps - sqrt(1 - a_bar) * x_0`` (Salimans & Ho)."""
+        clean, noise = _process_precision(clean), _process_precision(noise)
         shape = (-1,) + (1,) * (clean.ndim - 1)
         s_a = self.sqrt_alphas_cumprod.to(clean.device)[timesteps].reshape(shape).to(clean.dtype)
         s_1ma = (
@@ -194,6 +207,7 @@ class DiffusionSchedule(nn.Module):
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
         """Convert any supported network parameterisation to the clean ``x_0``."""
+        noisy, model_output = _process_precision(noisy), _process_precision(model_output)
         shape = (-1,) + (1,) * (noisy.ndim - 1)
         s_a = self.sqrt_alphas_cumprod.to(noisy.device)[timesteps].reshape(shape).to(noisy.dtype)
         s_1ma = (
@@ -216,6 +230,7 @@ class DiffusionSchedule(nn.Module):
         noisy: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
+        noisy, model_output = _process_precision(noisy), _process_precision(model_output)
         shape = (-1,) + (1,) * (noisy.ndim - 1)
         s_a = self.sqrt_alphas_cumprod.to(noisy.device)[timesteps].reshape(shape).to(noisy.dtype)
         s_1ma = (
@@ -232,7 +247,14 @@ class DiffusionSchedule(nn.Module):
         raise ValueError(f"Unsupported prediction_type {prediction_type!r}")
 
     def inference_timesteps(self, num_inference_steps: int, device: torch.device) -> torch.Tensor:
-        """Descending DDIM timestep grid, built once per sampling call."""
+        """Descending DDIM grid including both trained process endpoints.
+
+        Sampling starts from an isotropic Gaussian, so the first network call
+        must use the largest trained noise index.  The former stride-based grid
+        started a 50-step sampler at 980 for a 1,000-step schedule, creating a
+        process-index/source-state mismatch (and used clean index 0 for a
+        one-step sampler).
+        """
         num_inference_steps = int(num_inference_steps)
         if num_inference_steps < 1:
             raise ValueError("num_inference_steps must be >= 1")
@@ -241,6 +263,19 @@ class DiffusionSchedule(nn.Module):
                 f"num_inference_steps ({num_inference_steps}) exceeds "
                 f"num_train_timesteps ({self.num_train_timesteps})"
             )
-        stride = self.num_train_timesteps / num_inference_steps
-        steps = (torch.arange(num_inference_steps, dtype=torch.float64) * stride).round().long()
-        return steps.flip(0).to(device)
+        if num_inference_steps == 1:
+            # A one-step diagnostic still starts from the trained noise endpoint;
+            # ddim_reverse_step then maps it directly to x_0.
+            return torch.tensor(
+                [self.num_train_timesteps - 1], dtype=torch.long, device=device
+            )
+        steps = torch.linspace(
+            self.num_train_timesteps - 1,
+            0,
+            num_inference_steps,
+            dtype=torch.float64,
+            device=device,
+        ).round().long()
+        if not bool((steps.diff() < 0).all()):
+            raise RuntimeError("DDIM timestep construction produced duplicate indices")
+        return steps

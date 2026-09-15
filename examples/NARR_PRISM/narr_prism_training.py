@@ -197,10 +197,12 @@ class _WrappedDataset(torch.utils.data.Dataset):
         base: NarrPrismDataset,
         num_static_channels: int = 0,
         pad_multiple: int = 32,
+        include_sample_identity: bool = False,
     ) -> None:
         self.base = base
         self.num_static_channels = num_static_channels
         self.pad_multiple = pad_multiple
+        self.include_sample_identity = bool(include_sample_identity)
         self._static_y: Optional[torch.Tensor] = None
         if num_static_channels > 0 and base._elevation is not None:
             elev = torch.from_numpy(base._elevation.astype("float32"))
@@ -223,14 +225,17 @@ class _WrappedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.base[idx]
         x_full = sample["x"]  # (C_dyn [+ num_static], H_in, W_in)
-        tile_metadata = {
+        metadata_keys = [
+            "__scaler_offset",
+            "__input_scaler_offset",
+            "__output_scaler_offset",
+            "__output_crop",
+        ]
+        if self.include_sample_identity:
+            metadata_keys[:0] = ["date", "tile_index"]
+        sample_metadata = {
             key: sample[key]
-            for key in (
-                "__scaler_offset",
-                "__input_scaler_offset",
-                "__output_scaler_offset",
-                "__output_crop",
-            )
+            for key in metadata_keys
             if key in sample
         }
 
@@ -243,14 +248,14 @@ class _WrappedDataset(torch.utils.data.Dataset):
                 "static_x": self._pad_to_multiple(static_x),
                 "static_y": self._static_y,
             }
-            wrapped.update(tile_metadata)
+            wrapped.update(sample_metadata)
             return wrapped
 
         wrapped = {
             "x": self._pad_to_multiple(x_full),
             "y": sample["y"],
         }
-        wrapped.update(tile_metadata)
+        wrapped.update(sample_metadata)
         return wrapped
 
 
@@ -263,8 +268,13 @@ def _build_dataloader(
     distributed: bool,
     rank: int,
     world_size: int,
+    full_domain: bool = False,
 ) -> DataLoader:
-    base = NarrPrismDataset(config_path, mode=mode)
+    base = NarrPrismDataset(
+        config_path,
+        mode=mode,
+        full_domain=full_domain,
+    )
     num_static = int(getattr(getattr(config, "model", object()), "num_static_channels", 0))
     # Compute required padding multiple: mask_unit_size × patch_size
     mask_unit = getattr(config, "mask_unit_size", [16, 16])
@@ -272,7 +282,12 @@ def _build_dataloader(
     pad_multiple = (mask_unit[0] if isinstance(mask_unit, list) else mask_unit) * (
         patch_sz[0] if isinstance(patch_sz, list) else patch_sz
     )
-    dataset = _WrappedDataset(base, num_static_channels=num_static, pad_multiple=pad_multiple)
+    dataset = _WrappedDataset(
+        base,
+        num_static_channels=num_static,
+        pad_multiple=pad_multiple,
+        include_sample_identity=(mode == "inference"),
+    )
 
     sampler = None
     if distributed:
@@ -288,6 +303,28 @@ def _build_dataloader(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=False,
+    )
+
+
+def get_inference_dataloader(
+    config_path: str,
+    config: ExperimentConfig,
+) -> DataLoader:
+    """Return one canonical full-domain sample per ``dates.inference`` day.
+
+    This loader is intentionally separate from :func:`get_dataloaders`: the
+    latter retains tiled validation for checkpoint selection, whereas inference
+    must not reinterpret validation tiles as independent time records.
+    """
+    return _build_dataloader(
+        config_path,
+        config,
+        "inference",
+        shuffle=False,
+        distributed=False,
+        rank=0,
+        world_size=1,
+        full_domain=True,
     )
 
 

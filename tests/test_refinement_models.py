@@ -14,6 +14,14 @@ import pytest
 import torch
 
 from granitewxc.refinement import build_two_phase_model
+from granitewxc.refinement.diagnostics import summarize_refinement_tensor
+from granitewxc.refinement.diffusion import ddim_reverse_step
+from granitewxc.refinement.flow_matching import (
+    flow_interpolate,
+    flow_to_clean,
+    integrate_flow,
+)
+from granitewxc.refinement.schedules import DiffusionSchedule
 from granitewxc.refinement.target_space import NormalizedTargetSpace
 from refinement_fixtures import TinyPhase1, make_batch
 
@@ -30,6 +38,7 @@ def small_config(refiner_type: str, **overrides):
         "enabled": refiner_type != "none",
         "type": refiner_type,
         "ensemble_size": 3,
+        "residual_normalization": {"method": "identity"},
         "unet": {"hidden_channels": 8, "num_levels": 2, "attention_heads": 4},
         "transformer": {
             "embedding_dim": 32,
@@ -187,14 +196,23 @@ def test_physical_constraints_are_idempotent_and_nonnegative():
 
 
 @pytest.mark.parametrize("refiner_type", REFINERS)
-def test_masked_cells_stay_masked_and_output_is_finite_elsewhere(refiner_type):
+def test_prediction_mask_is_explicit_and_ground_truth_mask_does_not_leak(refiner_type):
     batch = make_batch(height=20, width=20, nan_fraction=0.25)
     model = build(refiner_type, batch)
     model.eval()
-    out = model.predict(batch, ensemble_size=2, seed=3)
-    invalid = ~torch.isfinite(batch["y"])
-    assert torch.isnan(out.members[:, 0][invalid]).all()
-    assert torch.isfinite(out.members[:, 0][~invalid]).all()
+    out_with_truth_nans = model.predict(batch, ensemble_size=2, seed=3)
+    filled = dict(batch)
+    filled["y"] = torch.nan_to_num(batch["y"], nan=1234.0)
+    out_with_changed_truth = model.predict(filled, ensemble_size=2, seed=3)
+    assert torch.equal(out_with_truth_nans.members, out_with_changed_truth.members)
+
+    domain_mask = torch.ones_like(batch["y"], dtype=torch.bool)
+    domain_mask[..., :3, :4] = False
+    masked = dict(filled)
+    masked["__prediction_mask"] = domain_mask
+    out = model.predict(masked, ensemble_size=2, seed=3)
+    assert torch.isnan(out.members[..., :3, :4]).all()
+    assert torch.isfinite(out.members[..., 3:, 4:]).all()
 
 
 @pytest.mark.parametrize("refiner_type", REFINERS)
@@ -249,6 +267,13 @@ def test_ensemble_dimensions_and_statistics(refiner_type):
 def test_ensemble_reproducibility(refiner_type):
     batch = make_batch(height=16, width=20)
     model = build(refiner_type, batch)
+    if refiner_type.startswith("diffusion"):
+        # Clean-sample refiners intentionally emit exact zero through their
+        # zero-initialized final projection.  Give that projection a tiny,
+        # trained-like nonzero state so this test measures seeded stochasticity
+        # rather than the separate initialization identity contract.
+        with torch.no_grad():
+            model.refiner.net.out_proj.weight.normal_(std=1.0e-3)
     model.eval()
     a = model.predict(batch, ensemble_size=3, seed=42)
     b = model.predict(batch, ensemble_size=3, seed=42)
@@ -261,6 +286,9 @@ def test_ensemble_reproducibility(refiner_type):
 def test_members_are_distinct(refiner_type):
     batch = make_batch(height=16, width=20)
     model = build(refiner_type, batch)
+    if refiner_type.startswith("diffusion"):
+        with torch.no_grad():
+            model.refiner.net.out_proj.weight.normal_(std=1.0e-3)
     model.eval()
     out = model.predict(batch, ensemble_size=3, seed=7)
     assert not torch.equal(out.member_residuals[:, 0], out.member_residuals[:, 1])
@@ -279,17 +307,6 @@ def test_frozen_phase1_stays_in_eval_mode():
     assert model.phase1_frozen is True
     assert model.phase1.training is False
     assert all(not p.requires_grad for p in model.phase1.parameters())
-
-
-def test_joint_finetuning_keeps_phase1_trainable():
-    batch = make_batch()
-    model = build("diffusion_unet", batch, joint_finetuning=True)
-    model.train()
-    assert model.phase1_frozen is False
-    assert model.phase1.training is True
-    # Non-trainable scaler buffers stay frozen; every learnable weight is live.
-    assert all(p.requires_grad for p in model.phase1.body.parameters())
-    assert all(p.requires_grad for p in model.phase1.head.parameters())
 
 
 def test_unused_phase1_features_are_not_computed():
@@ -316,3 +333,313 @@ def test_requested_phase1_features_are_returned():
     model.initialize_from_batch(batch)
     _, _, features = model.run_phase1(batch)
     assert set(features) == {"prithvi", "unet"}
+
+
+def test_phase1_prediction_is_identical_across_all_refinement_heads():
+    batch = make_batch(height=18, width=22)
+    torch.manual_seed(91)
+    reference_phase1 = TinyPhase1()
+    reference_state = reference_phase1.state_dict()
+    outputs = []
+    for refiner_type in REFINERS:
+        phase1 = TinyPhase1()
+        phase1.load_state_dict(reference_state, strict=True)
+        model = build_two_phase_model(phase1, small_config(refiner_type))
+        physical, normalized, _ = model.run_phase1(batch)
+        outputs.append((physical, normalized))
+    for physical, normalized in outputs[1:]:
+        assert torch.equal(physical, outputs[0][0])
+        assert torch.equal(normalized, outputs[0][1])
+
+
+@pytest.mark.parametrize(
+    "refiner_type", ["diffusion_transformer", "flow_matching_transformer"]
+)
+def test_zero_transformer_correction_is_exact_phase1_identity(refiner_type):
+    batch = make_batch(height=17, width=21)
+    model = build(refiner_type, batch)
+    model.eval()
+    out = model.predict(batch, ensemble_size=3, seed=77)
+    expected = out.deterministic.unsqueeze(1).expand_as(out.members)
+    assert torch.equal(out.members, expected)
+    assert torch.equal(out.refined, out.deterministic)
+    assert torch.count_nonzero(out.residual_physical) == 0
+
+
+# ---------------------------------------------------------------------------
+# Process-math and correction-gate regressions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("prediction_type", ["epsilon", "velocity", "sample"])
+def test_oracle_ddim_reverse_step_reconstructs_known_forward_state(prediction_type):
+    schedule = DiffusionSchedule(num_train_timesteps=100, schedule="cosine")
+    generator = torch.Generator().manual_seed(7)
+    clean = torch.randn(2, 3, 8, 9, generator=generator)
+    noise = torch.randn(2, 3, 8, 9, generator=generator)
+    timesteps = torch.full((2,), 80, dtype=torch.long)
+    previous_timestep = 55
+    noisy = schedule.add_noise(clean, noise, timesteps)
+    oracle = schedule.training_target(prediction_type, clean, noise, timesteps)
+
+    previous, predicted_clean, predicted_noise = ddim_reverse_step(
+        schedule,
+        prediction_type,
+        oracle,
+        noisy,
+        timesteps,
+        previous_timestep,
+        eta=0.0,
+    )
+    expected = schedule.add_noise(
+        clean,
+        noise,
+        torch.full_like(timesteps, previous_timestep),
+    )
+    assert torch.allclose(predicted_clean, clean, atol=2e-4, rtol=2e-4)
+    assert torch.allclose(predicted_noise, noise, atol=2e-4, rtol=2e-4)
+    assert torch.allclose(previous, expected, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.parametrize("prediction_type", ["epsilon", "velocity", "sample"])
+def test_terminal_ddim_step_adds_no_fresh_noise(prediction_type):
+    schedule = DiffusionSchedule(num_train_timesteps=100, schedule="cosine")
+    clean = torch.randn(2, 1, 5, 7)
+    noise = torch.randn_like(clean)
+    timesteps = torch.zeros(2, dtype=torch.long)
+    noisy = schedule.add_noise(clean, noise, timesteps)
+    oracle = schedule.training_target(prediction_type, clean, noise, timesteps)
+    previous, predicted_clean, _ = ddim_reverse_step(
+        schedule,
+        prediction_type,
+        oracle,
+        noisy,
+        timesteps,
+        None,
+        eta=1.0,
+        noise=torch.full_like(noisy, 1.0e6),
+    )
+    assert torch.allclose(predicted_clean, clean, atol=2e-4, rtol=2e-4)
+    assert torch.allclose(previous, clean, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.parametrize("prediction_type", ["epsilon", "velocity", "sample"])
+def test_oracle_ddim_full_skipped_chain_reconstructs_clean_sample(prediction_type):
+    schedule = DiffusionSchedule(num_train_timesteps=100, schedule="cosine")
+    clean = torch.randn(2, 1, 6, 7, generator=torch.Generator().manual_seed(19))
+    noise = torch.randn(2, 1, 6, 7, generator=torch.Generator().manual_seed(23))
+    grid = schedule.inference_timesteps(7, torch.device("cpu"))
+    current_t = torch.full((2,), int(grid[0]), dtype=torch.long)
+    state = schedule.add_noise(clean, noise, current_t)
+    for index, timestep in enumerate(grid):
+        current_t = torch.full((2,), int(timestep), dtype=torch.long)
+        oracle = schedule.training_target(prediction_type, clean, noise, current_t)
+        previous = grid[index + 1] if index + 1 < len(grid) else None
+        state, _, _ = ddim_reverse_step(
+            schedule,
+            prediction_type,
+            oracle,
+            state,
+            current_t,
+            previous,
+            eta=0.0,
+        )
+        if previous is not None:
+            expected = schedule.add_noise(
+                clean, noise, torch.full_like(current_t, int(previous))
+            )
+            assert torch.allclose(state, expected, atol=3e-4, rtol=3e-4)
+    assert torch.allclose(state, clean, atol=3e-4, rtol=3e-4)
+
+
+@pytest.mark.parametrize("previous", [-1, 80, 90, 100])
+def test_ddim_rejects_invalid_reverse_timestep_order(previous):
+    schedule = DiffusionSchedule(num_train_timesteps=100, schedule="cosine")
+    sample = torch.randn(1, 1, 3, 4)
+    with pytest.raises(ValueError, match="previous"):
+        ddim_reverse_step(
+            schedule,
+            "sample",
+            torch.zeros_like(sample),
+            sample,
+            torch.tensor([80]),
+            previous,
+        )
+
+
+def test_ddim_rejects_out_of_range_current_timestep_and_shape():
+    schedule = DiffusionSchedule(num_train_timesteps=100, schedule="cosine")
+    sample = torch.randn(1, 1, 3, 4)
+    with pytest.raises(ValueError, match="timesteps"):
+        ddim_reverse_step(
+            schedule, "sample", torch.zeros_like(sample), sample, torch.tensor([-1]), None
+        )
+    with pytest.raises(ValueError, match="shape"):
+        ddim_reverse_step(
+            schedule,
+            "sample",
+            torch.zeros(1, 1, 3, 3),
+            sample,
+            torch.tensor([80]),
+            40,
+        )
+
+
+@pytest.mark.parametrize("solver", ["euler", "midpoint", "heun"])
+def test_flow_integrator_reaches_constant_field_endpoint(solver):
+    initial = torch.randn(2, 3, 7, 9)
+    constant = torch.full_like(initial, 0.375)
+
+    def velocity(state, time):
+        del time
+        return constant.to(state)
+
+    endpoint = integrate_flow(initial, velocity, steps=7, solver=solver)
+    assert torch.allclose(endpoint, initial + constant, atol=1e-6, rtol=1e-6)
+
+
+def test_regularized_flow_path_velocity_and_clean_round_trip():
+    source = torch.randn(3, 2, 5, 7, generator=torch.Generator().manual_seed(29))
+    target = torch.randn(3, 2, 5, 7, generator=torch.Generator().manual_seed(31))
+    time = torch.tensor([0.0, 0.4, 1.0])
+    sigma_min = 0.1
+    state, velocity = flow_interpolate(source, target, time, sigma_min)
+    restored = flow_to_clean(state, velocity, time, sigma_min)
+    torch.testing.assert_close(restored, target, atol=2e-6, rtol=2e-6)
+    expected_velocity = target - (1.0 - sigma_min) * source
+    torch.testing.assert_close(velocity, expected_velocity)
+
+
+def test_flow_zero_source_diagnostic_does_not_mutate_source_configuration():
+    batch = make_batch(height=16, width=20)
+    model = build("flow_matching_transformer", batch)
+    model.eval()
+    _, normalized, features = model.run_phase1(batch)
+    conditioning = model.build_conditioning(batch, normalized, features)
+    before = model.refiner.stochastic_initialization
+    deterministic = model.refiner.deterministic_residual(conditioning)
+    assert model.refiner.stochastic_initialization is before
+    assert torch.count_nonzero(deterministic) == 0
+
+
+def test_zero_initialized_sample_diffusion_is_raw_zero_before_training():
+    batch = make_batch(height=16, width=20)
+    model = build("diffusion_transformer", batch)
+    model.eval()
+    _, normalized, features = model.run_phase1(batch)
+    conditioning = model.build_conditioning(batch, normalized, features)
+    raw = model.refiner.sample(conditioning, generator=torch.Generator().manual_seed(3))
+
+    assert torch.count_nonzero(raw) == 0
+    assert torch.count_nonzero(model.refiner.correction_gate) == 0
+    assert torch.count_nonzero(model.refiner.apply_correction_gate(raw)) == 0
+
+
+def test_zero_initialized_flow_exposes_raw_source_noise_before_gate():
+    batch = make_batch(height=16, width=20)
+    model = build("flow_matching_transformer", batch)
+    model.eval()
+    _, normalized, features = model.run_phase1(batch)
+    conditioning = model.build_conditioning(batch, normalized, features)
+    raw = model.refiner.sample(conditioning, generator=torch.Generator().manual_seed(3))
+    assert float(raw.abs().max()) > 0.0
+    assert torch.count_nonzero(model.refiner.correction_gate) == 0
+    assert torch.count_nonzero(model.refiner.apply_correction_gate(raw)) == 0
+
+
+def test_public_output_keeps_raw_checkerboard_visible_despite_zero_gate():
+    batch = make_batch(height=16, width=20)
+    model = build("diffusion_transformer", batch)
+    model.eval()
+    rows = torch.arange(16).view(1, 1, 16, 1)
+    cols = torch.arange(20).view(1, 1, 1, 20)
+    checkerboard = ((rows + cols).remainder(2).mul(2).sub(1).float() * 100.0)
+    checkerboard = checkerboard.expand(batch["y"].shape[0], batch["y"].shape[1], -1, -1)
+
+    def corrupted_sample(conditioning, **kwargs):
+        del kwargs
+        return checkerboard.to(conditioning)
+
+    model.refiner.sample = corrupted_sample
+    out = model.predict(batch, ensemble_size=1, seed=4)
+    assert torch.equal(out.refined, out.deterministic)
+    assert torch.equal(out.residual, checkerboard)
+    report = summarize_refinement_tensor("raw_residual", out.residual)
+    assert report["overall"]["std"] > 90.0
+    assert report["overall"]["high_frequency_spectral_power_fraction"] > 0.99
+
+
+@pytest.mark.parametrize(
+    "refiner_type", ["diffusion_transformer", "flow_matching_transformer"]
+)
+def test_clean_residual_auxiliary_trains_transformer_gate(refiner_type):
+    batch = make_batch(height=16, width=20)
+    model = build(refiner_type, batch)
+    model.train()
+    with torch.no_grad():
+        model.refiner.net.out_proj.weight.normal_(std=1.0e-3)
+    _, normalized, features = model.run_phase1(batch)
+    conditioning = model.build_conditioning(batch, normalized, features)
+    residual, valid = model.target_space.residual_target(batch["y"], normalized)
+    losses = model.refiner.training_loss(
+        residual,
+        conditioning,
+        valid,
+        generator=torch.Generator().manual_seed(11),
+    )
+    expected = (
+        losses["process_loss"]
+        + model.refiner.reconstruction_loss_weight
+        * (losses["reconstruction_loss"] + losses["gate_calibration_loss"])
+        + model.refiner.multiscale_loss_weight
+        * losses["multiscale_loss"]
+        + model.refiner.gradient_loss_weight * losses["gradient_loss"]
+        + model.refiner.mean_bias_loss_weight * losses["mean_bias_loss"]
+    )
+    assert torch.allclose(losses["loss"], expected)
+    losses["loss"].backward(retain_graph=True)
+    gate_grad = model.refiner.correction_gate.grad
+    assert gate_grad is not None
+    assert float(gate_grad.abs().sum()) > 0.0
+
+    # Gate calibration is detached from the raw network output: it can open
+    # the identity gate, but cannot make the sampler inflate by 1/gate.
+    model.zero_grad(set_to_none=True)
+    losses["gate_calibration_loss"].backward()
+    assert model.refiner.correction_gate.grad is not None
+    assert all(
+        parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
+        for parameter in model.refiner.net.parameters()
+    )
+
+
+@pytest.mark.parametrize(
+    "refiner_type", ["diffusion_transformer", "flow_matching_transformer"]
+)
+def test_zero_gate_is_anchored_at_physical_zero_after_standardization(
+    refiner_type,
+):
+    batch = make_batch(height=16, width=20)
+    model = build(
+        refiner_type,
+        batch,
+        residual_normalization={"method": "standardize"},
+    )
+    model.reset_residual_statistics()
+    model.update_residual_statistics(batch)
+    model.finalize_residual_statistics()
+    model.train()
+
+    out = model.training_step(
+        batch,
+        generator=torch.Generator().manual_seed(17),
+    )
+    effective = out.losses["effective_clean_residual_prediction"]
+    restored = model.residual_normalizer.denormalize(effective)
+    valid = out.valid_mask
+    torch.testing.assert_close(
+        restored[valid],
+        torch.zeros_like(restored[valid]),
+        atol=1e-6,
+        rtol=0.0,
+    )

@@ -35,11 +35,13 @@ Examples::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +51,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from granitewxc.refinement import TwoPhaseDownscalingModel  # noqa: E402
 from granitewxc.refinement.checkpoint import (  # noqa: E402
+    CHECKPOINT_SCHEMA_VERSION,
+    REFINEMENT_CONTRACT_VERSION,
     load_phase1_state_dict,
     load_refinement_state_dict,
     phase1_state_fingerprint,
@@ -65,7 +69,12 @@ from granitewxc.utils.normalization import (  # noqa: E402
     assert_scalars_available,
     log_case_context,
 )
-from narr_prism_training import create_finetune_model, get_dataloaders  # noqa: E402
+from narr_prism_inference import VAR_UNITS  # noqa: E402
+from narr_prism_training import (  # noqa: E402
+    create_finetune_model,
+    get_dataloaders,
+    get_inference_dataloader,
+)
 from narr_prism_utils import get_case_name  # noqa: E402
 
 
@@ -74,6 +83,14 @@ def _resolve(path: str | os.PathLike) -> str:
     if candidate.is_absolute():
         return str(candidate)
     return str((REPO_ROOT / candidate).resolve())
+
+
+def _sha256_file(path: str | os.PathLike) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _phase1_checkpoint(config, override: str | None) -> str | None:
@@ -85,6 +102,52 @@ def _phase1_checkpoint(config, override: str | None) -> str | None:
     else:
         path = getattr(phase1_cfg, "checkpoint", None)
     return _resolve(path) if path else None
+
+
+def _refinement_checkpoint(config, config_path: str, override: str | None) -> str:
+    if override:
+        candidate = Path(override).expanduser()
+    else:
+        refinement_cfg = getattr(config.model, "refinement", None) or {}
+        explicit = (
+            refinement_cfg.get("checkpoint")
+            if isinstance(refinement_cfg, dict)
+            else getattr(refinement_cfg, "checkpoint", None)
+        )
+        if explicit:
+            candidate = Path(explicit).expanduser()
+        else:
+            checkpoint_dir = getattr(config, "checkpoint_dir", None)
+            if not checkpoint_dir:
+                raise RuntimeError(
+                    "Active inference requires --refinement-checkpoint, "
+                    "model.refinement.checkpoint, or checkpoint_dir."
+                )
+            candidate = Path(checkpoint_dir).expanduser() / "best.ckpt"
+    if candidate.is_absolute():
+        candidates = [candidate.resolve()]
+    else:
+        # NARR YAMLs historically use both repository-relative paths
+        # (``./examples/NARR_PRISM/...``) and paths relative to the YAML file.
+        # Search both contracts explicitly and reject ambiguity rather than
+        # silently choosing a different checkpoint based on the process cwd.
+        candidates = []
+        for root in (REPO_ROOT, Path(config_path).expanduser().resolve().parent):
+            resolved = (root / candidate).resolve()
+            if resolved not in candidates:
+                candidates.append(resolved)
+    existing = [path for path in candidates if path.is_file()]
+    if len(existing) > 1:
+        raise RuntimeError(
+            "Ambiguous relative refinement checkpoint; both repository- and "
+            f"YAML-relative candidates exist: {existing}"
+        )
+    if not existing:
+        attempted = ", ".join(str(path) for path in candidates)
+        raise FileNotFoundError(
+            f"Refinement checkpoint not found; tried: {attempted}"
+        )
+    return str(existing[0])
 
 
 def build_model(config, config_path: str, phase1_checkpoint: str | None, device: torch.device):
@@ -104,7 +167,11 @@ def build_model(config, config_path: str, phase1_checkpoint: str | None, device:
         checkpoint = torch.load(phase1_checkpoint, map_location="cpu", mmap=True, weights_only=False)
         report = load_phase1_state_dict(model, checkpoint)
         print(f"[refinement] Phase-1 load: {report.summary()}")
-        unexplained = [k for k in report.missing if not k.startswith("refiner.")]
+        unexplained = [
+            key
+            for key in report.missing
+            if not key.startswith(("refiner.", "residual_normalizer."))
+        ]
         if unexplained:
             raise RuntimeError(f"Unexplained missing Phase-1 keys: {unexplained[:8]}")
         fingerprint = phase1_state_fingerprint(
@@ -112,7 +179,10 @@ def build_model(config, config_path: str, phase1_checkpoint: str | None, device:
         )
         print(f"[refinement] Phase-1 fingerprint: {fingerprint}")
     else:
-        print("[refinement] WARNING: no Phase-1 checkpoint provided; Phase 1 is randomly initialised")
+        raise RuntimeError(
+            "Phase-1 checkpoint is required for refinement training and inference; "
+            "randomly initialized deterministic conditioning is forbidden."
+        )
 
     model.to(device)
     return model, fingerprint
@@ -126,6 +196,66 @@ def _first_batch(loader):
 
 def _to_device(batch, device):
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+
+def _canonical_inference_dataset(loader):
+    """Return and validate the full-domain dataset wrapped by a loader."""
+    dataset = loader.dataset
+    while hasattr(dataset, "base"):
+        dataset = dataset.base
+    required = ("fine_lat", "fine_lon", "fine_shape", "crop_size", "mode")
+    missing = [name for name in required if not hasattr(dataset, name)]
+    if missing:
+        raise RuntimeError(
+            f"Inference loader does not expose canonical dataset metadata: {missing}"
+        )
+    if str(dataset.mode) != "inference":
+        raise RuntimeError(
+            f"Refinement inference requires dates.inference, got mode={dataset.mode!r}."
+        )
+    if getattr(dataset, "_tile_slices", None) is not None:
+        raise RuntimeError(
+            "Refinement inference received a tiled dataset; tiles must not be "
+            "serialized as independent time records."
+        )
+    fine_shape = tuple(int(value) for value in dataset.fine_shape)
+    crop_size = tuple(int(value) for value in dataset.crop_size)
+    if crop_size != fine_shape or not bool(getattr(dataset, "full_domain", False)):
+        raise RuntimeError(
+            "Refinement inference dataset is not full-domain: "
+            f"crop={crop_size}, canonical={fine_shape}."
+        )
+    return dataset
+
+
+def _batch_date_strings(batch, expected_batch_size: int) -> list[str]:
+    raw = batch.get("date")
+    if raw is None:
+        raise RuntimeError(
+            "Inference batch is missing source dates; refusing to fabricate a time axis."
+        )
+    values = [raw] if isinstance(raw, str) else list(raw)
+    dates = [str(value) for value in values]
+    if len(dates) != int(expected_batch_size):
+        raise RuntimeError(
+            f"Inference batch has {len(dates)} dates for batch size {expected_batch_size}."
+        )
+    return dates
+
+
+def _physical_output_units(variables) -> dict[str, str]:
+    """Return the established physical-unit contract for NARR predictands."""
+    missing = [
+        str(name)
+        for name in variables
+        if not str(VAR_UNITS.get(str(name), "")).strip()
+    ]
+    if missing:
+        raise RuntimeError(
+            "No physical output-unit contract is defined for NARR variable(s): "
+            f"{missing}. Add explicit units before writing refinement output."
+        )
+    return {str(name): str(VAR_UNITS[str(name)]) for name in variables}
 
 
 # ---------------------------------------------------------------------------
@@ -209,37 +339,60 @@ def cmd_infer(args) -> int:
     config = get_config(args.config)
     device = torch.device(args.device)
     phase1_checkpoint = _phase1_checkpoint(config, args.phase1_checkpoint)
-    model, _ = build_model(config, args.config, phase1_checkpoint, device)
+    model, loaded_phase1_fingerprint = build_model(
+        config, args.config, phase1_checkpoint, device
+    )
 
-    _, val_loader = get_dataloaders(args.config, config)
-    probe = _to_device(_first_batch(val_loader), device)
+    inference_loader = get_inference_dataloader(args.config, config)
+    inference_dataset = _canonical_inference_dataset(inference_loader)
+    probe = _to_device(_first_batch(inference_loader), device)
     model.initialize_from_batch(probe)
     model.to(device).eval()
 
-    if args.refinement_checkpoint:
-        payload = torch.load(args.refinement_checkpoint, map_location="cpu", weights_only=False)
-        phase1_state = {
-            k[len("phase1.") :]: v for k, v in model.state_dict().items() if k.startswith("phase1.")
-        }
-        validate_phase1_reference(payload, phase1_state, strict=not args.allow_phase1_mismatch)
-        load_refinement_state_dict(model, payload)
-        print(f"[refinement] loaded Phase-2 weights from {args.refinement_checkpoint}")
+    refinement_checkpoint = _refinement_checkpoint(
+        config, args.config, args.refinement_checkpoint
+    )
+    payload = torch.load(refinement_checkpoint, map_location="cpu", weights_only=False)
+    phase1_state = {
+        k[len("phase1.") :]: v for k, v in model.state_dict().items() if k.startswith("phase1.")
+    }
+    validate_phase1_reference(payload, phase1_state, strict=True)
+    load_refinement_state_dict(model, payload)
+    model.eval()
+    if any(module.training for module in model.refiner.modules()):
+        raise RuntimeError("Refinement modules must be in eval mode during inference.")
+    print(f"[refinement] loaded Phase-2 weights from {refinement_checkpoint}")
 
     ensemble_size = int(
         args.ensemble_size if args.ensemble_size is not None else model.refinement_config.ensemble_size
     )
     seed = args.seed if args.seed is not None else model.refinement_config.seed
+    inference_generator = torch.Generator(device=device)
+    if seed is not None:
+        inference_generator.manual_seed(int(seed))
 
     deterministic, residual, members, mean, spread, truth = [], [], [], [], [], []
+    inference_dates: list[str] = []
     limit = int(args.limit_batches or 0)
-    for index, batch in enumerate(val_loader):
+    for index, batch in enumerate(inference_loader):
         if limit and index >= limit:
             break
+        if "tile_index" in batch:
+            raise RuntimeError(
+                "Refinement inference received tile_index metadata; tiles must be "
+                "stitched before they can become one time record."
+            )
+        batch_size = int(batch["x"].shape[0])
+        inference_dates.extend(_batch_date_strings(batch, batch_size))
         batch = _to_device(batch, device)
-        out = model.predict(batch, ensemble_size=ensemble_size, seed=seed)
+        out = model.predict(
+            batch,
+            ensemble_size=ensemble_size,
+            generator=inference_generator,
+        )
         deterministic.append(out.deterministic.cpu())
-        if out.residual is not None:
-            residual.append(out.residual.cpu())
+        if out.residual_physical is not None:
+            residual.append(out.residual_physical.cpu())
         if out.members is not None:
             members.append(out.members.cpu())
             mean.append(out.ensemble_mean.cpu())
@@ -255,12 +408,52 @@ def cmd_infer(args) -> int:
     from granitewxc.refinement.io import build_refined_dataset, write_refined_netcdf
 
     variables = list(config.data.output_vars)
+    contract = payload.get("refinement_contract")
+    if not isinstance(contract, dict):
+        raise RuntimeError(
+            "Refinement checkpoint has no serialized scientific contract."
+        )
+    normalization_metadata = model.residual_normalization_metadata()
     deterministic_t = torch.cat(deterministic, dim=0)
     n_time, _, n_lat, n_lon = deterministic_t.shape
+    canonical_shape = tuple(int(value) for value in inference_dataset.fine_shape)
+    if (n_lat, n_lon) != canonical_shape:
+        raise RuntimeError(
+            "Refinement output is not on the full canonical PRISM grid: "
+            f"output={(n_lat, n_lon)}, canonical={canonical_shape}."
+        )
+    if len(inference_dates) != n_time:
+        raise RuntimeError(
+            f"Collected {len(inference_dates)} source dates for {n_time} predictions."
+        )
+    if len(set(inference_dates)) != len(inference_dates):
+        raise RuntimeError(
+            "Duplicate inference dates detected; refusing to serialize spatial "
+            "tiles as independent time records."
+        )
+    try:
+        time_values = np.asarray(inference_dates, dtype="datetime64[ns]")
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Inference dates are not valid ISO timestamps: {inference_dates[:3]}"
+        ) from exc
+    if np.isnat(time_values).any():
+        raise RuntimeError("Inference dates contain NaT values.")
+    fine_lat = np.asarray(inference_dataset.fine_lat)
+    fine_lon = np.asarray(inference_dataset.fine_lon)
+    if fine_lat.ndim != 1 or fine_lon.ndim != 1:
+        raise RuntimeError(
+            "Canonical NARR/PRISM latitude and longitude coordinates must be one-dimensional."
+        )
+    if (fine_lat.size, fine_lon.size) != canonical_shape:
+        raise RuntimeError(
+            "Canonical coordinate lengths do not match the dataset grid: "
+            f"coords={(fine_lat.size, fine_lon.size)}, grid={canonical_shape}."
+        )
     coords = {
-        "time": list(range(n_time)),
-        "lat": list(range(n_lat)),
-        "lon": list(range(n_lon)),
+        "time": time_values,
+        "lat": fine_lat,
+        "lon": fine_lon,
     }
     dataset = build_refined_dataset(
         variables=variables,
@@ -272,14 +465,38 @@ def cmd_infer(args) -> int:
         ensemble_spread=torch.cat(spread, dim=0) if spread else None,
         refined=torch.cat(mean, dim=0) if mean else None,
         truth=torch.cat(truth, dim=0) if truth else None,
+        units=_physical_output_units(variables),
         attrs={
             "case_name": get_case_name(config),
             "refinement_type": model.refinement_config.type,
             "ensemble_size": ensemble_size,
             "seed": -1 if seed is None else int(seed),
             "phase1_checkpoint": phase1_checkpoint or "",
+            "phase1_fingerprint": loaded_phase1_fingerprint,
+            "refinement_checkpoint": refinement_checkpoint,
+            "refinement_checkpoint_sha256": _sha256_file(
+                refinement_checkpoint
+            ),
+            "checkpoint_schema_version": int(
+                payload["checkpoint_schema_version"]
+            ),
+            "refinement_contract_version": int(contract["contract_version"]),
+            "residual_contract": str(contract["residual_contract"]),
+            "refinement_contract_fingerprint": str(
+                payload["refinement_contract_fingerprint"]
+            ),
+            "residual_normalization": json.dumps(
+                normalization_metadata, sort_keys=True, allow_nan=False
+            ),
+            "residual_units": "physical",
+            "prediction_kind": "two_phase_refinement_products",
         },
     )
+    if (
+        int(payload["checkpoint_schema_version"]) != CHECKPOINT_SCHEMA_VERSION
+        or int(contract["contract_version"]) != REFINEMENT_CONTRACT_VERSION
+    ):
+        raise RuntimeError("Refusing to write an obsolete refinement contract.")
     io_cfg = model.performance_config.io
     path = write_refined_netcdf(
         dataset,
@@ -323,7 +540,6 @@ def main() -> int:
     infer.add_argument("--seed", type=int, default=None)
     infer.add_argument("--limit-batches", type=int, default=0)
     infer.add_argument("--output", default=None)
-    infer.add_argument("--allow-phase1-mismatch", action="store_true")
     infer.set_defaults(func=cmd_infer)
 
     describe = sub.add_parser("describe", parents=[common], help="print the resolved configuration")

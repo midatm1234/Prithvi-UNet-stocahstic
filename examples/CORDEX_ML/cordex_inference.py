@@ -43,8 +43,9 @@ def build_predictor_names(config: Any) -> list[str]:
 class CordexWrappedDataset(Dataset):
     """Expose static predictors separately for the model forward pass."""
 
-    def __init__(self, base_dataset: CordexDownscaleDataset) -> None:
+    def __init__(self, base_dataset: CordexDownscaleDataset, *, preserve_metadata: bool = False) -> None:
         self.base = base_dataset
+        self.preserve_metadata = preserve_metadata
 
     def __len__(self) -> int:
         return len(self.base)
@@ -52,11 +53,14 @@ class CordexWrappedDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         sample = self.base[idx]
         x = sample["x"]
+        metadata = ({key: value for key, value in sample.items()
+                     if key.startswith("__sample_") or key == "__target_valid_mask"}
+                    if self.preserve_metadata else {})
         if not getattr(self.base, "use_static", True):
-            return {"x": x, "y": sample["y"]}
+            return {"x": x, "y": sample["y"], **metadata}
         dynamic = x[:-1]
         static = x[-1:].clone()
-        return {"x": dynamic, "y": sample["y"], "static_x": static, "static_y": static}
+        return {"x": dynamic, "y": sample["y"], "static_x": static, "static_y": static, **metadata}
 
 
 def build_inference_dataset(
@@ -65,7 +69,7 @@ def build_inference_dataset(
     target_paths: Sequence[Any],
     *,
     crop_size: tuple[int, int] | None = None,
-    allow_time_mismatch: bool = True,
+    allow_time_mismatch: bool = False,
 ) -> CordexDownscaleDataset:
     predictor_files = _coerce_paths(predictor_paths)
     target_files = _coerce_paths(target_paths)
@@ -92,5 +96,8 @@ def build_inference_dataset(
         random_crop=False,
         seed=None,
         use_static=use_static,
+        # A mismatch is allowed only when the dataset can map every predictor
+        # timestamp to an identical target date/time (e.g. no-leap predictors
+        # against a Gregorian target containing unused February 29 values).
         allow_time_mismatch=allow_time_mismatch,
     )

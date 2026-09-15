@@ -7,7 +7,7 @@ import io
 import os
 import warnings
 from bisect import bisect_right
-from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -159,32 +159,61 @@ class CordexDownscaleDataset(Dataset):
             )
         self._rng = np.random.default_rng(seed)
 
-        self._time_lengths, self._target_time_lengths = self._compute_time_lengths()
+        (
+            self._time_lengths,
+            self._target_time_lengths,
+            self._target_time_indices,
+        ) = self._compute_time_lengths()
         self._cumulative_sizes = self._build_cumulative_sizes(self._time_lengths)
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
         return self._cumulative_sizes[-1] if self._cumulative_sizes else 0
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, index: int) -> dict[str, Any]:
         file_idx, time_idx = self._locate_index(index)
 
         lat_slice, lon_slice = self._select_crop()
 
         x = self._load_predictors(self.predictor_paths[file_idx], time_idx, lat_slice, lon_slice)
-        target_lengths = getattr(self, "_target_time_lengths", self._time_lengths)
+        target_time_idx = self._target_time_indices[file_idx][time_idx]
         y = self._load_targets(
             self.target_paths[file_idx],
-            time_idx,
+            target_time_idx,
             lat_slice,
             lon_slice,
-            target_len=target_lengths[file_idx],
         )
 
-        if self.random_crop_offset != (0, 0):
+        # ``random_crop`` is deliberately disabled when the requested crop
+        # covers the full domain. Do not nevertheless translate that full
+        # field: coordinate-sensitive target scalers remain unshifted.
+        if self.random_crop and self.random_crop_offset != (0, 0):
             x, y = self._apply_random_spatial_offset(x, y)
 
-        return {"x": x, "y": y}
+        # Record target validity before retaining the legacy finite-filled
+        # ``y`` contract used by deterministic Phase-1 training. Phase-2 can
+        # combine this mask with its residual mask instead of interpreting
+        # missing precipitation as a dry zero.
+        target_valid_mask = torch.isfinite(y)
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
+        timestamp_key = self._predictor_time_keys[file_idx][time_idx]
+        return {
+            "x": x,
+            "y": y,
+            "__target_valid_mask": target_valid_mask,
+            # Private provenance fields are passed through the training wrapper
+            # and removed before model execution. They make a persisted
+            # diagnostic batch traceable to an exact file and timestamp rather
+            # than merely to "the first validation batch".
+            "__sample_dataset_index": int(index),
+            "__sample_file_index": int(file_idx),
+            "__sample_predictor_time_index": int(time_idx),
+            "__sample_target_time_index": int(target_time_idx),
+            "__sample_timestamp": self._format_time_key(timestamp_key),
+            "__sample_predictor_path": str(self.predictor_paths[file_idx]),
+            "__sample_target_path": str(self.target_paths[file_idx]),
+        }
 
     # ------------------------------------------------------------------
     def _inspect_predictor_template(
@@ -235,42 +264,130 @@ class CordexDownscaleDataset(Dataset):
                         f"Target file {path} does not contain variables: {missing}"
                     )
 
+            # Public, channel-aligned physical units after the dataset's one
+            # allowed target conversion. Diagnostics and output writers can
+            # use this without guessing semantics from variable names.
+            self.target_units = [
+                str(
+                    self._convert_target_units(
+                        xr.DataArray(
+                            0.0,
+                            name=var,
+                            attrs=dict(ds[var].attrs),
+                        ),
+                        variable_name=var,
+                    ).attrs.get("units", "")
+                ).strip()
+                for var in self.target_vars
+            ]
+
             target_example = ds[self.target_vars[0]]
-            spatial_dims = [dim for dim in target_example.dims if dim != self.time_dim]
-            if len(spatial_dims) != 2:
+            variable_spatial_dims = [
+                dim for dim in target_example.dims if dim != self.time_dim
+            ]
+            spatial_dims = self._coordinate_spatial_dims(lat_da, lon_da)
+            if (
+                len(variable_spatial_dims) != 2
+                or set(variable_spatial_dims) != set(spatial_dims)
+            ):
                 raise ValueError(
-                    f"Target variable {self.target_vars[0]} must have two spatial dims"
+                    f"Target variable {self.target_vars[0]} must use the latitude/longitude "
+                    f"dimensions {spatial_dims}; got {tuple(variable_spatial_dims)}."
                 )
 
             grid_out = self._build_grid(lat_da, lon_da, lat_name, lon_name)
             spatial_shape = self._compute_shape(lat_da, lon_da)
 
-        return lat_name, lon_name, spatial_shape, tuple(spatial_dims), self.target_vars, grid_out
+        return lat_name, lon_name, spatial_shape, spatial_dims, self.target_vars, grid_out
 
-    def _compute_time_lengths(self) -> Tuple[List[int], List[int]]:
+    @staticmethod
+    def _time_key(value: object) -> tuple:
+        """Calendar-agnostic timestamp key used for an exact date/time join."""
+        if all(hasattr(value, name) for name in ("year", "month", "day")):
+            return (
+                int(value.year),
+                int(value.month),
+                int(value.day),
+                int(getattr(value, "hour", 0)),
+                int(getattr(value, "minute", 0)),
+                int(getattr(value, "second", 0)),
+            )
+        try:
+            text = np.datetime_as_string(np.datetime64(value), unit="s")
+            date, time = text.split("T")
+            year, month, day = (int(part) for part in date.split("-"))
+            hour, minute, second = (int(part) for part in time.split(":"))
+            return year, month, day, hour, minute, second
+        except Exception:
+            return ("raw", str(value))
+
+    @staticmethod
+    def _format_time_key(key: tuple) -> str:
+        if len(key) == 6 and all(isinstance(value, int) for value in key):
+            year, month, day, hour, minute, second = key
+            return (
+                f"{year:04d}-{month:02d}-{day:02d}T"
+                f"{hour:02d}:{minute:02d}:{second:02d}"
+            )
+        if len(key) == 2 and key[0] == "raw":
+            return str(key[1])
+        return repr(key)
+
+    def _read_time_values(self, path: str) -> list[object]:
+        with xr.open_dataset(path) as ds:
+            if not self.time_dim or self.time_dim not in ds.coords:
+                return list(range(self._read_time_length(path)))
+            return list(ds[self.time_dim].values)
+
+    def _compute_time_lengths(self) -> Tuple[List[int], List[int], List[List[int]]]:
         lengths: List[int] = []
         target_lengths: List[int] = []
+        target_indices: List[List[int]] = []
+        self._predictor_time_keys: List[List[tuple]] = []
         for predictor_path, target_path in zip(self.predictor_paths, self.target_paths):
-            predictor_len = self._read_time_length(predictor_path)
-            target_len = self._read_time_length(target_path)
+            predictor_times = self._read_time_values(predictor_path)
+            target_times = self._read_time_values(target_path)
+            self._predictor_time_keys.append(
+                [self._time_key(value) for value in predictor_times]
+            )
+            predictor_len = len(predictor_times)
+            target_len = len(target_times)
             target_lengths.append(target_len)
 
-            if predictor_len != target_len:
-                if not self.allow_time_mismatch:
-                    raise ValueError(
-                        f"Time dimension mismatch between {predictor_path} and {target_path}"
-                    )
-                warnings.warn(
-                    "Time dimension mismatch between "
-                    f"{predictor_path} (len={predictor_len}) and "
-                    f"{target_path} (len={target_len}); "
-                    "using predictor length for indexing targets.",
-                    RuntimeWarning,
+            if predictor_len != target_len and not self.allow_time_mismatch:
+                raise ValueError(
+                    f"Time dimension mismatch between {predictor_path} "
+                    f"(len={predictor_len}) and {target_path} (len={target_len}). "
+                    "Set allow_time_mismatch only for an exact timestamp join "
+                    "between calendars (for example no-leap versus Gregorian)."
+                )
+
+            lookup: dict[tuple, int] = {}
+            for target_idx, value in enumerate(target_times):
+                key = self._time_key(value)
+                if key in lookup:
+                    raise ValueError(f"Duplicate target timestamp {key} in {target_path}.")
+                lookup[key] = target_idx
+            mapped: list[int] = []
+            missing: list[tuple] = []
+            for value in predictor_times:
+                key = self._time_key(value)
+                if key not in lookup:
+                    missing.append(key)
+                else:
+                    mapped.append(lookup[key])
+            if missing:
+                raise ValueError(
+                    f"Predictor/target timestamps are not aligned for {predictor_path} "
+                    f"and {target_path}; {len(missing)} predictor timestamps are "
+                    f"missing from the target, e.g. {missing[:3]}. Positional indexing "
+                    "and final-target repetition are forbidden."
                 )
 
             lengths.append(predictor_len)
+            target_indices.append(mapped)
 
-        return lengths, target_lengths
+        return lengths, target_lengths, target_indices
 
     def _build_cumulative_sizes(self, lengths: Sequence[int]) -> List[int]:
         cumulative: List[int] = []
@@ -303,6 +420,13 @@ class CordexDownscaleDataset(Dataset):
                     da = da.isel({self.time_dim: time_index}, drop=True)
                 da = self._rename_lat_lon(da, self.coarse_lat_name, self.coarse_lon_name)
                 regridded = self.regridder(da)
+                if isinstance(regridded, xr.DataArray):
+                    regridded = self._transpose_spatial(
+                        regridded,
+                        lat_name="lat",
+                        lon_name="lon",
+                        source=f"predictor variable {var}",
+                    )
                 arrays = np.nan_to_num(
                     self._to_numpy(regridded), nan=0.0, posinf=0.0, neginf=0.0
                 )
@@ -323,29 +447,91 @@ class CordexDownscaleDataset(Dataset):
         time_index: int,
         lat_slice: slice,
         lon_slice: slice,
-        *,
-        target_len: Optional[int] = None,
     ) -> torch.Tensor:
         tensors: List[np.ndarray] = []
         with xr.open_dataset(path) as ds:
-            resolved_index = time_index
-            if self.allow_time_mismatch and self.time_dim:
-                effective_len = target_len if target_len is not None else self._read_time_length(path)
-                if effective_len <= 0:
-                    raise ValueError(f"Target file {path} has no time dimension.")
-                if time_index >= effective_len:
-                    resolved_index = effective_len - 1
             for var in self.target_vars:
                 da = ds[var]
                 if self.time_dim and self.time_dim in da.dims:
-                    da = da.isel({self.time_dim: resolved_index}, drop=True)
-                arrays = np.nan_to_num(
-                    self._to_numpy(da), nan=0.0, posinf=0.0, neginf=0.0
+                    da = da.isel({self.time_dim: time_index}, drop=True)
+                da = self._transpose_spatial(
+                    da,
+                    lat_name=self.fine_lat_name,
+                    lon_name=self.fine_lon_name,
+                    source=f"target variable {var}",
                 )
+                da = self._convert_target_units(da, variable_name=var)
+                # Keep invalid values visible until ``__getitem__`` records
+                # their explicit validity mask. Filling here would erase the
+                # distinction between missing precipitation and 0 mm/day.
+                arrays = self._to_numpy(da)
                 tensors.append(arrays)
 
         stacked = np.stack(tensors, axis=0)[..., lat_slice, lon_slice]
         return torch.from_numpy(stacked).to(self.dtype)
+
+    @staticmethod
+    def _convert_target_units(
+        data: xr.DataArray,
+        *,
+        variable_name: str | None = None,
+    ) -> xr.DataArray:
+        """Normalize declared precipitation units to physical ``mm/day`` once.
+
+        Unknown or missing precipitation units are rejected instead of being
+        silently interpreted as daily totals. Other predictands retain their
+        native units (for example, SA ``tasmax`` remains Kelvin).
+        """
+        name = str(variable_name or data.name or "").strip().casefold()
+        standard_name = str(data.attrs.get("standard_name", "")).casefold()
+        is_precipitation = name in {
+            "pr",
+            "precip",
+            "precipitation",
+            "ppt",
+            "tp",
+        } or "precipitation" in standard_name
+        if not is_precipitation:
+            return data
+
+        raw_units = str(data.attrs.get("units", "")).strip()
+        if not raw_units:
+            raise ValueError(
+                f"Precipitation target {variable_name or data.name!r} is missing "
+                "units; expected mm/day or a supported per-second water flux."
+            )
+        compact = raw_units.casefold().translate(
+            str.maketrans("−⁻⁰¹²³⁴⁵⁶⁷⁸⁹", "--0123456789")
+        )
+        compact = compact.replace("**", "").replace("^", "").replace(" ", "")
+        daily_units = {
+            "mm/day",
+            "mmday-1",
+            "mmd-1",
+            "mmperday",
+        }
+        flux_units = {
+            "kgm-2s-1",
+            "kg/m2/s",
+            "kgm-2/sec",
+            "mms-1",
+            "mm/s",
+        }
+        if compact in daily_units:
+            return data
+        if compact not in flux_units:
+            raise ValueError(
+                f"Unsupported precipitation units {raw_units!r} for target "
+                f"{variable_name or data.name!r}; expected mm/day or a supported "
+                "per-second water flux."
+            )
+        converted = data * 86_400.0
+        converted.attrs = dict(data.attrs)
+        converted.attrs["units"] = "mm/day"
+        converted.attrs["unit_conversion"] = (
+            f"{raw_units} multiplied by 86400 exactly once"
+        )
+        return converted
 
     # ------------------------------------------------------------------
     def _prepare_orography(self) -> torch.Tensor:
@@ -494,6 +680,53 @@ class CordexDownscaleDataset(Dataset):
         if lat_da.ndim == 2 and lon_da.ndim == 2:
             return lat_da.shape[0], lat_da.shape[1]
         raise ValueError("Unsupported coordinate dimensionality for grid definition")
+
+    @staticmethod
+    def _coordinate_spatial_dims(
+        lat_da: xr.DataArray,
+        lon_da: xr.DataArray,
+    ) -> Tuple[str, str]:
+        """Return the canonical latitude-then-longitude spatial dimension order."""
+        if lat_da.ndim == 1 and lon_da.ndim == 1:
+            dims = (str(lat_da.dims[0]), str(lon_da.dims[0]))
+        elif lat_da.ndim == 2 and lon_da.ndim == 2:
+            if tuple(lat_da.dims) != tuple(lon_da.dims):
+                raise ValueError(
+                    "Two-dimensional latitude and longitude coordinates must "
+                    "share the same dimension order."
+                )
+            dims = tuple(str(dim) for dim in lat_da.dims)
+        else:
+            raise ValueError(
+                "Latitude and longitude coordinates must both be one- or "
+                "two-dimensional."
+            )
+        if len(dims) != 2 or dims[0] == dims[1]:
+            raise ValueError(f"Invalid spatial coordinate dimensions: {dims}.")
+        return dims
+
+    def _transpose_spatial(
+        self,
+        data: xr.DataArray,
+        *,
+        lat_name: str,
+        lon_name: str,
+        source: str,
+    ) -> xr.DataArray:
+        """Canonicalize a single-time field to latitude-major ``[H, W]``."""
+        if lat_name not in data.coords or lon_name not in data.coords:
+            raise ValueError(
+                f"{source} is missing coordinates {lat_name!r}/{lon_name!r}."
+            )
+        spatial_dims = self._coordinate_spatial_dims(
+            data.coords[lat_name], data.coords[lon_name]
+        )
+        if len(data.dims) != 2 or set(data.dims) != set(spatial_dims):
+            raise ValueError(
+                f"{source} must contain exactly spatial dimensions {spatial_dims} "
+                f"after time selection; got {tuple(data.dims)}."
+            )
+        return data.transpose(*spatial_dims)
 
     def _rename_lat_lon(
         self, data: xr.DataArray, lat_name: str, lon_name: str

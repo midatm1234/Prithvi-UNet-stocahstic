@@ -330,10 +330,120 @@ python examples/CORDEX_ML/utils/evaluate_v4_outputs.py \
   - **static/no_static**: with or without orography
 4. **Fine-tune** – Run the domain-specific `{Region}` notebooks:
   - `notebooks/{Region}_downscaling_finetune_T1(T2)_{ModelName}_{static|no_static}.ipynb`
-5. **Inference** – Run the `{Region}` inference drivers:
+5. **Optional Phase-2 residual training** – Train one refinement head with
+   `cordex_refinement_training.py` from the frozen Phase-1 checkpoint named by
+   the YAML.
+6. **Inference** – Run the `{Region}` inference drivers:
   - `notebooks/{Region}_downscaling_inference_T1(T2)_{ModelName}_{static|no_static}.py`
   - Run 12 predictor configurations (perfect/imperfect; two models).
   - Time periods: hist (1981–2000), mid (2041–2060), end (2080–2099).
+7. **Phase-2 evaluation** – Compare physical ensemble members with the paired
+   Phase-1 baseline and exact held-out truth using
+   `utils/evaluate_refinement_outputs.py`.
+
+### Phase-2 residual refinement
+
+All four Phase-2 choices model
+`ground_truth_physical - frozen_phase1_physical`; none regenerates the complete
+target. Training-only, per-output-channel residual statistics are stored in a
+strict schema-2 checkpoint and inverted exactly once. Each stochastic member is
+then reconstructed in physical units before ensemble aggregation.
+
+Transformer refiners use full-domain spatial attention with convolutional stems,
+overlapping patch embeddings, per-block conditioning and a convolutional
+decoder. A zero-initialized output projection and learnable physical correction
+gate make an untrained Transformer exactly reproduce Phase 1. Schema-1 Phase-2
+checkpoints use the superseded normalized-target-delta contract and must be
+retrained; the loader deliberately rejects them.
+
+```bash
+# Train a repaired Transformer head into a new checkpoint directory.
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_refinement_training.py \
+  --config examples/CORDEX_ML/SA_T2_ACCESS-CM2_static_diffusion_transformer.yaml \
+  --device cuda:0 \
+  --checkpoint-dir runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/SA_T2_ACCESS-CM2_static_diffusion_transformer_schema2_fixed
+
+# Train the fixed flow-Transformer precipitation-mean recipe from scratch.
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_refinement_training.py \
+  --config examples/CORDEX_ML/SA_T2_ACCESS-CM2_static_flow_matching_transformer.yaml \
+  --device cuda:0 \
+  --checkpoint-dir runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/SA_T2_ACCESS-CM2_static_flow_matching_transformer_schema2_precip_mean_fixed
+
+# Exercise the one-batch coherent-residual overfit diagnostic.
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_refinement_training.py \
+  --config examples/CORDEX_ML/SA_T2_ACCESS-CM2_static_diffusion_transformer.yaml \
+  --device cuda:0 --tiny-overfit --epochs 20 --learning-rate 1e-3
+
+# Resume checkpoint-dir/last.ckpt without permissive key loading.
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_refinement_training.py \
+  --config examples/CORDEX_ML/SA_T2_ACCESS-CM2_static_diffusion_transformer.yaml \
+  --device cuda:0 \
+  --checkpoint-dir runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/SA_T2_ACCESS-CM2_static_diffusion_transformer_schema2_fixed \
+  --resume --epochs 100
+```
+
+The default residual-normalization and auxiliary reconstruction settings are:
+
+```yaml
+model:
+  refinement:
+    train_on_residual: true
+    freeze_phase1: true
+    joint_finetuning: false
+    reconstruction_loss_weight: 0.25
+    multiscale_loss_weight: 0.10
+    gradient_loss_weight: 0.05
+    mean_bias_loss_weight: 0.01
+    nonnegative_ensemble_strategy: memberwise  # memberwise | mean_preserving
+    residual_normalization:
+      method: standardize
+      epsilon: 1.0e-6
+      minimum_scale: 1.0e-4
+      require_fitted: true
+    diffusion:
+      prediction_type: sample
+      clip_sample: false
+    flow_matching:
+      mean_path_loss_weight: 0.0
+    transformer:
+      zero_init_output: true
+```
+
+The library defaults above preserve historical behavior. The two fixed SA flow
+YAMLs intentionally override `mean_path_loss_weight` to `0.25`, adding a masked
+Huber anchor on the deterministic zero-source path without changing the
+stochastic Gaussian flow objective or inference ODE. They also select
+`mean_preserving`, which applies one final non-negative ensemble projection after
+physical `Phase1 + residual` reconstruction and avoids the positive mean shift
+caused by independently clipping precipitation members. It does not clip flow
+states or normalized residuals.
+
+At an exactly zero projected precipitation mean, every non-negative member must
+be zero, so the selected ensemble spread is necessarily zero even when the
+unbounded members straddle zero. Positive-mean cells can retain structured
+spread. Use the saved unbounded/memberwise-clipping diagnostics when separating
+this physical projection effect from sampler collapse.
+
+The multi-scale, gradient and mean-bias terms compare predictions against the
+true residual at matching scales; they are not total-variation smoothing or
+plot post-processing. See
+[`docs/STOCHASTIC_REFINEMENT.md`](../../docs/STOCHASTIC_REFINEMENT.md) for the
+complete inference/evaluation commands and formulation.
+
+If a refinement YAML names identical training and validation files, the CLI
+uses a chronological final-10% holdout by default rather than leaking training
+samples into validation. Adjust this with `--validation-fraction`;
+`--tiny-overfit` intentionally reuses one batch only as a learning/coherence
+diagnostic.
+`--batch-size`, `--gradient-accumulation-steps` and `--learning-rate` override
+their YAML values only when supplied. The non-notebook Phase-2 CLI deliberately
+ignores legacy top-level `resume_training` and `resume_checkpoint_path` fields;
+use its explicit `--resume [CHECKPOINT]` option. The shipped SA refinement
+YAMLs disable those legacy notebook controls and use distinct checkpoint
+directories so schema-1 artifacts cannot be selected by default. Diffusion uses
+head-specific `*_schema2_fixed` directories; the corrected flow recipes use
+head-specific `*_schema2_precip_mean_fixed` directories and must not resume the
+older flow runs because their serialized scientific contract differs.
 
 ## Notebooks
 ### Regional Downscaling Notebooks
@@ -420,28 +530,84 @@ jupyter lab examples/CORDEX_ML/notebooks/NZ_downscaling_inference.ipynb
 ## I/O Variables
 - **Predictor channels**: CORDEX coarse atmospheric fields referenced in the domain-specific YAML config files (`u`, `v`, `q`, `t`, `z` across multiple pressure levels) plus static orography.
 - **Target variables**: Consistent across all domains (ALPS, NZ, SA):
-  - `pr`: precipitation rate (mm/day in the benchmark files).
-  - `tasmax`: daily max 2 m air temperature (°C).
+  - `pr`: precipitation rate; raw declared flux units (`kg m-2 s-1` or
+    `mm s-1`) are converted exactly once to physical `mm/day`.
+  - `tasmax`: daily max 2 m air temperature. The shipped SA files, scalers,
+    and model outputs use Kelvin (`K`). The evaluator converts `K` and `°C`
+    only when both source and requested units are declared explicitly.
 
 Domain-specific notebooks expect predictors/targets to follow the CORDEX-ML benchmark naming convention and will emit NetCDFs with these same `pr` and `tasmax` variables.
 
 ## Model Loading
 - Each domain's inference notebook enumerates the fine-tune runs under the domain-specific directory (e.g., `examples/CORDEX_ML/runs/nz_finetune` for NZ, `examples/CORDEX_ML/runs/alps_finetune` for ALPS, `examples/CORDEX_ML/runs/sa_finetune` for SA), picks the latest checkpoint (or one set via environment variable), and stores the resolved path in `CHECKPOINT_PATH`.
 - When `CHECKPOINT_PATH` is loaded, the notebook prints the location, trainable parameter count, and a quick checksum (mean/std of the first tensor) so you can confirm the fine-tuned weights—not the generic base encoder—are active before running inference.
+- Phase-2 inference additionally verifies checkpoint schema, exact refinement
+  type/configuration, every trainable key and shape, residual-normalizer state
+  and fingerprint, and the frozen Phase-1 SHA-256 identity. Missing or unexpected
+  Transformer parameters are fatal; inference never continues with random
+  layers.
 
 ## Outputs
 - Domain-specific notebooks assert that `config.data.output_vars` provides `['pr', 'tasmax']` and that the dataloaders emit two-channel targets before training/inference begins.
 - Generated NetCDFs therefore always include `pr` and `tasmax` variables on each domain's high-resolution grid, matching the CORDEX-ML benchmark naming and order.
+- The repaired SA Phase-2 driver writes physical members on an explicit
+  `ensemble` dimension and a paired `.baseline.nc` Phase-1 file. Provenance
+  records the prediction kind, refinement case/type/checkpoint, schema and
+  residual-contract versions, fitted residual-normalization summary, Phase-1
+  checkpoint/state fingerprint, refinement-contract fingerprint and ensemble
+  size. It also records the refinement checkpoint file SHA-256. The strict
+  evaluator requires `--expected-checkpoint`, hashes its current bytes, and
+  authenticates the stored scientific contract, Phase-1 identity and residual-
+  normalizer tensor fingerprint. It also checks fitted per-channel residual
+  statistics and channel order against the requested output variables, and
+  requires the paired baseline to have the identical Phase-1 fingerprint.
+  Its default case directory uses a collision-safe `_schema2_fixed` or
+  `_schema2_<case>_fixed` suffix, preserving all legacy NetCDFs;
+  `GRANITE_REFINEMENT_OUTPUT_HEADER` can select another distinct schema-2 name.
+- The SA Phase-2 Python driver writes losslessly compressed float32 NetCDFs.
+  Duplicate ensemble and pre-inverse pickle files are disabled by default;
+  set `GRANITE_REFINEMENT_SAVE_PICKLES=1` to include them. Before sampling,
+  it checks free disk space against the uncompressed output bundle plus a
+  reserve. `GRANITE_REFINEMENT_OUTPUT_ROOT` optionally relocates outputs to
+  another drive, retaining the case/period/quality subdirectories. After an
+  interrupted write, use a new `GRANITE_REFINEMENT_OUTPUT_HEADER` ending in
+  `_schema2_<case>_fixed`; existing artifacts are never overwritten.
+- Each SA Phase-2 run also writes
+  `<prediction-stem>.constraint_diagnostics.nc` in physical units. Per output
+  channel it contains the ensemble mean before the final constraint, the mean
+  that ordinary independent memberwise clipping would produce, and their
+  clipping-induced difference. The main prediction file contains only the
+  selected finally constrained physical members.
+- The repaired SA Phase-2 driver intentionally forces full-domain sampling on
+  the 128 x 128 target grid. Consequently, the generic 96 x 96 tile, overlap,
+  and Hann-blending YAML fields are inactive for this workflow and cannot
+  explain fixed-latitude/longitude refinement artifacts. Other CORDEX drivers
+  may still use those generic tiling controls.
 
 ## Time Handling
+- `CordexDataset` pairs predictor and target samples by exact civil timestamp
+  `(year, month, day, hour, minute, second)`, not by array position, clamping
+  or repetition. The SA Phase-2 driver permits target-only leap days but still
+  requires an exact target match for every no-leap predictor date.
 - The inference writer inspects the predictor NetCDF(s) used for inference to build the `time` coordinate and raises if the predicted sequence length differs from the predictor timestamps.
 - The resulting NetCDF inherits the predictor time metadata verbatim, so e.g. `ACCESS-CM2_1981-2000_regridded.nc` yields a 1981–2000 `time` axis rather than reusing the training (1961–1980) window.
 - The notebook logs the detected start/end times to make it obvious which forcing period produced a set of predictions.
+- Raw precipitation flux targets (`kg m-2 s-1` or `mm s-1`) are converted to
+  `mm/day` exactly once. The strict evaluator repeats the exact timestamp join
+  across refinement, Phase-1 baseline and truth, and fails on wrong periods,
+  variables, dimension order or missing physical units.
 
 ## Inference Safety Defaults
 - All `*_downscaling_inference_*` scripts now automatically repair invalid predictor values (`NaN`, `inf`, and `_FillValue`/`missing_value`) by nearest-valid replacement in lat/lon space before dataloader normalization.
-- `pr` non-negativity is now enforced by model decoding (`softplus` + divide-only scaling) when configured via YAML `predictands.pr`.
-- No clamp-based precipitation post-processing is required.
+- Deterministic Phase-1 `pr` non-negativity is enforced by model decoding
+  (`softplus` + divide-only scaling) when configured via YAML.
+- Phase 2 applies the configured nonnegativity constraint once, and only after
+  `base + physical_residual` reconstruction. This final physical constraint is
+  not used to hide residual scale or sampler failures.
+- `nonnegative_ensemble_strategy: memberwise` is the backward-compatible
+  default. The fixed SA flow recipes use `mean_preserving` to retain the
+  non-negative projection of the unbounded physical ensemble mean and avoid a
+  memberwise-clipping Jensen bias; unconstrained tasmax members are unchanged.
 - The same behavior is enabled in `*_downscaling_inference_*.ipynb` notebooks.
 - Inference runs print diagnostics for:
   - Invalid predictor counts before/after repair (per predictor variable).

@@ -31,11 +31,13 @@ from granitewxc.refinement.config import (
     ConfigValidationError,
     PerformanceConfig,
     RefinementConfig,
+    ResidualNormalizationConfig,
     config_fingerprint,
     resolve_performance_config,
     resolve_refinement_config,
 )
 from granitewxc.refinement.target_space import NormalizedTargetSpace
+from granitewxc.refinement.normalization import ResidualNormalizer
 
 # Importing the concrete refiners populates the registry.
 from granitewxc.refinement import diffusion as _diffusion  # noqa: F401
@@ -54,6 +56,8 @@ __all__ = [
     "NormalizedTargetSpace",
     "PerformanceConfig",
     "RefinementConfig",
+    "ResidualNormalizationConfig",
+    "ResidualNormalizer",
     "RefinementTrainState",
     "RefinementTrainer",
     "ResidualRefiner",

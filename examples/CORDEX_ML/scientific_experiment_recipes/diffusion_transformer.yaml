@@ -1,0 +1,267 @@
+schema: registered_scientific_experiment_recipe_catalog_v1
+head: diffusion_transformer
+case_configuration: examples/CORDEX_ML/SA_T2_ACCESS-CM2_static_diffusion_transformer.yaml
+variables:
+- pr
+- tasmax
+entrypoint: examples/CORDEX_ML/cordex_scientific_experiments.py train
+selection: Select exactly one recipe by --recipe; no automatic Cartesian product.
+fresh_training_required: true
+refinement_configuration:
+  enabled: true
+  type: diffusion_transformer
+  checkpoint: null
+  freeze_phase1: true
+  joint_finetuning: false
+  train_on_residual: true
+  ensemble_size: 10
+  loss: mse
+  reconstruction_loss_weight: 0.25
+  multiscale_loss_weight: 0.1
+  gradient_loss_weight: 0.05
+  mean_bias_loss_weight: 0.01
+  nonnegative_ensemble_strategy: memberwise
+  seed: 1234
+  conditioning:
+    deterministic_output: true
+    input_predictors: true
+    prithvi_features: false
+    unet_features: false
+    static_fields: true
+    masks: true
+    normalize_predictors: false
+  residual_normalization:
+    method: standardize
+    epsilon: 1.0e-06
+    minimum_scale: 0.0001
+    require_fitted: true
+  diffusion:
+    training_timesteps: 1000
+    inference_steps: 50
+    prediction_type: sample
+    schedule: cosine
+    beta_start: 0.0001
+    beta_end: 0.02
+    cosine_s: 0.008
+    clip_sample: false
+    clip_sample_range: 10.0
+    eta: 0.0
+  flow_matching:
+    integration_steps: 50
+    solver: euler
+    source_distribution: gaussian
+    stochastic_initialization: true
+    sigma_min: 0.0001
+    time_sampling: uniform
+    logit_normal_mean: -0.5
+    logit_normal_std: 1.2
+    mean_path_loss_weight: 0.0
+  transformer:
+    patch_size:
+    - 8
+    - 8
+    embedding_dim: 256
+    num_heads: 8
+    num_blocks: 6
+    mlp_ratio: 4.0
+    dropout: 0.0
+    positional_encoding: learned_2d
+    max_tokens_lat: 128
+    max_tokens_lon: 128
+    gradient_checkpointing: true
+    optimized_attention: auto
+    zero_init_output: true
+    spatial_alignment: legacy
+  unet:
+    hidden_channels: 64
+    num_levels: 3
+    time_embedding_dim: 128
+    dropout: 0.0
+    bottleneck_attention: true
+    attention_heads: 4
+    zero_init_output: true
+    spatial_alignment: legacy
+recipes:
+  native:
+    name: native
+    variables:
+    - pr
+    - tasmax
+    variable_weights:
+    - 1.0
+    - 1.0
+    gate_policy: fixed_unit_fresh
+    process_loss: 1.0
+    reconstruction_loss: 0.0
+    gate_calibration_loss: 0.0
+    multiscale_loss: 0.0
+    gradient_loss: 0.0
+    mean_bias_loss: 0.0
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1
+  native_production_gate:
+    name: native_production_gate
+    variables:
+    - pr
+    - tasmax
+    variable_weights:
+    - 1.0
+    - 1.0
+    gate_policy: production_trainable
+    process_loss: 1.0
+    reconstruction_loss: 0.0
+    gate_calibration_loss: 0.0
+    multiscale_loss: 0.0
+    gradient_loss: 0.0
+    mean_bias_loss: 0.0
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1
+  reconstruction_loss:
+    name: reconstruction_loss
+    variables:
+    - pr
+    - tasmax
+    variable_weights:
+    - 1.0
+    - 1.0
+    gate_policy: fixed_unit_fresh
+    process_loss: 1.0
+    reconstruction_loss: 0.25
+    gate_calibration_loss: 0.0
+    multiscale_loss: 0.0
+    gradient_loss: 0.0
+    mean_bias_loss: 0.0
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1
+  multiscale_loss:
+    name: multiscale_loss
+    variables:
+    - pr
+    - tasmax
+    variable_weights:
+    - 1.0
+    - 1.0
+    gate_policy: fixed_unit_fresh
+    process_loss: 1.0
+    reconstruction_loss: 0.0
+    gate_calibration_loss: 0.0
+    multiscale_loss: 0.1
+    gradient_loss: 0.0
+    mean_bias_loss: 0.0
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1
+  gradient_loss:
+    name: gradient_loss
+    variables:
+    - pr
+    - tasmax
+    variable_weights:
+    - 1.0
+    - 1.0
+    gate_policy: fixed_unit_fresh
+    process_loss: 1.0
+    reconstruction_loss: 0.0
+    gate_calibration_loss: 0.0
+    multiscale_loss: 0.0
+    gradient_loss: 0.05
+    mean_bias_loss: 0.0
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1
+  mean_bias_loss:
+    name: mean_bias_loss
+    variables:
+    - pr
+    - tasmax
+    variable_weights:
+    - 1.0
+    - 1.0
+    gate_policy: fixed_unit_fresh
+    process_loss: 1.0
+    reconstruction_loss: 0.0
+    gate_calibration_loss: 0.0
+    multiscale_loss: 0.0
+    gradient_loss: 0.0
+    mean_bias_loss: 0.01
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1
+  gate_calibration_loss:
+    name: gate_calibration_loss
+    variables:
+    - pr
+    - tasmax
+    variable_weights:
+    - 1.0
+    - 1.0
+    gate_policy: production_trainable
+    process_loss: 1.0
+    reconstruction_loss: 0.0
+    gate_calibration_loss: 0.25
+    multiscale_loss: 0.0
+    gradient_loss: 0.0
+    mean_bias_loss: 0.0
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1
+  existing_full_recipe:
+    name: existing_full_recipe
+    variables:
+    - pr
+    - tasmax
+    variable_weights:
+    - 1.0
+    - 1.0
+    gate_policy: production_trainable
+    process_loss: 1.0
+    reconstruction_loss: 0.25
+    gate_calibration_loss: 0.25
+    multiscale_loss: 0.1
+    gradient_loss: 0.05
+    mean_bias_loss: 0.01
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1
+  pr_only:
+    name: pr_only
+    variables:
+    - pr
+    variable_weights:
+    - 1.0
+    gate_policy: fixed_unit_fresh
+    process_loss: 1.0
+    reconstruction_loss: 0.0
+    gate_calibration_loss: 0.0
+    multiscale_loss: 0.0
+    gradient_loss: 0.0
+    mean_bias_loss: 0.0
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1
+  tasmax_only:
+    name: tasmax_only
+    variables:
+    - tasmax
+    variable_weights:
+    - 1.0
+    gate_policy: fixed_unit_fresh
+    process_loss: 1.0
+    reconstruction_loss: 0.0
+    gate_calibration_loss: 0.0
+    multiscale_loss: 0.0
+    gradient_loss: 0.0
+    mean_bias_loss: 0.0
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1
+  fixed_pr_weight_2:
+    name: fixed_pr_weight_2
+    variables:
+    - pr
+    - tasmax
+    variable_weights:
+    - 2.0
+    - 1.0
+    gate_policy: fixed_unit_fresh
+    process_loss: 1.0
+    reconstruction_loss: 0.0
+    gate_calibration_loss: 0.0
+    multiscale_loss: 0.0
+    gradient_loss: 0.0
+    mean_bias_loss: 0.0
+    mean_path_loss: 0.0
+    version: native_process_individual_auxiliary_v1

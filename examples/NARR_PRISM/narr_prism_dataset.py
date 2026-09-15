@@ -133,6 +133,10 @@ class NarrPrismDataset(Dataset):
         ``normalization.resolve_scalar_dir``).
     dtype : torch.dtype
         Tensor dtype for returned samples.
+    full_domain : bool
+        When true, inference returns one complete canonical-grid sample per
+        date instead of the default training-size center crop. It is rejected
+        for training and validation modes.
     """
 
     def __init__(
@@ -143,6 +147,7 @@ class NarrPrismDataset(Dataset):
         target_variables: Optional[Sequence[str]] = None,
         scalars_dir: Optional[PathLike] = None,
         dtype: torch.dtype = torch.float32,
+        full_domain: bool = False,
     ) -> None:
         if xr is None:
             raise ImportError("xarray is required for NarrPrismDataset")
@@ -150,6 +155,12 @@ class NarrPrismDataset(Dataset):
         self.cfg = load_yaml(config_path)
         self.mode = mode
         self.dtype = dtype
+        self.full_domain = bool(full_domain)
+        if self.full_domain and mode != "inference":
+            raise ValueError(
+                "full_domain=True is reserved for inference so training and "
+                "validation spatial sampling remain unchanged"
+            )
 
         data_cfg = self.cfg.get("data", {})
         self.use_preprocessed = bool(data_cfg.get("use_preprocessed", False))
@@ -388,13 +399,20 @@ class NarrPrismDataset(Dataset):
                 f"from {regrid_cache}"
             )
 
-        # Crop size (tile) used for training. Inference crops/tiles explicitly.
-        crop_lat = int(data_cfg.get("train_crop_size_lat", 256))
-        crop_lon = int(data_cfg.get("train_crop_size_lon", 256))
-        self.crop_size: Tuple[int, int] = (
-            min(crop_lat, self.fine_shape[0]),
-            min(crop_lon, self.fine_shape[1]),
-        )
+        # Crop size (tile) used for training. The ordinary deterministic
+        # inference workflow tiles explicitly, while refinement inference can
+        # opt into one canonical full-domain sample per date. Keeping this
+        # explicit prevents validation tiles from ever being mistaken for time
+        # records without changing the established training sampler.
+        if self.full_domain:
+            self.crop_size: Tuple[int, int] = self.fine_shape
+        else:
+            crop_lat = int(data_cfg.get("train_crop_size_lat", 256))
+            crop_lon = int(data_cfg.get("train_crop_size_lon", 256))
+            self.crop_size = (
+                min(crop_lat, self.fine_shape[0]),
+                min(crop_lon, self.fine_shape[1]),
+            )
         self.training_spatial_sampling = str(
             data_cfg.get("training_spatial_sampling", "random")
         ).lower()

@@ -68,8 +68,8 @@ data:
     targets_mean: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_mean.npy
     targets_std: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_std.npy
   train_random_crop_offset:
-  - 8
-  - 8
+  - 0
+  - 0
 predictands:
   pr:
     name: pr
@@ -164,13 +164,41 @@ model:
       masks: true
     ensemble_size: 10
     loss: mse
+    reconstruction_loss_weight: 0.25
+    multiscale_loss_weight: 0.10
+    gradient_loss_weight: 0.05
+    mean_bias_loss_weight: 0.01
+    # Keep the physical ensemble mean equal to the constrained mean of the
+    # unbounded prediction; avoids memberwise-clipping Jensen wet bias.
+    nonnegative_ensemble_strategy: mean_preserving
+    residual_normalization:
+      method: standardize
+      epsilon: 1.0e-6
+      minimum_scale: 1.0e-4
+      require_fitted: true
+      # Signed-log ("symlog") compression of the precipitation residual before
+      # standardization: sign(r)*log1p(|r|/scale), exact inverse
+      # sign(z)*expm1(|z|)*scale. Precipitation residuals are heavy-tailed
+      # (a handful of extreme wet cells otherwise dominate the MSE/Huber
+      # process loss); this rebalances gradient signal toward the widespread
+      # modest boundary/southeastern-dry-bias corrections. tasmax (not a
+      # non-negative predictand) is bit-for-bit unaffected. New checkpoint
+      # schema; retrain rather than resume the *_schema2_precip_mean_fixed
+      # checkpoint.
+      signed_log_nonnegative_channels: true
+      signed_log_scale: 1.0
     seed: 1234
     flow_matching:
       integration_steps: 50
-      solver: euler
+      solver: heun
       source_distribution: gaussian
       stochastic_initialization: true
+      sigma_min: 1.0e-4
       time_sampling: logit_normal
+      logit_normal_mean: -0.5
+      logit_normal_std: 1.2
+      # Supervise the zero-source path; it is not a conditional ensemble mean.
+      mean_path_loss_weight: 0.25
     unet:
       hidden_channels: 64
       num_levels: 3
@@ -181,7 +209,7 @@ model:
 job_id: SA_T2_ACCESS-CM2_static_flow_matching_unet
 type_training: full_dataset
 batch_size: 64
-num_epochs: 10
+num_epochs: 100
 dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 5.0e-05
@@ -224,7 +252,7 @@ inference:
       boundary_width: 2
       strength: 0.1
       kernel_size: 3
-    force_full_frame: false
+    force_full_frame: true
     blend_window: hann
     blend_sigma: 0.35
     use_seam_deblocking: false
@@ -237,7 +265,7 @@ inference:
   - 32
   inference_blend_window: hann
   inference_blend_sigma: 0.35
-  force_full_frame: false
+  force_full_frame: true
   use_seam_deblocking: false
   seam_deblocking_strength: 0.1
 training:
@@ -339,5 +367,5 @@ performance:
     atomic_checkpoints: true
     netcdf_compression: true
     netcdf_compression_level: 4
-checkpoint_dir: ./experiments/refinement_checkpoints/SA_T2_ACCESS-CM2_static/flow_matching_unet
-case_name: cordex_sa_t2_access_cm2_static_flow_matching_unet
+checkpoint_dir: ./runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/SA_T2_ACCESS-CM2_static_flow_matching_unet_schema2_signed_log_fixed
+case_name: cordex_sa_t2_access_cm2_static_flow_matching_unet_schema2_signed_log_fixed

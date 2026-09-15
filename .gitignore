@@ -174,6 +174,10 @@ examples/MERRA_PRISM/scalars/
 # generated locally from large source datasets and must not be versioned.
 examples/NARR_PRISM/preprocessed/
 
+# Local run outputs, caches, and scratch scripts generated during refinement
+# validation runs (can grow to tens of GB) must not be versioned.
+/artifacts/
+
 # Binary data/model artifacts must stay out of Git
 *.nc
 *.nc4
