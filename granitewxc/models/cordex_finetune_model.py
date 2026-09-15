@@ -444,6 +444,11 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         # is byte-for-byte unchanged and no extra activations are retained.
         self._capture_features: tuple[str, ...] = ()
         self._last_phase1_features: dict[str, torch.Tensor] = {}
+        # Temporal extension (Prithvi-UNet_temporal_model). ``temporal_adapter``
+        # stays None for every legacy spatial configuration, and
+        # ``_apply_temporal_latent`` is then an exact identity.
+        self.temporal_adapter: torch.nn.Module | None = None
+        self._temporal_ctx: dict | None = None
 
         #----------- From Config
 
@@ -1183,6 +1188,13 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 mode="bilinear",
                 align_corners=False,
             )
+        # Optional temporal state injection (Prithvi-UNet_temporal_model branch).
+        # This is the U-Net bottleneck: the coarsest, cheapest latent that still
+        # carries full spatial organization. Returns ``out`` unchanged -- the same
+        # object, no arithmetic -- unless a temporal adapter has been attached and
+        # a sequence step context is active, so the legacy spatial path is
+        # bit-for-bit preserved.
+        out = self._apply_temporal_latent(out)
         for step_idx in reversed(range(self.num_upsample)):
             skip = self._ensure_on_device(copy_activations[step_idx], out.device)
             upsampled = self.upsample_layers[step_idx](out)
@@ -1240,6 +1252,39 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
 
     def clear_last_precip_hurdle_aux(self) -> None:
         self._last_precip_hurdle_aux = None
+
+    # ------------------------------------------------------------------
+    # Optional temporal latent injection (Prithvi-UNet_temporal_model)
+    # ------------------------------------------------------------------
+    def _apply_temporal_latent(self, out: torch.Tensor) -> torch.Tensor:
+        """Inject the recurrent/SSM temporal state at the U-Net bottleneck.
+
+        Returns ``out`` untouched -- literally the same tensor object, with no
+        arithmetic applied -- when no temporal adapter is attached or when no
+        sequence step context is active. Every legacy spatial configuration
+        therefore executes the identical computation it did before this branch,
+        which :func:`tests.test_temporal_legacy_parity` asserts bit-for-bit.
+
+        When active, the adapter advances its hidden state by one frame and
+        returns an additive correction to the bottleneck latent. The state is
+        read from and written back into ``self._temporal_ctx``, which the
+        sequence runner in :mod:`granitewxc.temporal.model` owns.
+        """
+        adapter = self.temporal_adapter
+        ctx = self._temporal_ctx
+        if adapter is None or ctx is None:
+            return out
+        delta, new_state = adapter(
+            out,
+            ctx.get("state"),
+            ctx.get("time_features"),
+            ctx.get("interval_ratio"),
+            reset_mask=ctx.get("reset_mask"),
+        )
+        ctx["state"] = new_state
+        if ctx.get("capture_latent"):
+            ctx.setdefault("latents", []).append(delta)
+        return out + delta
 
     # ------------------------------------------------------------------
     # Optional Phase-1 spatial-feature capture (two-phase refinement)

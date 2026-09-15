@@ -89,3 +89,53 @@ attention operates over two-dimensional spatial tokens only.
 See [docs/STOCHASTIC_REFINEMENT.md](docs/STOCHASTIC_REFINEMENT.md) for the full
 description, configuration schema, example YAMLs, commands, checkpoint
 compatibility notes, domain-runner availability and benchmarks.
+
+
+## Temporal (sequence-conditioned) extension
+
+Branch `Prithvi-UNet_temporal_model` adds **explicit temporal dependence** to the
+otherwise frame-independent model, so it learns temporally evolving temperature and
+precipitation events instead of predicting each date in isolation. Date embeddings
+alone are not sufficient and are not what this does: temporal state is carried in a
+spatially organized latent at the U-Net bottleneck by one of two interchangeable
+backends, selected by `temporal.backend`:
+
+- `recurrent` -- a multi-layer **ConvGRU** (or ConvLSTM) with dilated kernels
+- `mamba` -- a **Mamba-2 / SSD** block whose selective scan runs over the **time**
+  axis, with explicit convolutional spatial mixing
+
+The task stays *causal, same-day, sequence-conditioned downscaling*: output date
+`t` uses the coarse predictors at `t` and earlier, with **zero predictor-to-target
+lead time**. Targets are never shifted and observed high-resolution fields never
+enter the model's input path.
+
+Everything is opt-in. With `temporal.enabled: false` -- or with no `temporal:` block
+at all, which is every existing YAML -- the legacy spatial computation path is
+preserved **bit-for-bit**; a test asserts exact equality on the real
+246M-parameter SA model with real checkpoint weights. All four existing refinement
+heads and their Phase-2 checkpoints remain valid.
+
+Case configurations:
+
+| case | recurrent | mamba |
+|---|---|---|
+| SA T2 ACCESS-CM2 static | `examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_recurrent.yaml` | `..._temporal_mamba.yaml` |
+| NARR/PRISM California | `examples/NARR_PRISM/NARR_PRISM_subdomain_temporal_recurrent.yaml` | `..._temporal_mamba.yaml` |
+
+```bash
+# audit a config without loading weights
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py describe --config <yaml>
+# engineering checks on real data (parity, causality, gradients, chunk exactness)
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py check    --config <yaml>
+# fine-tune / infer / evaluate
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py train    --config <yaml>
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py infer    --config <yaml> --split test
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py evaluate --config <yaml> --predictions <npz>
+```
+
+See [docs/temporal_model_research.md](docs/temporal_model_research.md) for the
+literature review and architecture decisions,
+[docs/temporal_model_architecture.md](docs/temporal_model_architecture.md) for
+tensor shapes, causality, state management, losses and checkpoint compatibility,
+and [docs/temporal_model_results.md](docs/temporal_model_results.md) for measured
+outcomes and remaining scientific limitations.

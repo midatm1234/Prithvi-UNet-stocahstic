@@ -995,3 +995,39 @@ Run them with `mamba run -n Prithvi pytest tests/ -q`.
 ## 2026-09-09 four-option CORDEX audit
 
 The [four-option audit report](../artifacts/refinement_validation/four_option_20260909/REPORT.md) records verified fixes, all-eight paired subset results, existing-checkpoint non-regression, full-period flow diagnostics, and unresolved scientific acceptance. The short conditioning ablation does not justify promoting a new default. [Reproduction commands](../artifacts/refinement_validation/four_option_20260909/COMMANDS.md) and isolated configurations cover all four options.
+
+
+## Temporal branch compatibility
+
+Branch `Prithvi-UNet_temporal_model` adds a sequence-conditioned deterministic
+model. It does **not** change any refinement head, and the temporal deterministic
+model is a usable baseline on its own -- stochastic refinement is not a
+prerequisite for using it.
+
+All four heads (`diffusion_unet`, `diffusion_transformer`, `flow_matching_unet`,
+`flow_matching_transformer`) are reused unchanged. Compatibility is governed by one
+key:
+
+| `temporal.refinement.temporal_conditioning` | extra `cond_channels` | existing Phase-2 checkpoints |
+|---|---|---|
+| `none` (**shipped default**) | 0 | valid, byte-identical path |
+| `time_features` | +5 | invalid -- retrain Phase 2 |
+| `latent_state` | +21 | invalid -- retrain Phase 2 |
+
+Widening the conditioning changes the refiner's input projection, so the weights no
+longer describe the same model. `check_refiner_temporal_compatibility` raises with
+the exact channel counts and names the two valid actions; the existing
+`cond_channels` guard in `two_phase.py::initialize_refiner` provides the same check
+independently. Nothing is loaded partially.
+
+Refinement is **causal per date**, not whole-sequence: each date is refined
+conditioned on its temporal metadata and, optionally, the Phase-1 temporal latent,
+with the noise state carried forward. Noise is `iid_per_frame` by default
+(bit-for-bit the existing behaviour). `ar1_correlated` with `0 < rho < 1` gives each
+ensemble member a temporally coherent trajectory while keeping every frame's
+marginal exactly N(0,1), so the refiner still sees the distribution it was trained
+against. `rho = 1` (identical noise at every date) is **rejected**: it manufactures
+persistence rather than modelling it. Each member keeps its own generator *and* its
+own AR(1) state, the same contract as `ChunkNoiseSource`.
+
+See [temporal_model_architecture.md](temporal_model_architecture.md) section 10.

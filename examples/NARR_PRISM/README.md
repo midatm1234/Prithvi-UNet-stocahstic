@@ -223,3 +223,49 @@ gradient error, native-grid boundary error, and spatial block power.
   (with a same-case fallback to a legacy `data.scalar_dir/<case_name>/`) and
   raise a clear error if the per-case scalars are missing. Each entry point
   logs the active `case_name` and the exact preprocessing/scalar directories.
+
+
+## Temporal (sequence-conditioned) workflow
+
+`NARR_PRISM_subdomain_temporal_{recurrent,mamba}.yaml` add explicit temporal
+dependence to the `narr_prism_California` case. They are derived from
+`NARR_PRISM_subdomain.yaml` and preserve:
+
+- **all three targets in order -- `ppt`, `tmax`, `tmin`** (target variables come
+  from the config, never from a filename)
+- the 31 predictor channels and their ordering, including `elev` and the 16
+  predictor masks, with `num_static_channels: 0` -- elevation and masks travel in
+  the *dynamic* channel list, so no separate static tensor is split off
+- `case_name: narr_prism_California`, which is both the case identity and what
+  locates the preprocessed inputs under `preprocessed/<case_name>/<mode>/`
+- the California subset bounds, the Gregorian daily calendar, `scalars_with_H`
+  normalization, the 1996-2013 / 2014-2015 / 2016-2025 periods, the tiled 256-px
+  training geometry with a 32-px halo, and the hurdle precipitation head
+
+Because both `tmax` and `tmin` are configured, a physical-consistency term
+penalizing `tmin > tmax` is active automatically; it contributes exactly zero for a
+consistent pair.
+
+`context_length` is 5 here rather than the SA case's 7: the PRISM crop is 256x256
+against SA's 128x128, so each frame costs ~4x as much and the U-Net bottleneck is
+32x32. `state.tbptt_chunk: 3` bounds backprop memory. See the config comments.
+
+> **Not executed end-to-end.** The NARR and PRISM archives and the
+> `narr_prism_California` Phase-1 checkpoint are not present on the machine this
+> branch was developed on (`preprocessed/` and `experiments/` are both empty). The
+> configs are schema-complete and every key in them is consumed and validated by
+> real code, and `describe` reports the missing preprocessed directory explicitly,
+> but no training or evaluation numbers exist for this case. Re-run the
+> event-alignment diagnostic before drawing scientific conclusions.
+
+```bash
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_temporal.py describe \
+    --config examples/NARR_PRISM/NARR_PRISM_subdomain_temporal_recurrent.yaml \
+    --splits train validation test
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_temporal.py check    --config <yaml>
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_temporal.py train    --config <yaml>
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_temporal.py infer    --config <yaml> --split test
+mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_temporal.py evaluate --config <yaml> --predictions <npz>
+```
+
+Outputs go to `runs_temporal/`, so the existing `experiments/` tree is untouched.

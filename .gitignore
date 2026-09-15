@@ -178,6 +178,12 @@ examples/NARR_PRISM/preprocessed/
 # validation runs (can grow to tens of GB) must not be versioned.
 /artifacts/
 
+# Temporal-branch (Prithvi-UNet_temporal_model) experiment outputs: migrated and
+# fine-tuned checkpoints, prediction NetCDF/npz, and per-run logs. Generated
+# locally and several GB per run. The measured results and the machine-readable
+# scorecard values are recorded in docs/temporal_model_results.md instead.
+examples/*/runs_temporal/
+
 # Binary data/model artifacts must stay out of Git
 *.nc
 *.nc4

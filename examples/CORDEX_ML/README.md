@@ -895,3 +895,60 @@ When extending this workflow to new regions or datasets:
 4. Verify that `input_vars`, `input_levels`, `output_vars`, and `static_path` match your data
 5. Optionally adjust `batch_size`, `num_epochs`, `learning_rate`, and step limits based on GPU memory and desired iteration speed
 6. Store predictions in a consistent NetCDF format with metadata for reproducibility
+
+
+## Temporal (sequence-conditioned) workflow -- SA case
+
+`SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_{recurrent,mamba}.yaml`
+add explicit temporal dependence to the SA T2 ACCESS-CM2 static case. They are
+derived from `SA_T2_ACCESS-CM2_static_diffusion_unet.yaml` and preserve its
+predictor/target variables and ordering, static orography, 128x128 grid, data
+paths, calendar, normalization scalers and model geometry. The two files differ in
+exactly one semantic key (`temporal.backend`) plus output paths, so a backend
+comparison is not confounded; `tests/test_temporal_configs.py` asserts this.
+
+New relative to the source config:
+
+- an explicit, non-overlapping `temporal_splits:` block -- train 1961-1976,
+  validation 1977-1980, and a genuinely held-out test period 1981-2000 taken from
+  `SA_domain/test/historical/predictors/perfect`. The source config left
+  `test_*_paths` empty and pointed train and validation at the same file.
+- the `temporal:` block
+
+Two data facts this workflow handles explicitly, both verified against the files:
+
+- The SA training file's time axis is **not contiguous**. It has 12
+  discontinuities: ten 2-day gaps where 29 February was removed (landing exactly on
+  1 March of 1964/68/72/76/80 and 2080/84/88/92/96) plus one 36,160-day jump
+  between the historical and end-century blocks. Sequence windows are cut at every
+  one of them.
+- The held-out test files pair a **365-day** predictor axis (7300 records) with a
+  **Gregorian** target axis (7305). These are joined by exact timestamp, never by
+  position.
+
+Event alignment was verified before enabling supervised sequence training:
+domain-mean deseasonalized `t_850` vs `tasmax` anomaly correlation peaks sharply at
+lag 0 (r = 0.95), so this is a perfect-model pairing and date-paired metrics are
+valid. For the free-running 2041-2060 / 2080-2099 application, evaluate with
+`--not-event-aligned` so only distributional, persistence and extreme-value
+diagnostics are reported.
+
+```bash
+# data diagnostics: event alignment, history headroom, target persistence
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_diagnostics.py \
+    --config examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_recurrent.yaml
+
+# describe / check / train / infer / evaluate
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py describe --config <yaml> --splits train validation test
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py check    --config <yaml> --split validation
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py train    --config <yaml>
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py infer    --config <yaml> --split test
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py evaluate --config <yaml> --predictions <npz>
+
+# five-variant bounded comparison with pre-registered acceptance tolerances
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_experiment.py \
+    --steps 600 --val-steps 60 --epochs 1 --test-years 3
+```
+
+Notebook: `notebooks/SA_downscaling_temporal_T2_ACCESS-CM2_static.ipynb`.
+Outputs go to `runs_temporal/`, so nothing under `runs/` is touched.
