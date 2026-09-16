@@ -1,0 +1,47 @@
+# Corrected native positive input-time convention; separate bounded audit.
+experiment: regional_rollout_pair_transfer_v2
+base_config: examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair.yaml
+foundation:
+  path: D:/Prithvi-WxC/data/weights/large_rollout/prithvi.wxc.rollout.2300m.v1.pt
+  source: https://huggingface.co/Prithvi-WxC/prithvi.wxc.rollout.2300m.v1
+  revision: 53cce4de1e1500dbce42283eae6242e73f60f8a1
+  sha256: e66ef85d4e404465a5359b729f115d4bd7a5c5e8016c7b86b5f773d72cef8efa
+initialization: pretrained
+history_mode: observed
+seed: 173
+learning_rate: 0.0001
+atmospheric_indices:
+- 0
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
+- 10
+- 11
+- 12
+- 13
+- 14
+token_grid:
+- 8
+- 8
+local_grid:
+- 2
+- 2
+semantics:
+  predictor_interval_hours: 24
+  predictor_time_statistic: daily means
+  downscaling_lead_hours: 0
+  normalization: immutable original Phase-1 per-variable scalers
+  native_merra2_input: false
+  geometry: regional average-pooled 8x8 tokens; 2x2 local blocks; new relative regional
+    coordinates
+  excluded: native patch embedding, MERRA-2 scalers, all but first local/global transformer
+    pair, decoder
+  limitation: Rollout source trained with 6-hour inputs and lead; daily regional reduced-variable
+    adaptation is experimental.
+  native_input_time_sign: positive current-minus-history, matching upstream SampleSpec

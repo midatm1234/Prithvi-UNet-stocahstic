@@ -1,0 +1,559 @@
+# Optional extended development run; NOT launched by asset generation.
+# Distinct from the frozen-encoder 600-update comparison.
+# Epochs 4/10 unfreeze encoder/backbone at scaled group rates.
+# Existing Adam state is retained; immutable physical scalers stay frozen.
+# Use --max-steps to cap actual optimizer updates per epoch.
+data:
+  type: narr_prism
+  predictor_dir: /data2/NARR/data/subset
+  target_dir: /data/PRISM/prism_daily_800m_an
+  target_variables:
+  - ppt
+  - tmax
+  - tmin
+  predictor_variables:
+    shum:
+    - 500
+    - 700
+    - 850
+    uwnd:
+    - 500
+    - 700
+    - 850
+    vwnd:
+    - 500
+    - 700
+    - 850
+    air:
+    - 500
+    - 700
+    - 850
+    hgt:
+    - 500
+    - 700
+    - 850
+  static_elevation_file: ./examples/NARR_PRISM/prism_elevation.nc
+  static_elevation_var: null
+  input_vars:
+  - shum_500
+  - shum_700
+  - shum_850
+  - uwnd_500
+  - uwnd_700
+  - uwnd_850
+  - vwnd_500
+  - vwnd_700
+  - vwnd_850
+  - air_500
+  - air_700
+  - air_850
+  - hgt_500
+  - hgt_700
+  - hgt_850
+  - elev
+  - mask_shum_500
+  - mask_shum_700
+  - mask_shum_850
+  - mask_uwnd_500
+  - mask_uwnd_700
+  - mask_uwnd_850
+  - mask_vwnd_500
+  - mask_vwnd_700
+  - mask_vwnd_850
+  - mask_air_500
+  - mask_air_700
+  - mask_air_850
+  - mask_hgt_500
+  - mask_hgt_700
+  - mask_hgt_850
+  - mask_elev
+  input_levels:
+  - 1
+  input_surface_vars: []
+  vertical_pres_vars:
+  - shum_500
+  - shum_700
+  - shum_850
+  - uwnd_500
+  - uwnd_700
+  - uwnd_850
+  - vwnd_500
+  - vwnd_700
+  - vwnd_850
+  - air_500
+  - air_700
+  - air_850
+  - hgt_500
+  - hgt_700
+  - hgt_850
+  - elev
+  - mask_shum_500
+  - mask_shum_700
+  - mask_shum_850
+  - mask_uwnd_500
+  - mask_uwnd_700
+  - mask_uwnd_850
+  - mask_vwnd_500
+  - mask_vwnd_700
+  - mask_vwnd_850
+  - mask_air_500
+  - mask_air_700
+  - mask_air_850
+  - mask_hgt_500
+  - mask_hgt_700
+  - mask_hgt_850
+  - mask_elev
+  input_level_pres:
+  - 1
+  vertical_level1_vars: []
+  input_level1: []
+  vertical_level2_vars: []
+  input_level2: []
+  other: []
+  output_vars:
+  - ppt
+  - tmax
+  - tmin
+  use_static: true
+  use_preprocessed: true
+  preprocessed_dir: ./examples/NARR_PRISM/preprocessed
+  scalar_dir: ./examples/NARR_PRISM/scalars_with_H
+  scalers:
+    inputs_mean: ./examples/NARR_PRISM/scalars_with_H/inputs_mean.npy
+    inputs_std: ./examples/NARR_PRISM/scalars_with_H/inputs_std.npy
+    targets_mean: ./examples/NARR_PRISM/scalars_with_H/targets_mean.npy
+    targets_std: ./examples/NARR_PRISM/scalars_with_H/targets_std.npy
+  train_crop_size_lat: 256
+  train_crop_size_lon: 256
+  training_spatial_sampling: tiled
+  training_tile_stride_lat: 192
+  training_tile_stride_lon: 192
+  training_halo_lat: 32
+  training_halo_lon: 32
+  min_valid_target_fraction: 0.0001
+  max_crop_retries: 32
+  skip_empty_target_tiles: true
+  n_input_timestamps: 2
+  regrid_method: linear
+  scalar_stride: 1
+  spatial_subset:
+    enabled: true
+    lat_min: 32.55
+    lat_max: 41.075
+    lon_min: -124.45
+    lon_max: -115.925
+dates:
+  training:
+    start: '1996-01-01'
+    end: '2013-12-31'
+  validation:
+    start: '2014-01-01'
+    end: '2015-12-31'
+  inference:
+    start: '2016-01-01'
+    end: '2025-12-31'
+normalization:
+  predictor_method: standardize
+  predictor_mode: global
+  target_method: per_variable
+predictands:
+  ppt:
+    name: ppt
+    allow_negative_value: false
+    nonnegativity:
+      enabled: true
+      method: softplus
+    scaling:
+      method: divide_only
+      scale_stat: p95
+      fixed_scale: null
+    normalization:
+      method: divide_only
+      mode: global
+      eps_std: 1.0e-06
+      allow_negative_value: false
+  tmax:
+    name: tmax
+    allow_negative_value: false
+    nonnegativity:
+      enabled: false
+      method: none
+    scaling:
+      method: zscore
+      scale_stat: mean
+      fixed_scale: null
+    normalization:
+      method: standardize
+      mode: gridpoint
+      eps_std: 1.0e-06
+  tmin:
+    name: tmin
+    allow_negative_value: false
+    nonnegativity:
+      enabled: false
+      method: none
+    scaling:
+      method: zscore
+      scale_stat: mean
+      fixed_scale: null
+    normalization:
+      method: standardize
+      mode: gridpoint
+      eps_std: 1.0e-06
+model:
+  input_mu: ./examples/NARR_PRISM/scalars_with_H/inputs_mean.npy
+  input_sigma: ./examples/NARR_PRISM/scalars_with_H/inputs_std.npy
+  target_mu: ./examples/NARR_PRISM/scalars_with_H/targets_mean.npy
+  target_sigma: ./examples/NARR_PRISM/scalars_with_H/targets_std.npy
+  token_size:
+  - 1
+  - 1
+  embed_dim: 1024
+  n_blocks_encoder: 8
+  mlp_multiplier: 4
+  n_heads: 16
+  dropout_rate: 0.0
+  drop_path: 0.0
+  residual: none
+  num_static_channels: 0
+  downscaling_patch_size:
+  - 2
+  - 2
+  downscaling_embed_dim: 512
+  encoder_decoder_type: conv
+  encoder_decoder_upsampling_mode: bilinear
+  encoder_decoder_kernel_size_per_stage:
+  - - 3
+  - - 3
+  encoder_decoder_scale_per_stage:
+  - - 2
+  - - 3
+  encoder_decoder_conv_channels: 128
+  residual_connection: true
+  backbone_residual_mode: pre_conv_add
+  encoder_shift: false
+  unet: true
+  decoder_skip_source: dynamic
+  backbone_attention_scope: windowed_local
+  decoder_upsampling_mode: bilinear
+  output_scaler_resize_mode: bilinear
+  output_scaler_align_corners: false
+  unet_upsample_scales:
+  - 2
+  - 2
+  - 2
+  unet_decoder_kernel_size:
+  - 3
+  - 3
+  - 3
+job_id: NARR_PRISM_subdomain_temporal_prithvi_native_pair_extended_v2
+case_name: narr_prism_California
+type_training: full_dataset
+batch_size: 1
+num_epochs: 20
+dl_num_workers: 2
+dl_prefetch_size: 1
+learning_rate: 1.0e-05
+max_grad_norm: 1.0
+limit_steps_train: 100000
+limit_steps_valid: 100
+min_lr: 1.0e-06
+max_lr: 0.0001
+warm_up_steps: 0
+mask_unit_size:
+- 16
+- 16
+mask_ratio_inputs: 0.0
+mask_ratio_targets: 0.0
+max_batch_size: 4
+path_experiment: ./examples/NARR_PRISM/runs_temporal/NARR_PRISM_subdomain_temporal_prithvi_native_pair_extended_v2
+checkpoint_dir: ./examples/NARR_PRISM/runs_temporal/NARR_PRISM_subdomain_temporal_prithvi_native_pair_extended_v2/checkpoints
+run_dir: ./examples/NARR_PRISM/runs_temporal/NARR_PRISM_subdomain_temporal_prithvi_native_pair_extended_v2/runs
+path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET.pt
+backbone_use: true
+backbone_freeze: false
+backbone_prefix: encoder.
+finetune_w_static: false
+strict_matching: false
+device_target: cuda
+distributed_strategy: none
+fsdp_precision: bf16
+fsdp_min_num_params: 5000000
+backbone_gradient_checkpointing: true
+skip_activation_offload: true
+training:
+  distributed: none
+  num_gpus: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 32
+  auto_resume_if_checkpoint_exists: false
+gradient_accumulation_steps: 32
+loss:
+  base: rmse
+  predictands:
+    ppt:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: true
+        bins: 100
+    tmax:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: false
+        bins: 100
+    tmin:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: false
+        bins: 100
+  spatial_gradient:
+    enabled: true
+    weight: 0.03
+    predictands:
+      tmax: 1.0
+      tmin: 1.0
+      ppt: 0.25
+    precipitation_wet_only: true
+    precipitation_wet_threshold: 0.1
+  use_gradient_loss: true
+  gradient_loss_weight: 0.03
+  use_tv_loss: false
+  tv_loss_weight: 0.0005
+  use_multiscale_loss: true
+  multiscale_loss_weight: 0.015
+  tv:
+    enabled: false
+    weight: 0.0005
+    predictands:
+      ppt: 0.1
+      tmax: 0.3
+      tmin: 0.3
+  multiscale:
+    enabled: true
+    weight: 0.015
+    scales:
+    - 2
+    - 4
+    loss_type: l1
+  boundary_continuity:
+    enabled: true
+    weight: 0.01
+    predictands:
+      ppt: 0.2
+      tmax: 1.0
+      tmin: 1.0
+    stride_lat: 16
+    stride_lon: 16
+    match_target: true
+inference:
+  checkpoint_path: null
+  output_dir: ./examples/NARR_PRISM/runs_temporal/NARR_PRISM_subdomain_temporal_prithvi_native_pair_extended_v2/inference
+  mixed_precision: true
+  mixed_precision_dtype: bfloat16
+  boundary_mitigation:
+    enabled: true
+    tile_size:
+    - 256
+    - 256
+    overlap:
+    - 64
+    - 64
+    halo:
+    - 32
+    - 32
+    blend_mode: hann
+    deblock:
+      enabled: false
+      boundary_width: 2
+      strength: 0.1
+      kernel_size: 3
+    force_full_frame: false
+    blend_window: hann
+    blend_sigma: 0.35
+    use_seam_deblocking: false
+    seam_deblocking_strength: 0.1
+  inference_tile_size:
+  - 256
+  - 256
+  inference_overlap:
+  - 64
+  - 64
+  inference_halo:
+  - 32
+  - 32
+  inference_blend_window: hann
+  inference_blend_sigma: 0.35
+  diagnostics:
+    enabled: true
+    max_days: 1
+    predictor_channels:
+    - 0
+  force_full_frame: false
+  use_seam_deblocking: false
+  seam_deblocking_strength: 0.1
+precip_model: hurdle
+precip_wet_threshold: 0.01
+precip_occurrence_prob_threshold: 0.5
+precip_lambda_occurrence: 1.0
+precip_lambda_amount: 1.0
+precip_amount_loss_type: smoothl1
+resume_training: false
+resume_checkpoint_path: null
+auto_resume_if_checkpoint_exists: false
+temporal:
+  enabled: true
+  backend: native_pair
+  mode: downscaling
+  causal: true
+  lead_time_days: 0.0
+  cadence_days: 1.0
+  context_length: 5
+  warmup_length: 1
+  output_length: 4
+  sequence_stride: 4
+  state:
+    init: zeros
+    reset_on_discontinuity: true
+    carry_across_windows: false
+    detach_between_chunks: true
+    tbptt_chunk: 3
+  time_features:
+    include_hour_of_day: auto
+    include_lead_time: false
+  latent:
+    site: bottleneck
+    hidden_channels: 256
+    adapter_init_gate: 0.001
+    norm: group
+    groups: 8
+    time_feature_hidden: 64
+  recurrent:
+    cell: convgru
+    kernel_size: 3
+    num_layers: 2
+    dilations:
+    - 1
+    - 2
+  mamba:
+    implementation: reference
+    d_state: 16
+    d_conv: 4
+    expand: 2
+    n_layers: 2
+    headdim: 32
+    spatial_mixing: conv3x3
+    scan_axis: time
+    time_scale_from_metadata: true
+    dt_min: 0.001
+    dt_max: 0.1
+  native_pair:
+    history_offsets:
+    - 1
+    history_mode: real
+    time_conditioning: true
+    time_conditioning_gate_init: 0.001
+    pretext:
+      masked_reconstruction:
+        enabled: false
+        weight: 0.0
+        mask_ratio: 0.5
+      transition:
+        enabled: false
+        weight: 0.0
+        lead_steps: 1
+      head_hidden: 128
+  init_from_spatial_checkpoint: ./examples/NARR_PRISM/experiments/checkpoints/narr_prism_California/last.ckpt
+  resume_from_temporal_checkpoint: null
+  freeze:
+    backbone: true
+    encoder: true
+    decoder: false
+    unfreeze_schedule:
+    - epoch: 4
+      modules:
+      - encoder
+      lr_scale: 0.1
+    - epoch: 10
+      modules:
+      - backbone
+      lr_scale: 0.05
+    lr_temporal: 0.0002
+    lr_decoder: 5.0e-05
+    lr_encoder: 1.0e-05
+    lr_backbone: 1.0e-06
+  losses:
+    per_frame_weight: 1.0
+    predictand_weights:
+      ppt: 1.0
+      tmax: 1.0
+      tmin: 1.0
+    tendency:
+      enabled: true
+      weight: 0.15
+      normalize_by_interval: true
+      predictands:
+        ppt: 0.5
+        tmax: 1.0
+        tmin: 1.0
+    accumulation:
+      enabled: true
+      weight: 0.1
+      windows:
+      - 3
+      - 5
+      predictands:
+      - ppt
+    occurrence:
+      enabled: true
+      weight: 0.05
+      variable: ppt
+      wet_threshold: 1.0
+      transition_weight: 0.5
+      softness: 0.5
+    lag_autocorr:
+      enabled: false
+      weight: 0.0
+      lags:
+      - 1
+      - 2
+      min_samples: 512
+  refinement:
+    temporal_conditioning: none
+    noise: iid_per_frame
+    noise_rho: 0.0
+    ensemble_size: 1
+    per_member_state: true
+  inference:
+    chunk_length: 32
+    chunk_warmup: 5
+    carry_state_across_chunks: true
+    write_netcdf: true
+    output_dir: ./examples/NARR_PRISM/runs_temporal/NARR_PRISM_subdomain_temporal_prithvi_native_pair_extended_v2/inference
+  evaluation:
+    event_paired: true
+    wet_threshold: 1.0
+    autocorr_lags:
+    - 1
+    - 2
+    - 3
+    - 5
+    accumulation_windows:
+    - 3
+    - 5
+    deseasonalize: true
+    boundary_width: 8
+    block_bootstrap_length: 30
+    n_bootstrap: 500
+  seed: 1234

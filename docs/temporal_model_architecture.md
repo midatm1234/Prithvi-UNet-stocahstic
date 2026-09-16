@@ -1,3 +1,11 @@
+> **2026-09-15 takeover correction.** The historical experiments and verdicts below
+> are preserved. The later native-pair audit found frozen historical weights,
+> mutable normalization, dropped partial accumulation, and a missing quantile
+> guardrail. See [current takeover evidence](temporal_codex_handoff.md),
+> [native/NARR corrections](temporal_native_correctness_takeover.md), and
+> [pretrained provenance](temporal_pretrained_transfer_takeover.md).
+> Architectural history gains and verified pretrained transfer are separate claims.
+
 # Temporal Prithvi-UNet: architecture, tensor shapes, and contracts
 
 Branch `Prithvi-UNet_temporal_model`, based on `Prithvi-UNet-stochastic_refinement`

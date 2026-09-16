@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, MutableMapping, Sequence
 
@@ -71,7 +72,7 @@ def _coerce_mapping(value: Any) -> dict[str, Any]:
 
 
 def _warn(message: str) -> None:
-    print(f"[predictands] {message}")
+    warnings.warn(f"[predictands] {message}", UserWarning, stacklevel=2)
 
 
 def canonicalize_scaling_method(value: Any) -> str:

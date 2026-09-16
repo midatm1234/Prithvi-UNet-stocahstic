@@ -11,6 +11,81 @@ from PrithviWxC.model import PrithviWxCEncoderDecoder
 
 
 
+
+def extract_pretrained_state(payload):
+    """Extract downstream and official foundation checkpoint layouts."""
+    from collections.abc import Mapping
+    if isinstance(payload, Mapping):
+        for key in ("model", "model_state", "state_dict", "model_state_dict"):
+            if isinstance(payload.get(key), Mapping):
+                return dict(payload[key])
+        if payload and all(torch.is_tensor(v) for v in payload.values()):
+            return dict(payload)
+    raise ValueError("Unrecognized pretrained checkpoint: expected a tensor state dictionary")
+
+
+def audited_pretrained_load(model, weights, *, backbone_prefix="backbone.",
+                            require_backbone=False, strict=False,
+                            exclude_scalers=True):
+    """Report exact-shape parameter coverage separately from buffers.
+
+    New transfer configurations require_backbone=True. A selected component also
+    uses strict=True. No dimensional slicing or implicit reshaping occurs.
+    Rejection happens before mutation. Legacy partial loading warns prominently.
+    """
+    import warnings
+    state = model.state_dict()
+    expected_module = bool(state) and all(k.startswith("module.") for k in state)
+    normalized = {}
+    for key, value in weights.items():
+        if not torch.is_tensor(value):
+            raise ValueError(f"Non-tensor pretrained state entry: {key}")
+        key = key.removeprefix("module.")
+        normalized[("module." if expected_module else "") + key] = value
+    parameters = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+    fixed = {k for k in state if "scalers" in k}
+    learned = {k: v for k, v in parameters.items() if k not in fixed}
+    backbone = {k: v for k, v in learned.items()
+                if k.removeprefix("module.").startswith(backbone_prefix)}
+    matched, mismatch, excluded, unexpected = {}, {}, [], []
+    for key, value in normalized.items():
+        if exclude_scalers and key in fixed:
+            excluded.append(key)
+        elif key not in state:
+            unexpected.append(key)
+        elif state[key].shape != value.shape:
+            mismatch[key] = {"checkpoint": list(value.shape), "model": list(state[key].shape)}
+        else:
+            matched[key] = value
+    def coverage(items):
+        total = sum(v.numel() for v in items.values())
+        loaded = sum(v.numel() for k, v in items.items() if k in matched)
+        return {"loaded_numel": loaded, "total_numel": total,
+                "fraction": loaded / total if total else None,
+                "matched_keys": [k for k in items if k in matched]}
+    report = {
+        "matched_keys": list(matched), "shape_mismatch": mismatch,
+        "excluded_keys": excluded, "unexpected_keys": unexpected,
+        "missing_keys": [k for k in state if k not in matched and k not in excluded],
+        "learned_parameters": coverage(learned), "buffers": coverage(buffers),
+        "fixed_normalization_parameters": coverage({k: v for k, v in parameters.items() if k in fixed}),
+        "backbone_parameters": coverage(backbone), "adaptations": [],
+    }
+    if require_backbone and report["backbone_parameters"]["loaded_numel"] == 0:
+        raise ValueError("Claimed pretrained transfer loaded zero compatible backbone parameters; "
+                         f"{len(mismatch)} shape mismatches. Check checkpoint width and prefix.")
+    if strict and (mismatch or unexpected or report["missing_keys"]):
+        raise ValueError(f"Incomplete pretrained component load: {report}")
+    if backbone and report["backbone_parameters"]["loaded_numel"] == 0:
+        warnings.warn("ZERO pretrained backbone parameters loaded. Current checkpoint/model "
+                      "shapes are incompatible; this says nothing about historical Phase-1 "
+                      "initialization. See model.pretrained_load_report.", RuntimeWarning)
+    model.load_state_dict(matched, strict=False)
+    model.pretrained_load_report = report
+    return report
+
+
 def _as_int_list(value, default: list[int]) -> list[int]:
     if value is None:
         return list(default)
@@ -118,12 +193,27 @@ def get_scalers(config: ExperimentConfig):
                     )
 
         static_channels = int(getattr(config.model, "num_static_channels", 1))
-        # number of dynamic predictor channels (time * vars * levels)
-        n_dynamic = (
-            len(config.data.input_vars)
-            * len(config.data.input_levels)
-            * max(1, int(getattr(config.data, "n_input_timestamps", 1)))
-        )
+        # Number of dynamic predictor channels PER TIMESTAMP (vars * levels).
+        #
+        # Deliberately not multiplied by ``n_input_timestamps``. The input
+        # scalers are per-parameter statistics that the model broadcasts *over*
+        # the native time axis:
+        #
+        #     x_sep_time = batch['x'].view(B, n_input_timestamps, -1, H, W)
+        #     x_scale = (x_sep_time - input_mu.unsqueeze(1)) / (...)
+        #
+        # (``granitewxc/models/cordex_finetune_model.py``). ``input_mu`` must
+        # therefore have one entry per parameter, not per parameter-and-timestamp;
+        # the same statistics apply to every timestamp because it is the same
+        # variable observed at a different date. Multiplying here made
+        # ``n_input_timestamps > 1`` fail two ways at once: the channel count no
+        # longer matched ``n_dynamic + static_channels``, so the static scalers
+        # silently fell back to mu=0 / sigma=1 (destroying the orography
+        # normalization -- measured sigma 576.94 -> 1.0 on the SA case), and the
+        # surviving scaler vector then mis-broadcast against the 5-D tensor. This
+        # is a no-op for every configuration shipped in this repository, all of
+        # which set ``n_input_timestamps: 1``.
+        n_dynamic = len(config.data.input_vars) * len(config.data.input_levels)
 
         if static_channels <= 0:
             input_mu = input_mu_full[:n_dynamic]

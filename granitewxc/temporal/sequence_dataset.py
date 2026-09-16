@@ -339,6 +339,8 @@ class TemporalSequenceDataset(Dataset):
                 min(int(crop_size[1]), self._fine_shape[1]),
             )
         self._full_frame = self.crop_size == self._fine_shape
+        self.spatial_tiles = tuple(getattr(source, "spatial_tiles", ()) or ())
+        self._tiles_per_window = max(1, len(self.spatial_tiles))
 
     # -- introspection ----------------------------------------------------
     def describe(self) -> dict[str, Any]:
@@ -353,6 +355,8 @@ class TemporalSequenceDataset(Dataset):
             "run_length_min": min(run_lengths) if run_lengths else 0,
             "run_length_max": max(run_lengths) if run_lengths else 0,
             "n_windows": len(self.windows),
+            "n_sequence_samples": len(self),
+            "tiles_per_window": self._tiles_per_window,
             "window_length": self.window_length,
             "stride": self.stride,
             "crop_size": list(self.crop_size),
@@ -377,10 +381,10 @@ class TemporalSequenceDataset(Dataset):
     def unique_emission_plan(self, output_length: int) -> list[tuple[int, tuple[int, ...]]]:
         """Assign each date to exactly one window.
 
-        Returns ``[(window_index, frame_offsets), ...]`` such that every date in
-        the split is emitted exactly once. This is what the evaluator iterates so
-        overlapping windows cannot inflate the sample count (and thereby shrink
-        the apparent confidence intervals).
+        Returns ``[(sample_index, frame_offsets), ...]`` such that every date is
+        emitted once per spatial tile. For untiled sources this is once for the
+        domain. Tiled outputs must be spatially blended before temporal scoring;
+        overlapping tiles are not independent date observations.
         """
         claimed: set[tuple[int, int, int]] = set()
         plan: list[tuple[int, tuple[int, ...]]] = []
@@ -394,18 +398,21 @@ class TemporalSequenceDataset(Dataset):
                 claimed.add(key)
                 offsets.append(local)
             if offsets:
-                plan.append((w_idx, tuple(offsets)))
+                for tile_index in range(self._tiles_per_window):
+                    plan.append((w_idx * self._tiles_per_window + tile_index, tuple(offsets)))
         return plan
 
     # -- torch Dataset ----------------------------------------------------
     def __len__(self) -> int:
-        return len(self.windows)
+        return len(self.windows) * self._tiles_per_window
 
     def set_epoch(self, epoch: int) -> None:
         """Re-key the crop generator so crops vary across epochs, reproducibly."""
         self.epoch = int(epoch)
 
     def _select_crop(self, window_index: int) -> tuple[slice, slice]:
+        if self.spatial_tiles:
+            return self.spatial_tiles[window_index % self._tiles_per_window]
         h, w = self.crop_size
         fh, fw = self._fine_shape
         if self._full_frame:
@@ -423,16 +430,22 @@ class TemporalSequenceDataset(Dataset):
         return slice(lat0, lat0 + h), slice(lon0, lon0 + w)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        window = self.windows[index]
+        window = self.windows[index // self._tiles_per_window]
         lat_slice, lon_slice = self._select_crop(index)
 
         xs: list[torch.Tensor] = []
         ys: list[torch.Tensor] = []
         masks: list[torch.Tensor] = []
         static: torch.Tensor | None = None
+        geometry: dict[str, torch.Tensor] = {}
 
         for frame in window.frames:
             loaded = self.source.load_frame(frame, lat_slice, lon_slice)
+            for key in ("__scaler_offset", "__input_scaler_offset", "__output_scaler_offset", "__output_crop"):
+                if key in loaded:
+                    if key in geometry and not torch.equal(geometry[key], loaded[key]):
+                        raise ValueError(f"Sequence dates must share one geometry: {key} changed.")
+                    geometry[key] = loaded[key]
             x = loaded["x"]
             if self.static_channels > 0:
                 dynamic = x[: x.shape[0] - self.static_channels]
@@ -495,6 +508,7 @@ class TemporalSequenceDataset(Dataset):
                 int(self.crop_size[1]),
             ],
         }
+        sample.update(geometry)
         if static is not None:
             sample["static_x"] = static
             sample["static_y"] = static.clone()

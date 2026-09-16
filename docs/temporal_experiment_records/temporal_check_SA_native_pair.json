@@ -1,0 +1,80 @@
+{
+  "config": "examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair.yaml",
+  "device": "cuda",
+  "time_features": {
+    "dim": 5,
+    "names": [
+      "season_sin",
+      "season_cos",
+      "log_gap_excess",
+      "is_sequence_start",
+      "state_age"
+    ]
+  },
+  "migration": {
+    "source": "./examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/phase1_unet/best.ckpt",
+    "kind": "spatial_init",
+    "n_loaded": 208,
+    "missing_temporal": [
+      "temporal_adapter.time_conditioning.gate",
+      "temporal_adapter.time_conditioning.input_time_embedding.weight",
+      "temporal_adapter.time_conditioning.input_time_embedding.bias",
+      "temporal_adapter.time_conditioning.lead_time_embedding.weight",
+      "temporal_adapter.time_conditioning.lead_time_embedding.bias"
+    ],
+    "missing_other": [],
+    "unexpected": [],
+    "shape_mismatch": [],
+    "contract_problems": [],
+    "checkpoint_epoch": 9,
+    "checkpoint_global_step": 4570,
+    "trained_temporal_steps": 0
+  },
+  "temporal_parameters": 2048,
+  "legacy_parity_gate_zero": {
+    "bitwise_identical": true,
+    "max_abs_diff": 0.0
+  },
+  "near_identity_default_gate": {
+    "gate": 0.001,
+    "gate_key": "temporal.native_pair.time_conditioning_gate_init",
+    "mean_relative_deviation": 1.4276398360379972e-05
+  },
+  "gradient_flow": {
+    "n_temporal_tensors": 5,
+    "n_zero_gradient": 1,
+    "zero_gradient_examples": [
+      "temporal_adapter.time_conditioning.lead_time_embedding.weight"
+    ],
+    "expected_dead": [
+      "temporal_adapter.time_conditioning.lead_time_embedding.weight"
+    ],
+    "unexpected_dead": [],
+    "history_half_receives_gradient": true
+  },
+  "causality": {
+    "earlier_frames_bitwise_unchanged": true,
+    "last_frame_changed": true
+  },
+  "history_sensitivity": {
+    "note": "temporal contribution temporarily amplified to measure that the pathway is wired, not to measure accuracy",
+    "max_abs_change_final_frame": 100.73794555664062,
+    "field_scale": 151.82632446289062,
+    "time_features_identical": true
+  },
+  "chunk_consistency": {
+    "n_frames": 12,
+    "chunks": {
+      "12": {
+        "max_abs_diff": 0.0,
+        "reference": true
+      },
+      "4": {
+        "max_abs_diff": 0.0,
+        "reference": false
+      }
+    },
+    "max_abs_diff_overall": 0.0,
+    "exact": true
+  }
+}

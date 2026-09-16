@@ -97,12 +97,30 @@ Branch `Prithvi-UNet_temporal_model` adds **explicit temporal dependence** to th
 otherwise frame-independent model, so it learns temporally evolving temperature and
 precipitation events instead of predicting each date in isolation. Date embeddings
 alone are not sufficient and are not what this does: temporal state is carried in a
-spatially organized latent at the U-Net bottleneck by one of two interchangeable
-backends, selected by `temporal.backend`:
+spatially organized latent, or by pairing two dates *before* the transformer.
+Three interchangeable pathways, selected by `temporal.backend`:
 
-- `recurrent` -- a multi-layer **ConvGRU** (or ConvLSTM) with dilated kernels
+- `recurrent` -- a multi-layer **ConvGRU** (or ConvLSTM) with dilated kernels,
+  carrying hidden state at the U-Net bottleneck
 - `mamba` -- a **Mamba-2 / SSD** block whose selective scan runs over the **time**
-  axis, with explicit convolutional spatial mixing
+  axis, with explicit convolutional spatial mixing, likewise at the bottleneck
+- `native_pair` -- **no new memory module.** Uses the backbone's own
+  multi-timestamp input axis, so the predictors at `t-1` and `t` are embedded
+  together and meet each other *inside* the shared transformer, exactly as
+  upstream Prithvi-WxC combines its two input states (it folds the time axis into
+  patch-embed channels before anything learned happens). Adds **32,768**
+  parameters -- 233x fewer than the ConvGRU adapter -- and costs *fewer* backbone
+  evaluations per window, because a stateless finite-history model has no warm-up
+  frames to run. Optional pretraining-aligned auxiliary objectives (masked
+  atmospheric reconstruction, atmospheric transition prediction) are available as
+  a separate, independently switchable ablation.
+
+⚠️ `native_pair` tests an **architectural** claim, not foundation-model transfer.
+This pipeline contains no Prithvi-WxC foundation weights: the configs pair
+`model.embed_dim: 1024` with an `embed_dim 2560` checkpoint, so all 170 backbone
+tensors shape-mismatch and are dropped by the loader's shape filter, and the
+transformer was trained from random initialization on the downscaling task. See
+[docs/temporal_native_pair.md](docs/temporal_native_pair.md) §2 for the measurement.
 
 The task stays *causal, same-day, sequence-conditioned downscaling*: output date
 `t` uses the coarse predictors at `t` and earlier, with **zero predictor-to-target
@@ -117,10 +135,15 @@ heads and their Phase-2 checkpoints remain valid.
 
 Case configurations:
 
-| case | recurrent | mamba |
-|---|---|---|
-| SA T2 ACCESS-CM2 static | `examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_recurrent.yaml` | `..._temporal_mamba.yaml` |
-| NARR/PRISM California | `examples/NARR_PRISM/NARR_PRISM_subdomain_temporal_recurrent.yaml` | `..._temporal_mamba.yaml` |
+| case | recurrent | mamba | native pair | native pair + pretext |
+|---|---|---|---|---|
+| SA T2 ACCESS-CM2 static | `examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_recurrent.yaml` | `..._temporal_mamba.yaml` | `..._temporal_prithvi_native_pair.yaml` | `..._temporal_prithvi_native_pair_pretext.yaml` |
+| NARR/PRISM California | `examples/NARR_PRISM/NARR_PRISM_subdomain_temporal_recurrent.yaml` | `..._temporal_mamba.yaml` | `..._temporal_prithvi_native_pair.yaml` | `..._temporal_prithvi_native_pair_pretext.yaml` |
+
+Every config runs through the same CLI below with no code edits. The NARR/PRISM
+case has **never been executed** — its archives, scalers and Phase-1 checkpoint are
+absent from the development machine — so its configs are schema-complete and
+test-validated only.
 
 ```bash
 # audit a config without loading weights
@@ -137,5 +160,50 @@ See [docs/temporal_model_research.md](docs/temporal_model_research.md) for the
 literature review and architecture decisions,
 [docs/temporal_model_architecture.md](docs/temporal_model_architecture.md) for
 tensor shapes, causality, state management, losses and checkpoint compatibility,
-and [docs/temporal_model_results.md](docs/temporal_model_results.md) for measured
-outcomes and remaining scientific limitations.
+and [docs/temporal_model_results.md](docs/temporal_model_results.md) for the
+measured outcomes of the two bottleneck backends — both of which were
+**NOT ACCEPTED** against the pre-registered criteria, a verdict that stands.
+
+For the `native_pair` pathway see
+[docs/temporal_native_pair.md](docs/temporal_native_pair.md) (mechanism, the
+checkpoint-provenance measurement, the pretext objectives, and limitations) and
+[docs/temporal_native_pair_results.md](docs/temporal_native_pair_results.md) (the
+bounded comparison and its verdict, scored by the **unchanged** pre-registered
+scorecard plus one additional capacity control).
+
+
+### Selected temporal workflow (takeover v2)
+
+Use `examples/CORDEX_ML/notebooks/Temporal_selected_training_v2.ipynb` to select
+one SA or NARR configuration and checkpoint for train, resume, infer and evaluate.
+Set `BACKEND` to `recurrent`, `mamba`, `native_pair`, or `native_pair_pretext`.
+The notebook uses each YAML's epoch count, accumulation and complete data splits;
+short-run update/validation caps are optional. All action switches default to false.
+Mamba's shipped `implementation: reference` uses the repository's PyTorch backend.
+The spatial-only `SA_downscaling_finetune_T2_ACCESS-CM2_static.ipynb` rejects temporal
+YAMLs early: its frame trainer and two-GPU FSDP setup do not implement the temporal
+workflow. The temporal notebook invokes the dedicated CLI from the repository root.
+The shared CLI accepts `train --resume CHECKPOINT` and repeated
+`--set dotted.path=YAML_value` overrides for existing configuration keys.
+`--max-steps` counts actual successful optimizer updates per epoch; microbatches
+and temporal-parameter updates are recorded separately.
+
+Optional `*_temporal_prithvi_native_pair*_extended_v2.yaml` configurations add
+20-epoch development schedules. They are not launched automatically and are
+separate from the frozen-encoder 600-update comparison. NARR retains
+`case_name: narr_prism_California`, its real NetCDF source contracts, 32 predictor
+channels, `ppt,tmax,tmin` output order, masks and hurdle precipitation.
+
+See `docs/temporal_codex_handoff.md` for current execution/evidence and
+`docs/temporal_pretrained_transfer_takeover.md` for the separate transfer path.
+Existing recurrent/Mamba results remain not accepted. Refinement interface
+compatibility does not establish calibration after changing Phase-1 predictions.
+
+
+Fourteen obsolete/standalone transfer-control YAMLs were removed from the active
+example directories. One current `*_regional_pretrained_transfer_v2.yaml` remains
+per case; select controls using `--initialization` and `--history-mode` instead.
+Archived copies and hashes: `artifacts/config_cleanup_20260915/cleanup_manifest.json`.
+The notebook generator creates no YAMLs by default; `--include-extended-configs`
+explicitly creates missing optional native training schedules. Existing experiment
+snapshots, resolved configurations, scientific recipes and outputs are preserved.

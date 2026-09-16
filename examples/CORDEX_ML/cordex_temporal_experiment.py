@@ -42,6 +42,7 @@ import json
 import os
 import sys
 import time
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,14 @@ from granitewxc.utils.config import ExperimentConfig  # noqa: E402
 
 SA_RECURRENT = "examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_recurrent.yaml"
 SA_MAMBA = "examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_mamba.yaml"
+SA_NATIVE_PAIR = (
+    "examples/CORDEX_ML/"
+    "SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair.yaml"
+)
+SA_NATIVE_PAIR_PRETEXT = (
+    "examples/CORDEX_ML/"
+    "SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair_pretext.yaml"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +109,29 @@ ACCEPTANCE: dict[str, list[tuple[str, str, str, float]]] = {
 #: temporal memory.
 MUST_BEAT = ("spatial_ft", "time_only")
 
+#: Variants that are candidates rather than controls. Everything else is scored
+#: against the baseline for information but is never "accepted".
+CANDIDATES = ("convgru", "mamba", "native_pair", "native_pair_pretext")
+
+#: Per-candidate controls required IN ADDITION to ``MUST_BEAT``. These only ever
+#: add hurdles; ``ACCEPTANCE`` and ``MUST_BEAT`` are pre-registered and unchanged.
+#:
+#: The paired-state pathway widens the patch embedding, so it has slightly more
+#: parameters than the frame-independent model. ``native_pair_nohistory`` holds
+#: that capacity fixed and removes only the information, which is the control that
+#: makes "history helped" separable from "capacity helped".
+EXTRA_MUST_BEAT: dict[str, tuple[str, ...]] = {
+    "native_pair": ("native_pair_nohistory",),
+    "native_pair_pretext": ("native_pair_nohistory", "native_pair"),
+}
+
 
 # ---------------------------------------------------------------------------
 # variants
 # ---------------------------------------------------------------------------
+SCORER_VERSION = "2.0-missing-metrics-and-dotted-keys"
+
+
 def variant_overrides() -> dict[str, dict[str, Any]]:
     """Config patches defining each variant, relative to the case YAML."""
     return {
@@ -127,6 +155,32 @@ def variant_overrides() -> dict[str, dict[str, Any]]:
         },
         "convgru": {"_source": SA_RECURRENT, "_train": True, "temporal": {}},
         "mamba": {"_source": SA_MAMBA, "_train": True, "temporal": {}},
+        # --- Prithvi-native paired state -----------------------------------
+        # Two dates enter the shared transformer together via the backbone's own
+        # multi-timestamp input axis, instead of being encoded separately and
+        # mixed afterwards by a new module. The loss configuration is byte
+        # identical to the four variants above, so this differs from them in the
+        # temporal pathway alone.
+        "native_pair": {"_source": SA_NATIVE_PAIR, "_train": True, "temporal": {}},
+        # Capacity control for the above: same architecture, same parameter
+        # count, same time metadata, but the history slot is a copy of date t. It
+        # separates "useful history" from "30,720 extra patch-embedding
+        # parameters", which the previous experiment could not do for ConvGRU's
+        # 7.6 M new parameters.
+        "native_pair_nohistory": {
+            "_source": SA_NATIVE_PAIR,
+            "_train": True,
+            "temporal": {"native_pair": {"history_mode": "duplicate_current"}},
+        },
+        # Pretraining-aligned auxiliary objectives on top of the paired pathway:
+        # masked atmospheric reconstruction and atmospheric transition
+        # prediction, both training the shared trunk. Separate variant so the
+        # objective change is never confounded with the architectural change.
+        "native_pair_pretext": {
+            "_source": SA_NATIVE_PAIR_PRETEXT,
+            "_train": True,
+            "temporal": {},
+        },
     }
 
 
@@ -141,7 +195,7 @@ def _deep_merge(base: dict, patch: dict) -> dict:
 
 
 def build_variant_config(name: str, patch: dict[str, Any], out_root: Path) -> ExperimentConfig:
-    raw = yaml.safe_load(Path(patch["_source"]).read_text(encoding="utf-8"))
+    raw = yaml.safe_load((Path(_REPO_ROOT) / patch["_source"]).read_text(encoding="utf-8"))
     applied = {k: v for k, v in patch.items() if not k.startswith("_")}
     raw = _deep_merge(raw, applied)
     run_dir = out_root / name
@@ -165,11 +219,20 @@ def build_variant_config(name: str, patch: dict[str, Any], out_root: Path) -> Ex
 # metric helpers
 # ---------------------------------------------------------------------------
 def _dig(report: dict, variable: str, path: str) -> float | None:
-    node: Any = report["variables"].get(variable)
+    node: Any = report.get("variables", {}).get(variable)
     if node is None:
         return None
-    for part in path.split("."):
-        if not isinstance(node, dict) or part not in node:
+    parts = path.split(".")
+    while parts:
+        if not isinstance(node, dict):
+            return None
+        # Metric names themselves contain dots, e.g. q0.99_bias.
+        remainder = ".".join(parts)
+        if remainder in node:
+            node = node[remainder]
+            break
+        part = parts.pop(0)
+        if part not in node:
             return None
         node = node[part]
     try:
@@ -183,7 +246,7 @@ def score_acceptance(
     baseline: dict, variant: dict, variables: list[str]
 ) -> dict[str, Any]:
     """Evaluate the pre-registered tolerances for one variant."""
-    result: dict[str, Any] = {"variables": {}, "pass_primary": True, "pass_guardrail": True}
+    result: dict[str, Any] = {"variables": {}, "pass_primary": bool(variables), "pass_guardrail": bool(variables)}
     for var in variables:
         entry: dict[str, Any] = {"primary": {}, "guardrail": {}}
         for group, checks in ACCEPTANCE.items():
@@ -193,6 +256,7 @@ def score_acceptance(
                 v = _dig(variant, var, path)
                 if b is None or v is None:
                     entry[key][label] = {"status": "unavailable", "baseline": b, "variant": v}
+                    result["pass_primary" if key == "primary" else "pass_guardrail"] = False
                     continue
                 if mode == "rel_improve":
                     denom = abs(b)
@@ -232,7 +296,7 @@ def beats_controls(
             out[control] = {"status": "unavailable"}
             continue
         per_var: dict[str, Any] = {}
-        all_ok = True
+        all_ok = bool(variables)
         for var in variables:
             checks: dict[str, Any] = {}
             for label, path, mode, _ in ACCEPTANCE["primary_temporal"]:
@@ -240,6 +304,7 @@ def beats_controls(
                 c = _dig(reports[control], var, path)
                 if v is None or c is None:
                     checks[label] = "unavailable"
+                    all_ok = False
                     continue
                 ok = abs(v) < abs(c)
                 checks[label] = {
@@ -253,13 +318,20 @@ def beats_controls(
     return out
 
 
+def assert_optimizer_budget(summary: dict, updates: int, epochs: int) -> None:
+    """A spatial control updates its decoder while temporal-update count stays zero."""
+    actual = summary.get("global_step")
+    if actual != updates * epochs:
+        raise RuntimeError(f"Actual optimizer updates {actual} differ from requested {updates * epochs}")
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="examples/CORDEX_ML/runs_temporal/experiment")
-    ap.add_argument("--steps", type=int, default=400, help="Training windows (= optimizer steps)")
+    ap.add_argument("--steps", type=int, default=400, help="Actual optimizer updates per trained variant per epoch; accumulation fixed to 1")
     ap.add_argument("--val-steps", type=int, default=60)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--test-years", type=int, default=3, help="Years of the held-out test period")
@@ -267,11 +339,30 @@ def main() -> int:
     ap.add_argument(
         "--variants",
         nargs="+",
-        default=["baseline", "spatial_ft", "time_only", "convgru", "mamba"],
+        default=[
+            "baseline",
+            "spatial_ft",
+            "time_only",
+            "native_pair",
+            "native_pair_nohistory",
+            "native_pair_pretext",
+        ],
+        help=(
+            "Variants to run, in order. The default is the paired-state experiment with "
+            "its matched controls; pass 'convgru mamba' to re-run the archived "
+            "bottleneck-adapter backends in the same directory."
+        ),
     )
     args = ap.parse_args()
+    if min(args.steps, args.val_steps, args.epochs, args.test_years) < 1:
+        ap.error("steps, val-steps, epochs and test-years must be positive")
+    unknown = set(args.variants) - set(variant_overrides())
+    if unknown or len(set(args.variants)) != len(args.variants):
+        ap.error(f"unknown or duplicate variants: {unknown or args.variants}")
 
     out_root = Path(args.out)
+    if (out_root / "manifest.json").exists():
+        raise FileExistsError(f"Preserving existing experiment {out_root}; use a new versioned directory")
     out_root.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
 
@@ -283,6 +374,10 @@ def main() -> int:
         "device": str(device),
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "training_windows": args.steps,
+        "optimizer_updates_per_epoch": args.steps,
+        "scorer_version": SCORER_VERSION,
+        "source_root": _REPO_ROOT,
+        "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "validation_windows": args.val_steps,
         "epochs": args.epochs,
         "test_period": [test_start, test_end],
@@ -294,7 +389,13 @@ def main() -> int:
             for group, checks in ACCEPTANCE.items()
         },
         "must_beat": list(MUST_BEAT),
-        "variants": {},
+        # Recorded here, before any variant runs, for the same reason the
+        # tolerances are: these are additional controls a candidate must beat, and
+        # writing them after seeing results would make them worthless.
+        "candidates": list(CANDIDATES),
+        "extra_must_beat": {k: list(v) for k, v in EXTRA_MUST_BEAT.items()},
+        "planned_variants": list(args.variants),
+        "variants": {name: {"status": "not started"} for name in args.variants},
     }
     print("=" * 78)
     print("PRE-REGISTERED ACCEPTANCE TOLERANCES (fixed before any test result is read)")
@@ -314,6 +415,11 @@ def main() -> int:
         run_dir = out_root / name
         info: dict[str, Any] = {"trained": bool(patch["_train"]), "source": patch["_source"]}
 
+        info.update(status="running", phase="training" if patch["_train"] else "inference",
+                    started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    pid=os.getpid(), configuration=str(run_dir / "resolved.yaml"))
+        manifest["variants"][name] = info
+        (out_root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         t0 = time.time()
         if patch["_train"]:
             summary = train_temporal_model(
@@ -332,6 +438,9 @@ def main() -> int:
             info["history"] = summary["history"]
             info["variable_scales"] = summary["variable_scales"]
             info["trained_temporal_steps"] = summary["trained_temporal_steps"]
+            info["training_summary"] = summary
+            info["actual_optimizer_steps"] = summary["global_step"]
+            assert_optimizer_budget(summary, args.steps, args.epochs)
             ckpt = run_dir / "checkpoints" / "best.ckpt"
             if not ckpt.is_file():
                 ckpt = run_dir / "checkpoints" / "last.ckpt"
@@ -347,6 +456,10 @@ def main() -> int:
         else:
             infer_config, infer_temporal = config, cfg
             info["checkpoint"] = cfg.init_from_spatial_checkpoint
+            info["trained_temporal_steps"] = 0
+
+        info["phase"] = "inference"
+        (out_root / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
 
         # ---- inference on the held-out test period ----
         probe = build_sequence_dataloaders(
@@ -415,6 +528,9 @@ def main() -> int:
             seams=np.array(seams, dtype=np.int64),
             output_vars=np.array(variables),
         )
+        info.update(status="completed", phase="completed", predictions=str(run_dir / "predictions.npz"),
+                    evaluation=str(run_dir / "evaluation.json"),
+                    completed_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         manifest["variants"][name] = info
         (out_root / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
 
@@ -431,19 +547,36 @@ def main() -> int:
         torch.cuda.empty_cache()
 
     # ---- scorecard ----
-    scorecard: dict[str, Any] = {"variables": variables, "variants": {}}
+    scorecard: dict[str, Any] = {"scorer_version": SCORER_VERSION, "variables": variables, "variants": {}}
     if "baseline" in reports:
         for name in args.variants:
             if name == "baseline":
                 continue
             entry = score_acceptance(reports["baseline"], reports[name], variables)
-            if name in ("convgru", "mamba"):
-                entry["versus_controls"] = beats_controls(reports, name, MUST_BEAT, variables)
+            if name in CANDIDATES:
+                # MUST_BEAT is pre-registered and is applied unchanged. Candidates
+                # that add parameters to the *input* pathway must additionally beat
+                # their own same-architecture no-history control, which is an
+                # ADDITIONAL hurdle, not a relaxation of any existing one: without
+                # it, a gain could be bought with the extra parameters rather than
+                # with the history they carry.
+                required = tuple(MUST_BEAT) + tuple(EXTRA_MUST_BEAT.get(name, ()))
+                entry["versus_controls"] = beats_controls(reports, name, required, variables)
+                entry["must_beat"] = list(required)
+                missing = [
+                    c
+                    for c in tuple(MUST_BEAT) + tuple(EXTRA_MUST_BEAT.get(name, ()))
+                    if c not in reports
+                ]
+                entry["must_beat_missing"] = missing
                 beat_all = all(
                     v.get("beats") is True for v in entry["versus_controls"].values()
                 )
                 entry["beats_all_controls"] = beat_all
-                entry["scientific_acceptance"] = bool(entry["accepted"] and beat_all)
+                # A control that was never run cannot be counted as beaten.
+                entry["scientific_acceptance"] = bool(
+                    entry["accepted"] and beat_all and not missing
+                )
             else:
                 entry["scientific_acceptance"] = None  # controls are not candidates
             scorecard["variants"][name] = entry

@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import platform
+import random
 import subprocess
 import sys
 import time
@@ -35,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -52,6 +54,8 @@ __all__ = [
     "initialize_from_spatial_checkpoint",
     "resume_temporal_checkpoint",
     "save_temporal_checkpoint",
+    "capture_rng_state",
+    "restore_rng_state",
 ]
 
 #: Prefix of every parameter/buffer introduced by the temporal extension.
@@ -243,9 +247,15 @@ class MigrationReport:
     unexpected: list[str] = field(default_factory=list)
     shape_mismatch: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = field(default_factory=list)
     contract_problems: list[str] = field(default_factory=list)
+    contract_notes: list[str] = field(default_factory=list)
     checkpoint_epoch: int | None = None
     checkpoint_global_step: int | None = None
     trained_temporal_steps: int = 0
+    #: Tensors that were deliberately reshaped to fit a wider input contract
+    #: before loading. Kept separate from ``loaded`` because an adapted tensor is
+    #: not a tensor that matched, and a reader must be able to tell which
+    #: pretrained weights were used verbatim.
+    adapted: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -257,6 +267,8 @@ class MigrationReport:
         lines = [
             f"[checkpoint] {self.kind} from {self.source}",
             f"  loaded            : {len(self.loaded)} tensor(s)",
+            f"  adapted (reshaped): {len(self.adapted)}"
+            + (f" -> {self.adapted}" if self.adapted else ""),
             f"  missing (temporal): {len(self.missing_temporal)}"
             + (f" e.g. {self.missing_temporal[:3]}" if self.missing_temporal else ""),
             f"  missing (other)   : {len(self.missing_other)}"
@@ -272,6 +284,8 @@ class MigrationReport:
                 f"step={self.checkpoint_global_step} "
                 f"trained_temporal_steps={self.trained_temporal_steps}"
             )
+        if self.contract_notes:
+            lines.extend(f"  note: {note}" for note in self.contract_notes)
         if self.contract_problems:
             lines.append("  CONTRACT PROBLEMS :")
             lines.extend(f"    - {p}" for p in self.contract_problems)
@@ -290,6 +304,7 @@ class MigrationReport:
                 for k, a, b in self.shape_mismatch
             ],
             "contract_problems": self.contract_problems,
+            "contract_notes": self.contract_notes,
             "checkpoint_epoch": self.checkpoint_epoch,
             "checkpoint_global_step": self.checkpoint_global_step,
             "trained_temporal_steps": self.trained_temporal_steps,
@@ -374,6 +389,7 @@ def initialize_from_spatial_checkpoint(
     *,
     expected_contract: CheckpointContract | None = None,
     strict_contract: bool = True,
+    n_input_timestamps: int = 1,
 ) -> MigrationReport:
     """Initialize a temporal model from a frame-independent spatial checkpoint.
 
@@ -387,6 +403,14 @@ def initialize_from_spatial_checkpoint(
     genuinely failed load: if, say, the decoder were renamed, its weights would
     show up as ``missing_other`` and this raises instead of silently training a
     randomly initialized decoder.
+
+    ``n_input_timestamps > 1`` (the ``native_pair`` pathway) widens exactly one
+    tensor -- the patch-embedding weight -- so the checkpoint's single-timestamp
+    filter is reused for date ``t`` while every history block starts at zero. The
+    widened key is recorded under ``report.adapted``, not ``report.loaded``,
+    because it is an explicit adaptation rather than a match. Nothing else in the
+    contract changes: the input scalers are per-parameter and are broadcast over
+    the time axis, so they keep their single-timestamp shape.
     """
     source = str(path)
     payload = torch.load(source, map_location="cpu", weights_only=False)
@@ -400,6 +424,23 @@ def initialize_from_spatial_checkpoint(
         )
 
     report = MigrationReport(source=source, kind="spatial_init")
+
+    if int(n_input_timestamps) > 1:
+        from granitewxc.temporal.native_pair import (
+            PATCH_EMBED_WEIGHT_KEY,
+            adapt_state_dict_for_pairs,
+        )
+
+        model_weight = model.state_dict().get(PATCH_EMBED_WEIGHT_KEY)
+        try:
+            state, adapted_keys = adapt_state_dict_for_pairs(
+                state,
+                n_timestamps=int(n_input_timestamps),
+                model_weight_shape=None if model_weight is None else tuple(model_weight.shape),
+            )
+        except ValueError as exc:
+            raise TemporalCheckpointError(f"{source}: {exc}") from exc
+        report.adapted.extend(adapted_keys)
     if isinstance(payload, Mapping):
         report.checkpoint_epoch = payload.get("epoch")
         report.checkpoint_global_step = payload.get("global_step")
@@ -430,6 +471,16 @@ def initialize_from_spatial_checkpoint(
             + report.summary()
         )
     return report
+
+
+def _native_pair_contract(model: nn.Module) -> dict[str, Any]:
+    adapter = getattr(model, "temporal_adapter", None)
+    return {
+        "history_projection": "separate_zero_initialized_conv2d_v1",
+        "predictor_channel_names": list(getattr(model, "predictor_channel_names", ())),
+        "atmospheric_channel_indices": list(getattr(adapter, "atmospheric_channel_indices", ())),
+        "atmospheric_mask_indices": list(getattr(adapter, "atmospheric_mask_indices", ())),
+    }
 
 
 def resume_temporal_checkpoint(
@@ -463,6 +514,10 @@ def resume_temporal_checkpoint(
         )
 
     problems: list[str] = []
+    if cfg.backend == "native_pair":
+        recorded_pair = stored.get("native_pair_contract")
+        if recorded_pair is not None and recorded_pair != _native_pair_contract(model):
+            problems.append("native_pair_contract: historical adaptation or atmospheric channel layout changed")
     stored_version = str(stored.get("architecture_version", ""))
     if stored_version != cfg.architecture_version:
         problems.append(
@@ -482,12 +537,45 @@ def resume_temporal_checkpoint(
         got = stored_cfg.get(key)
         if got is not None and got != want:
             problems.append(f"temporal.{key}: checkpoint {got!r} vs config {want!r}")
-    for section, current in (
-        ("latent", cfg.latent.to_dict()),
-        ("recurrent" if cfg.backend == "recurrent" else "mamba",
-         cfg.recurrent.to_dict() if cfg.backend == "recurrent" else cfg.mamba.to_dict()),
-    ):
-        stored_section = stored_cfg.get(section) or {}
+    # Compare the sub-block that actually defines the selected backend's
+    # architecture. Selecting it by name rather than by an ``if recurrent else
+    # mamba`` binary matters: with a third backend the binary would have silently
+    # validated ``native_pair`` against ``mamba``'s dict and accepted any
+    # architecture change.
+    _backend_sections: dict[str, dict[str, Any]] = {
+        "recurrent": cfg.recurrent.to_dict(),
+        "mamba": cfg.mamba.to_dict(),
+        "native_pair": cfg.native_pair.architecture_signature(),
+    }
+    if cfg.backend not in _backend_sections:
+        raise TemporalCheckpointError(
+            f"resume validation has no architecture section registered for backend "
+            f"{cfg.backend!r}; add one rather than letting it be validated against "
+            "another backend's settings."
+        )
+    sections: list[tuple[str, dict[str, Any], dict[str, Any]]] = [
+        ("latent", cfg.latent.to_dict(), stored_cfg.get("latent") or {})
+    ]
+    if cfg.backend == "native_pair":
+        # This pathway does not use the bottleneck adapter at all, so the latent
+        # block describes nothing about it and must not gate a resume. The stored
+        # block is re-parsed into a config so the comparison is signature-to-
+        # signature; comparing a signature against a raw ``to_dict()`` would find
+        # none of its keys and silently validate nothing.
+        from granitewxc.temporal.config import NativePairBackendConfig
+
+        sections = []
+        stored_pair = NativePairBackendConfig.parse(
+            stored_cfg.get("native_pair"), "checkpoint.temporal.native_pair"
+        )
+        sections.append(
+            (cfg.backend, _backend_sections[cfg.backend], stored_pair.architecture_signature())
+        )
+    else:
+        sections.append(
+            (cfg.backend, _backend_sections[cfg.backend], stored_cfg.get(cfg.backend) or {})
+        )
+    for section, current, stored_section in sections:
         for key, want in current.items():
             # ``implementation`` selects a kernel, not an architecture: a run
             # started with fused kernels may legitimately resume on reference.
@@ -507,6 +595,11 @@ def resume_temporal_checkpoint(
             )
 
     report = MigrationReport(source=source, kind="temporal_resume")
+    if cfg.backend == "native_pair" and stored.get("native_pair_contract") is None:
+        report.contract_notes.append(
+            "Native layout metadata absent; separate history projection and auxiliary head shapes "
+            "are validated by strict state keys. Channel semantics rely on the recorded configuration."
+        )
     report.contract_problems.extend(problems)
     if isinstance(payload, Mapping):
         report.checkpoint_epoch = payload.get("epoch")
@@ -547,6 +640,28 @@ def _git_provenance() -> dict[str, str | None]:
     }
 
 
+def capture_rng_state() -> dict[str, Any]:
+    """Capture process RNGs at a completed optimizer/epoch boundary."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def restore_rng_state(state: Mapping[str, Any]) -> None:
+    """Restore recorded randomness; data and auxiliary generators are separate."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    cuda = state.get("cuda") or []
+    if cuda:
+        if not torch.cuda.is_available() or len(cuda) != torch.cuda.device_count():
+            raise TemporalCheckpointError("Exact RNG resume requires the recorded CUDA device count")
+        torch.cuda.set_rng_state_all([value.cpu() for value in cuda])
+
+
 def save_temporal_checkpoint(
     path: str | os.PathLike[str],
     *,
@@ -559,6 +674,9 @@ def save_temporal_checkpoint(
     trained_temporal_steps: int,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: Any = None,
+    scaler: Any = None,
+    training_state: Mapping[str, Any] | None = None,
+    rng_state: Mapping[str, Any] | None = None,
     train_loss: float | None = None,
     val_loss: float | None = None,
     metrics: Mapping[str, Any] | None = None,
@@ -602,6 +720,7 @@ def save_temporal_checkpoint(
             "output_vars": [str(v) for v in output_vars],
             "trained_temporal_steps": int(trained_temporal_steps),
             "contract": contract.to_dict(),
+            "native_pair_contract": _native_pair_contract(model) if cfg.backend == "native_pair" else None,
         },
         "normalization": dict(normalization or {}),
         "data_provenance": dict(data_provenance or {}),
@@ -617,8 +736,14 @@ def save_temporal_checkpoint(
     }
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
-    if scheduler is not None and hasattr(scheduler, "state_dict"):
-        payload["scheduler"] = scheduler.state_dict()
+    payload["scheduler"] = (
+        scheduler.state_dict() if scheduler is not None else None
+    )
+    payload["scaler"] = scaler.state_dict() if scaler is not None else None
+    if training_state is not None:
+        payload["training_state"] = dict(training_state)
+    if rng_state is not None:
+        payload["rng_state"] = dict(rng_state)
     if extra:
         payload.update(dict(extra))
 

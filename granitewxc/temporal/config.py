@@ -380,6 +380,241 @@ class MambaBackendConfig:
 
 
 @dataclass(frozen=True)
+class NativePairPretextConfig:
+    """Pretraining-aligned auxiliary objectives for the native-pair pathway.
+
+    Both are opt-in and independently switchable, so the architectural change
+    (paired atmospheric inputs meeting inside the shared transformer) is never
+    confounded with an objective change in the same run.
+
+    ``masked_reconstruction`` masks whole mask-units of the *raw normalized
+    predictor field* -- in every input timestamp simultaneously, which is what
+    the native model does when it masks a token, because upstream folds the time
+    axis into patch-embed channels. Masking only the current timestamp would
+    leave the answer visible in the history channels, and masking only the
+    backbone input would leave it visible in the U-Net skips.
+
+    ``transition`` predicts a *later available atmospheric state* from strictly
+    earlier ones (``x[t-2d], x[t-d] -> x[t]``). Its verification state is never
+    an input to that pass. This is the forecasting half of the native mixed
+    objective, at the archive's real cadence.
+    """
+
+    masked_reconstruction_enabled: bool = False
+    masked_reconstruction_weight: float = 0.0
+    mask_ratio: float = 0.5
+    transition_enabled: bool = False
+    transition_weight: float = 0.0
+    transition_lead_steps: int = 1
+    head_hidden: int = 128
+
+    @staticmethod
+    def parse(value: Any, where: str) -> "NativePairPretextConfig":
+        data = _require_mapping(value, where)
+        allowed = {
+            "masked_reconstruction",
+            "transition",
+            "head_hidden",
+        }
+        _reject_unknown(data, allowed, where)
+
+        mr = _require_mapping(data.get("masked_reconstruction"), f"{where}.masked_reconstruction")
+        _reject_unknown(mr, {"enabled", "weight", "mask_ratio"}, f"{where}.masked_reconstruction")
+        mr_enabled = _as_bool(mr.get("enabled"), f"{where}.masked_reconstruction.enabled", False)
+        mr_weight = _as_float(
+            mr.get("weight"), f"{where}.masked_reconstruction.weight", 0.0, minimum=0.0
+        )
+        mask_ratio = _as_float(
+            mr.get("mask_ratio"), f"{where}.masked_reconstruction.mask_ratio", 0.5, minimum=0.0
+        )
+        if mask_ratio >= 1.0:
+            raise TemporalConfigError(
+                f"{where}.masked_reconstruction.mask_ratio must be < 1.0, got {mask_ratio}. "
+                "Masking every mask unit leaves the encoder no context to reconstruct from."
+            )
+        if mr_enabled and mr_weight <= 0.0:
+            raise TemporalConfigError(
+                f"{where}.masked_reconstruction.enabled is true but weight is {mr_weight}. "
+                "Set a positive weight or disable the objective; a zero-weight term "
+                "costs a full extra forward pass and contributes nothing."
+            )
+        if mr_enabled and mask_ratio <= 0.0:
+            raise TemporalConfigError(
+                f"{where}.masked_reconstruction.enabled is true but mask_ratio is {mask_ratio}. "
+                "Nothing would be masked, so the term would reduce to an identity copy."
+            )
+
+        tr = _require_mapping(data.get("transition"), f"{where}.transition")
+        _reject_unknown(tr, {"enabled", "weight", "lead_steps"}, f"{where}.transition")
+        tr_enabled = _as_bool(tr.get("enabled"), f"{where}.transition.enabled", False)
+        tr_weight = _as_float(tr.get("weight"), f"{where}.transition.weight", 0.0, minimum=0.0)
+        lead_steps = _as_int(tr.get("lead_steps"), f"{where}.transition.lead_steps", 1, minimum=1)
+        if tr_enabled and tr_weight <= 0.0:
+            raise TemporalConfigError(
+                f"{where}.transition.enabled is true but weight is {tr_weight}. "
+                "Set a positive weight or disable the objective."
+            )
+
+        return NativePairPretextConfig(
+            masked_reconstruction_enabled=mr_enabled,
+            masked_reconstruction_weight=mr_weight,
+            mask_ratio=mask_ratio,
+            transition_enabled=tr_enabled,
+            transition_weight=tr_weight,
+            transition_lead_steps=lead_steps,
+            head_hidden=_as_int(data.get("head_hidden"), f"{where}.head_hidden", 128, minimum=8),
+        )
+
+    @property
+    def any_enabled(self) -> bool:
+        return bool(self.masked_reconstruction_enabled or self.transition_enabled)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "masked_reconstruction": {
+                "enabled": self.masked_reconstruction_enabled,
+                "weight": self.masked_reconstruction_weight,
+                "mask_ratio": self.mask_ratio,
+            },
+            "transition": {
+                "enabled": self.transition_enabled,
+                "weight": self.transition_weight,
+                "lead_steps": self.transition_lead_steps,
+            },
+            "head_hidden": self.head_hidden,
+        }
+
+
+@dataclass(frozen=True)
+class NativePairBackendConfig:
+    """Paired-state settings for ``backend: native_pair``.
+
+    This pathway does **not** add a recurrent or state-space module after the
+    spatial encoder. Instead it uses the backbone's own multi-timestamp input
+    axis (``data.n_input_timestamps``), so the predictors at ``t`` and at
+    ``t - offset`` are embedded together and meet each other *inside* the shared
+    transformer computation, exactly as upstream Prithvi-WxC combines its two
+    input states (which it folds into patch-embed channels).
+
+    ``history_offsets`` is in cadence steps and is the honest statement of how
+    many earlier dates influence each output: ``[1]`` means exactly one.
+
+    ``history_mode: duplicate_current`` is the **capacity control**: identical
+    architecture, identical parameter count and identical time metadata, but the
+    history slot is filled with a copy of the current frame, so it carries no
+    information the frame-independent model did not already have. Any gain that
+    survives against this control cannot be attributed to the extra parameters.
+
+    ``cold_start_time_mode`` applies only to missing history before a true run
+    boundary during inference. ``legacy_nominal`` preserves the synthetic
+    configured interval of old checkpoints; ``selected_timestamps`` measures the
+    available selected history span, with current-frame duplicates at zero lag.
+    Both modes measure actual elapsed time once all required history exists.
+    Training requires complete history, so it never uses this cold-start rule.
+    """
+
+    history_offsets: tuple[int, ...] = (1,)
+    history_mode: str = "real"
+    # Old checkpoints omit this field and retain their synthetic nominal span
+    # when cold-start history slots duplicate the current frame. The measured
+    # selected-timestamp convention is opt-in and checked on checkpoint resume.
+    cold_start_time_mode: str = "legacy_nominal"
+    time_conditioning: bool = True
+    time_conditioning_gate_init: float = 1.0e-3
+    pretext: NativePairPretextConfig = field(default_factory=NativePairPretextConfig)
+
+    @staticmethod
+    def parse(value: Any, where: str) -> "NativePairBackendConfig":
+        data = _require_mapping(value, where)
+        allowed = {
+            "history_offsets",
+            "history_mode",
+            "cold_start_time_mode",
+            "time_conditioning",
+            "time_conditioning_gate_init",
+            "pretext",
+        }
+        _reject_unknown(data, allowed, where)
+        offsets = _as_int_list(data.get("history_offsets"), f"{where}.history_offsets") or [1]
+        if len(set(offsets)) != len(offsets):
+            raise TemporalConfigError(
+                f"{where}.history_offsets contains duplicates ({offsets}); each earlier "
+                "date may appear at most once."
+            )
+        if sorted(offsets) != offsets:
+            raise TemporalConfigError(
+                f"{where}.history_offsets must be given in increasing order, got {offsets}. "
+                "The input channel order is oldest-to-newest and is load-bearing for "
+                "checkpoint compatibility."
+            )
+        return NativePairBackendConfig(
+            history_offsets=tuple(offsets),
+            history_mode=_as_choice(
+                data.get("history_mode"),
+                f"{where}.history_mode",
+                ("real", "duplicate_current"),
+                "real",
+            ),
+            cold_start_time_mode=_as_choice(
+                data.get("cold_start_time_mode"),
+                f"{where}.cold_start_time_mode",
+                ("legacy_nominal", "selected_timestamps"),
+                "legacy_nominal",
+            ),
+            time_conditioning=_as_bool(
+                data.get("time_conditioning"), f"{where}.time_conditioning", True
+            ),
+            time_conditioning_gate_init=_as_float(
+                data.get("time_conditioning_gate_init"),
+                f"{where}.time_conditioning_gate_init",
+                1.0e-3,
+                minimum=0.0,
+            ),
+            pretext=NativePairPretextConfig.parse(data.get("pretext"), f"{where}.pretext"),
+        )
+
+    @property
+    def n_input_timestamps(self) -> int:
+        """Timestamps the patch embedding must accept: the history plus ``t``."""
+        return len(self.history_offsets) + 1
+
+    @property
+    def max_offset(self) -> int:
+        return max(self.history_offsets) if self.history_offsets else 0
+
+    def architecture_signature(self) -> dict[str, Any]:
+        """The subset a resumed checkpoint's weights actually depend on.
+
+        Excludes ``time_conditioning_gate_init`` (an initialization, like
+        ``adapter_init_gate``) and the auxiliary loss *weights* (an objective, not
+        a shape). Includes whether each pretext head exists, because that does
+        change the set of parameters, and ``history_mode``, because resuming a
+        real-history run as a duplicated-history control -- or the reverse --
+        would silently invalidate the comparison the control exists to support.
+        """
+        return {
+            "history_offsets": list(self.history_offsets),
+            "history_mode": self.history_mode,
+            "cold_start_time_mode": self.cold_start_time_mode,
+            "time_conditioning": self.time_conditioning,
+            "pretext_masked_reconstruction": self.pretext.masked_reconstruction_enabled,
+            "pretext_transition": self.pretext.transition_enabled,
+            "pretext_transition_lead_steps": self.pretext.transition_lead_steps,
+            "pretext_head_hidden": self.pretext.head_hidden,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "history_offsets": list(self.history_offsets),
+            "history_mode": self.history_mode,
+            "cold_start_time_mode": self.cold_start_time_mode,
+            "time_conditioning": self.time_conditioning,
+            "time_conditioning_gate_init": self.time_conditioning_gate_init,
+            "pretext": self.pretext.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class TendencyLossConfig:
     enabled: bool = False
     weight: float = 0.0
@@ -857,6 +1092,7 @@ class TemporalConfig:
     latent: TemporalLatentConfig
     recurrent: RecurrentBackendConfig
     mamba: MambaBackendConfig
+    native_pair: NativePairBackendConfig
     losses: TemporalLossConfig
     freeze: TemporalFreezeConfig
     inference: TemporalInferenceConfig
@@ -898,6 +1134,7 @@ class TemporalConfig:
             "latent": self.latent.to_dict(),
             "recurrent": self.recurrent.to_dict(),
             "mamba": self.mamba.to_dict(),
+            "native_pair": self.native_pair.to_dict(),
             "losses": self.losses.to_dict(),
             "freeze": self.freeze.to_dict(),
             "inference": self.inference.to_dict(),
@@ -926,6 +1163,7 @@ _TOP_LEVEL_KEYS = {
     "latent",
     "recurrent",
     "mamba",
+    "native_pair",
     "losses",
     "freeze",
     "inference",
@@ -967,7 +1205,9 @@ def parse_temporal_config(raw: Any, *, where: str = "temporal") -> TemporalConfi
             "do not reuse this config against these weights."
         )
 
-    backend = _as_choice(data.get("backend"), f"{where}.backend", ("recurrent", "mamba"))
+    backend = _as_choice(
+        data.get("backend"), f"{where}.backend", ("recurrent", "mamba", "native_pair")
+    )
     mode = _as_choice(data.get("mode"), f"{where}.mode", ("downscaling", "forecasting"), "downscaling")
 
     context_length = _as_int(data.get("context_length"), f"{where}.context_length", 7, minimum=1)
@@ -1052,6 +1292,48 @@ def parse_temporal_config(raw: Any, *, where: str = "temporal") -> TemporalConfi
                 f"mamba.headdim ({mamba.headdim})."
             )
 
+    native_pair = NativePairBackendConfig.parse(data.get("native_pair"), f"{where}.native_pair")
+    if backend == "native_pair":
+        # Every emitted frame must have all of its history inside the window, and
+        # the window must be long enough for the pretext transition pass when it
+        # is enabled. Checking here means a bad geometry fails at config parse
+        # rather than as an IndexError thousands of steps into a run.
+        needed = native_pair.max_offset
+        if native_pair.pretext.transition_enabled:
+            # x[t - lead - max_offset .. t - lead] -> x[t]
+            needed = max(needed, native_pair.max_offset + native_pair.pretext.transition_lead_steps)
+        if warmup_length < needed:
+            raise TemporalConfigError(
+                f"{where}: backend native_pair with history_offsets="
+                f"{list(native_pair.history_offsets)}"
+                + (
+                    f" and pretext.transition.lead_steps={native_pair.pretext.transition_lead_steps}"
+                    if native_pair.pretext.transition_enabled
+                    else ""
+                )
+                + f" needs warmup_length >= {needed} so every emitted frame has its full "
+                f"history inside the window, but warmup_length is {warmup_length}. "
+                "Padding or clamping the history would feed the model fabricated context."
+            )
+        if native_pair.max_offset >= context_length:
+            raise TemporalConfigError(
+                f"{where}: native_pair.history_offsets max ({native_pair.max_offset}) must be "
+                f"< context_length ({context_length})."
+            )
+        if mode != "downscaling":
+            raise TemporalConfigError(
+                f"{where}: backend native_pair is defined for mode 'downscaling' (zero "
+                f"predictor-to-target lead time), got mode {mode!r}. The auxiliary transition "
+                "objective is what carries a positive lead, and it has its own lead_steps key."
+            )
+    elif native_pair.pretext.any_enabled:
+        raise TemporalConfigError(
+            f"{where}.native_pair.pretext enables an auxiliary objective but backend is "
+            f"{backend!r}. The pretext objectives are defined only for the native_pair "
+            "pathway, which is what routes the paired atmospheric state through the shared "
+            "pretrained representation they are meant to train."
+        )
+
     inference = TemporalInferenceConfig.parse(data.get("inference"), f"{where}.inference")
     if inference.chunk_warmup >= inference.chunk_length and inference.chunk_length > 1:
         raise TemporalConfigError(
@@ -1088,6 +1370,7 @@ def parse_temporal_config(raw: Any, *, where: str = "temporal") -> TemporalConfi
         latent=latent,
         recurrent=RecurrentBackendConfig.parse(data.get("recurrent"), f"{where}.recurrent"),
         mamba=mamba,
+        native_pair=native_pair,
         losses=TemporalLossConfig.parse(data.get("losses"), f"{where}.losses"),
         freeze=TemporalFreezeConfig.parse(data.get("freeze"), f"{where}.freeze"),
         inference=inference,

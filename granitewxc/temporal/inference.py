@@ -59,6 +59,8 @@ class InferenceResult:
     targets: np.ndarray | None
     valid_mask: np.ndarray | None
     seam_indices: list[int] = field(default_factory=list)
+    lat: np.ndarray | None = None
+    lon: np.ndarray | None = None
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -95,8 +97,14 @@ def _chunk_batch(
 
     xs, ys, masks = [], [], []
     static = None
+    geometry = {}
     for frame in frames:
         loaded = source.load_frame(frame, lat_slice, lon_slice)
+        for key in ("__scaler_offset", "__input_scaler_offset", "__output_scaler_offset", "__output_crop"):
+            if key in loaded:
+                if key in geometry and not torch.equal(geometry[key], loaded[key]):
+                    raise ValueError(f"Inference dates must share one geometry: {key} changed.")
+                geometry[key] = loaded[key]
         x = loaded["x"]
         if dataset.static_channels > 0:
             n = x.shape[0] - dataset.static_channels
@@ -138,6 +146,7 @@ def _chunk_batch(
         "reset": torch.from_numpy(reset).unsqueeze(0),
         "__target_valid_mask": torch.stack(masks, 0).unsqueeze(0),
     }
+    batch.update({key: value.unsqueeze(0) for key, value in geometry.items()})
     if static is not None:
         batch["static_x"] = static.unsqueeze(0)
         batch["static_y"] = static.clone().unsqueeze(0)
@@ -160,6 +169,8 @@ def run_sequence_inference(
     limit_runs: int | None = None,
     limit_frames_per_run: int | None = None,
     verbose: bool = True,
+    _source: Any = None,
+    _spatial_crop: tuple[slice, slice] | None = None,
 ) -> list[InferenceResult]:
     """Run the temporal model over every contiguous run in a split.
 
@@ -168,47 +179,144 @@ def run_sequence_inference(
     encodes the history; when ``carry_state`` is False the configured
     ``chunk_warmup`` frames are re-run purely to rebuild state and are then
     discarded, which is the deployment policy for a cold start at a split
-    boundary.
+    boundary. For native finite-history models, requested dates select outputs;
+    available history before ``date_start`` is retained within the declared split
+    and contiguous run. Only a true split/gap/archive boundary uses duplicated
+    current inputs, under the explicit configured cold-start time convention.
     """
     from granitewxc.temporal.sources import build_frame_source
 
     chunk = int(chunk_length or cfg.inference.chunk_length)
     carry = cfg.inference.carry_state_across_chunks if carry_state is None else bool(carry_state)
     warmup = int(cfg.inference.chunk_warmup)
+    # Frames of real history each chunk must be handed in addition to the frames
+    # it emits (0 for the stateful backends, which carry state instead).
+    history_context = (
+        cfg.native_pair.max_offset if cfg.backend == "native_pair" else 0
+    )
+    if history_context and history_context >= chunk:
+        raise ValueError(
+            f"temporal.inference.chunk_length ({chunk}) must exceed the deepest history "
+            f"offset ({history_context}) or a chunk would emit no frame."
+        )
+    # Cold starts are legitimate here and only here: at the first date of a run
+    # there is genuinely no earlier date, and refusing to predict it would change
+    # the evaluated date set relative to the frame-independent baseline.
+    previous_cold_start = getattr(runner, "_allow_cold_start", False)
+    from granitewxc.temporal.training import resolve_crop_size, resolve_static_channels, _split_dates
 
-    from granitewxc.temporal.training import resolve_crop_size, resolve_static_channels
-
-    source = build_frame_source(config, split)
+    source = _source if _source is not None else build_frame_source(config, split)
+    plan = getattr(source, "inference_tile_plan", None)
+    if plan is not None and _spatial_crop is None:
+        # Carry independent temporal state within each spatial tile, then blend
+        # output cores on the canonical domain. No tile can substitute a date.
+        from granitewxc.utils.prism_tiling import blend_window
+        weights = blend_window(plan.core_shape, plan.overlap, mode=source.inference_blend_mode)
+        accumulated = None
+        totals = np.zeros(plan.domain_shape, dtype=np.float64)
+        source._inference_active = True
+        try:
+            for top, left in plan.positions:
+                height, width = plan.core_shape
+                region = (slice(top, top + height), slice(left, left + width))
+                tile_runs = run_sequence_inference(
+                    runner, config, cfg, split=split, date_start=date_start, date_end=date_end,
+                    device=device, chunk_length=chunk_length, carry_state=carry_state,
+                    return_targets=return_targets, limit_runs=limit_runs,
+                    limit_frames_per_run=limit_frames_per_run, verbose=False,
+                    _source=source, _spatial_crop=region,
+                )
+                if accumulated is None:
+                    accumulated = []
+                    for result in tile_runs:
+                        shape = (*result.predictions.shape[:-2], *plan.domain_shape)
+                        accumulated.append({
+                            "result": result, "prediction": np.zeros(shape, dtype=np.float64),
+                            "target": np.zeros(shape, dtype=np.float64) if result.targets is not None else None,
+                            "target_weight": np.zeros(shape, dtype=np.float64) if result.targets is not None else None,
+                            "mask": np.zeros(shape, dtype=bool) if result.valid_mask is not None else None,
+                        })
+                if len(tile_runs) != len(accumulated):
+                    raise ValueError("Spatial tiles returned different temporal runs.")
+                for saved, result in zip(accumulated, tile_runs):
+                    if saved["result"].dates != result.dates:
+                        raise ValueError("Spatial tiles returned different emitted dates.")
+                    saved["prediction"][..., region[0], region[1]] += result.predictions * weights
+                    if saved["mask"] is not None:
+                        saved["mask"][..., region[0], region[1]] |= result.valid_mask
+                    if saved["target"] is not None:
+                        valid = result.valid_mask if result.valid_mask is not None else np.isfinite(result.targets)
+                        saved["target"][..., region[0], region[1]] += np.where(valid, result.targets, 0) * weights
+                        saved["target_weight"][..., region[0], region[1]] += valid * weights
+                totals[region] += weights
+            if not np.all(totals > 0):
+                raise ValueError("NARR inference tiles leave canonical-grid cells uncovered.")
+            results = []
+            for saved in accumulated or []:
+                previous = saved["result"]
+                targets = None
+                if saved["target"] is not None:
+                    targets = (saved["target"] / np.maximum(saved["target_weight"], 1e-30)).astype(np.float32)
+                result = InferenceResult(
+                    run_id=previous.run_id, dates=previous.dates,
+                    predictions=(saved["prediction"] / totals).astype(np.float32),
+                    targets=targets, valid_mask=saved["mask"], seam_indices=previous.seam_indices,
+                    lat=np.asarray(source._dataset.fine_lat), lon=np.asarray(source._dataset.fine_lon),
+                )
+                results.append(result)
+                if verbose:
+                    print(f"[infer] tiled canonical domain: {len(plan.positions)} tiles; {json.dumps(result.describe())}")
+            return results
+        finally:
+            source._inference_active = False
+            runner._allow_cold_start = previous_cold_start
     static_channels = resolve_static_channels(config)
     crop = resolve_crop_size(config, source)
+    context_start, context_end = date_start, date_end
+    if history_context:
+        # A requested output interval is not a new observed run. Retain the
+        # within-split timeline so the first output can use existing history.
+        # Declared split boundaries still reset history, even if the source
+        # archive contains earlier dates from another split.
+        split_start, split_end = _split_dates(config, split)
+        context_start = split_start
+        bounds = [str(value) for value in (date_end, split_end) if value is not None]
+        context_end = min(bounds) if bounds else None
     dataset = TemporalSequenceDataset(
         source,
         # Run/window bookkeeping only. Time features use cfg.context_length, passed
         # explicitly below, so nothing observable depends on the chunk length.
-        window_length=int(cfg.context_length),
+        window_length=1 if history_context else int(cfg.context_length),
         stride=1,
         cadence_days=cfg.cadence_days,
         crop_size=crop,
         random_crop=False,
         static_channels=static_channels,
-        date_start=date_start,
-        date_end=date_end,
+        date_start=context_start,
+        date_end=context_end,
         include_hour_of_day=cfg.include_hour_of_day,
         include_lead_time=cfg.include_lead_time,
         lead_time_days=cfg.lead_time_days,
     )
-    lat_slice, lon_slice = dataset._select_crop(0)
+    lat_slice, lon_slice = _spatial_crop if _spatial_crop is not None else dataset._select_crop(0)
     runner.eval()
 
     results: list[InferenceResult] = []
-    runs = dataset.runs if limit_runs is None else dataset.runs[: int(limit_runs)]
-    for run in runs:
-        frames = list(run.frames)
+    runs = []
+    for run in dataset.runs:
+        selected = [i for i, frame in enumerate(run.frames)
+                    if date_in_range(frame.timestamp, date_start, date_end)]
+        if selected:
+            runs.append((run, selected[0], selected[-1] + 1))
+    if limit_runs is not None:
+        runs = runs[: int(limit_runs)]
+    if not runs:
+        raise ValueError("No requested inference dates lie within the available declared split.")
+    for run, emission_start, emission_stop in runs:
+        frames = list(run.frames[:emission_stop])
         if limit_frames_per_run is not None:
-            # Truncation for bounded diagnostics only (e.g. the chunk-consistency
-            # check). Truncating the *tail* of a run never changes any earlier
-            # frame, because the model is causal.
-            frames = frames[: int(limit_frames_per_run)]
+            # This budget counts emitted dates, not the necessary prior context.
+            frames = frames[:emission_start + int(limit_frames_per_run)]
         state = None
         preds: list[np.ndarray] = []
         targs: list[np.ndarray] = []
@@ -216,7 +324,7 @@ def run_sequence_inference(
         seams: list[int] = []
         emitted = 0
 
-        position = 0
+        position = emission_start
         first_chunk = True
         while position < len(frames):
             if carry or first_chunk:
@@ -224,6 +332,17 @@ def run_sequence_inference(
             else:
                 lo = max(position - warmup, 0)
                 warm = position - lo
+            if history_context:
+                # A finite-history pathway carries no state, so nothing can be
+                # "carried across" a chunk boundary: the earlier *dates
+                # themselves* must be in the batch. Extend the chunk backwards by
+                # the deepest history offset and do not emit those frames again.
+                # This is what makes chunked inference identical to a single pass
+                # here, and it is the direct analogue of carrying hidden state for
+                # the recurrent backends.
+                new_lo = max(position - history_context, 0)
+                warm = position - new_lo
+                lo = new_lo
             hi = min(position + chunk, len(frames))
             block = frames[lo:hi]
             batch = _chunk_batch(
@@ -232,17 +351,25 @@ def run_sequence_inference(
                 block,
                 lat_slice=lat_slice,
                 lon_slice=lon_slice,
-                is_run_start=first_chunk,
+                is_run_start=first_chunk and (not history_context or lo == 0),
                 position_offset=lo,
                 context_length=cfg.context_length,
                 device=device,
             )
+            # Absolute index of this block's frame 0 within the run, so the pair
+            # builder can distinguish "date precedes the run" (a cold start) from
+            # "date exists but was not supplied" (a chunking bug).
+            batch["__position_offset"] = lo
             emit = tuple(range(warm, len(block)))
-            out = runner(
-                batch,
-                initial_state=state if (carry and not first_chunk) else None,
-                emit_indices=emit,
-            )
+            runner._allow_cold_start = bool(history_context)
+            try:
+                out = runner(
+                    batch,
+                    initial_state=state if (carry and not first_chunk) else None,
+                    emit_indices=emit,
+                )
+            finally:
+                runner._allow_cold_start = previous_cold_start
             state = runner.adapter.detach_state(out.final_state) if carry else None
 
             preds.append(out.predictions[0].detach().float().cpu().numpy())
@@ -257,7 +384,9 @@ def run_sequence_inference(
             position = hi
             first_chunk = False
 
-        dates = [time_key(f.timestamp) for f in frames]
+        dates = [time_key(f.timestamp) for f in frames[emission_start:]]
+        coordinates = getattr(source, "spatial_coordinates", None)
+        latitude, longitude = coordinates(lat_slice, lon_slice) if coordinates is not None else (None, None)
         result = InferenceResult(
             run_id=run.run_id,
             dates=dates,
@@ -265,6 +394,7 @@ def run_sequence_inference(
             targets=np.concatenate(targs, axis=0) if targs else None,
             valid_mask=np.concatenate(masks, axis=0) if masks else None,
             seam_indices=seams,
+            lat=latitude, lon=longitude,
         )
         if result.predictions.shape[0] != len(dates):
             raise RuntimeError(
@@ -274,6 +404,7 @@ def run_sequence_inference(
         if verbose:
             print(f"[infer] {json.dumps(result.describe(), default=str)}")
         results.append(result)
+    runner._allow_cold_start = previous_cold_start
     return results
 
 
@@ -357,8 +488,17 @@ def write_netcdf(
     t, c, hgt, wid = result.predictions.shape
     coords: dict[str, Any] = {"time": times}
     dims = ("time", "lat", "lon")
-    coords["lat"] = lat if lat is not None else np.arange(hgt, dtype=np.float32)
-    coords["lon"] = lon if lon is not None else np.arange(wid, dtype=np.float32)
+    lat = lat if lat is not None else result.lat
+    lon = lon if lon is not None else result.lon
+    if lat is not None and lon is not None and np.ndim(lat) == np.ndim(lon) == 2:
+        if np.shape(lat) != (hgt, wid) or np.shape(lon) != (hgt, wid):
+            raise ValueError("Two-dimensional physical coordinates must match the prediction grid.")
+        dims = ("time", "y", "x")
+        coords["lat"] = (("y", "x"), lat)
+        coords["lon"] = (("y", "x"), lon)
+    else:
+        coords["lat"] = lat if lat is not None else np.arange(hgt, dtype=np.float32)
+        coords["lon"] = lon if lon is not None else np.arange(wid, dtype=np.float32)
 
     data_vars: dict[str, Any] = {}
     for idx, name in enumerate(output_vars):

@@ -41,10 +41,29 @@ __all__ = ["main", "build_parser"]
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-def _load(config_path: str):
+def _load(config_path: str, overrides: Sequence[str] | None = None):
     from granitewxc.utils.config import get_config
 
-    config = get_config(config_path)
+    if overrides:
+        import yaml
+        from granitewxc.utils.config import ExperimentConfig
+        raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+        for override in overrides:
+            if "=" not in override:
+                raise TemporalConfigError("--set expects an existing dotted.path=YAML_value")
+            key, value = override.split("=", 1)
+            node = raw
+            parts = key.split(".")
+            for part in parts[:-1]:
+                if part not in node or not isinstance(node[part], dict):
+                    raise TemporalConfigError(f"Unknown configuration path: {key}")
+                node = node[part]
+            if parts[-1] not in node:
+                raise TemporalConfigError(f"Unknown configuration key: {key}")
+            node[parts[-1]] = yaml.safe_load(value)
+        config = ExperimentConfig.from_dict(raw)
+    else:
+        config = get_config(config_path)
     raw = getattr(config, "temporal", None)
     cfg = parse_temporal_config(raw)
     if cfg is None:
@@ -88,7 +107,7 @@ def cmd_describe(args: argparse.Namespace) -> int:
         resolve_static_channels,
     )
 
-    config, cfg = _load(args.config)
+    config, cfg = _load(args.config, getattr(args, "overrides", None))
     report: dict[str, Any] = {
         "config": args.config,
         "case_name": getattr(config, "case_name", None),
@@ -155,7 +174,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         resolve_time_feature_dim,
     )
 
-    config, cfg = _load(args.config)
+    config, cfg = _load(args.config, getattr(args, "overrides", None))
     device = _device(args.device, config)
     loaders = build_sequence_dataloaders(
         config, cfg, splits=(args.split,), batch_size=1, verbose=True
@@ -179,11 +198,67 @@ def cmd_check(args: argparse.Namespace) -> int:
         ),
     }
 
-    # 1. legacy parity with the gate forced to zero
+    # 1. legacy parity with the temporal contribution forced to zero
+    #
+    # "Zero the temporal contribution" means different things for the two
+    # pathways, so it is expressed per pathway rather than by assuming a single
+    # ``adapter.gate`` exists:
+    #
+    # * bottleneck adapters (recurrent / mamba): zero the output gate.
+    # * native_pair: zero the token-level time-conditioning gate AND the history
+    #   half of the patch-embedding weight. Those two together are the entire
+    #   temporal contribution, and at migration the history half is already zero,
+    #   which is exactly why the pathway starts from the frame-independent model.
     adapter = model.temporal_adapter
-    saved_gate = adapter.gate.detach().clone()
-    with torch.no_grad():
-        adapter.gate.zero_()
+    is_native_pair = cfg.backend == "native_pair"
+    per_ts = int(getattr(adapter, "predictor_channels_per_timestamp", 0) or 0)
+
+    if is_native_pair:
+        saved_gate = (
+            None
+            if adapter.time_conditioning is None
+            else adapter.time_conditioning.gate.detach().clone()
+        )
+        saved_hist = adapter.history_projection.weight.detach().clone()
+
+        def _zero_temporal() -> None:
+            with torch.no_grad():
+                if adapter.time_conditioning is not None:
+                    adapter.time_conditioning.gate.zero_()
+                adapter.history_projection.weight.zero_()
+
+        def _restore_temporal() -> None:
+            with torch.no_grad():
+                if saved_gate is not None:
+                    adapter.time_conditioning.gate.copy_(saved_gate)
+                adapter.history_projection.weight.copy_(saved_hist)
+
+        def _amplify_temporal() -> None:
+            # The history weights are exactly zero after migration, so an
+            # untrained pathway is *by construction* insensitive to history.
+            # Give them a small non-zero value to measure that the pathway is
+            # wired, which is a statement about plumbing, not about skill.
+            with torch.no_grad():
+                torch.manual_seed(4242)
+                adapter.history_projection.weight.normal_(0.0, 0.02)
+                if adapter.time_conditioning is not None:
+                    adapter.time_conditioning.gate.fill_(1.0)
+    else:
+        saved_gate = adapter.gate.detach().clone()
+
+        def _zero_temporal() -> None:
+            with torch.no_grad():
+                adapter.gate.zero_()
+
+        def _restore_temporal() -> None:
+            with torch.no_grad():
+                adapter.gate.copy_(saved_gate)
+
+        def _amplify_temporal() -> None:
+            with torch.no_grad():
+                adapter.gate.fill_(1.0)
+
+    _zero_temporal()
     runner.eval()
     with torch.no_grad():
         zero_gate = runner(batch).predictions.clone()
@@ -192,7 +267,14 @@ def cmd_check(args: argparse.Namespace) -> int:
     with torch.no_grad():
         spatial = []
         for t in emit:
-            frame = {"x": batch["x"][:, t], "y": batch["y"][:, t]}
+            frame_x = batch["x"][:, t]
+            if is_native_pair:
+                # The reference is the frame-independent prediction from date t
+                # alone. With the history weights zeroed, whatever occupies the
+                # history channels is multiplied by zero, so date t is repeated
+                # there purely to satisfy the conv's input channel count.
+                frame_x = frame_x.repeat(1, cfg.native_pair.n_input_timestamps, 1, 1)
+            frame = {"x": frame_x, "y": batch["y"][:, t]}
             for key in ("static_x", "static_y"):
                 if key in batch:
                     frame[key] = batch[key]
@@ -203,32 +285,66 @@ def cmd_check(args: argparse.Namespace) -> int:
         "bitwise_identical": bool(torch.equal(zero_gate, spatial)),
         "max_abs_diff": float((zero_gate - spatial).abs().max()),
     }
-    with torch.no_grad():
-        adapter.gate.copy_(saved_gate)
+    _restore_temporal()
 
     # 2. near-identity at the configured gate
     with torch.no_grad():
         default_out = runner(batch).predictions.clone()
     scale = float(spatial.abs().mean())
     results["near_identity_default_gate"] = {
-        "adapter_init_gate": cfg.latent.adapter_init_gate,
+        "gate": (
+            cfg.native_pair.time_conditioning_gate_init
+            if is_native_pair
+            else cfg.latent.adapter_init_gate
+        ),
+        "gate_key": (
+            "temporal.native_pair.time_conditioning_gate_init"
+            if is_native_pair
+            else "temporal.latent.adapter_init_gate"
+        ),
         "mean_relative_deviation": float((default_out - spatial).abs().mean() / max(scale, 1e-12)),
     }
 
     # 3. gradient flow
+    from granitewxc.temporal.model import apply_freeze_policy
+    apply_freeze_policy(model, cfg, 0)
     runner.train()
     out = runner(batch)
-    out.predictions.pow(2).mean().backward()
+    gradient_loss = out.predictions.pow(2).mean()
+    if is_native_pair and cfg.native_pair.pretext.any_enabled:
+        from granitewxc.temporal.native_pair import compute_pretext_losses
+        terms, _ = compute_pretext_losses(model, adapter, batch, emit[-1], cfg)
+        gradient_loss = gradient_loss + terms.total
+    gradient_loss.backward()
     params = dict(model.named_parameters())
     names = temporal_parameter_names(model)
     dead = [
         n for n in names
         if params[n].grad is None or float(params[n].grad.abs().sum()) == 0.0
     ]
+    expected_dead = [
+        f"temporal_adapter.{n}"
+        for n in getattr(adapter, "structurally_dead_parameters", lambda: [])()
+    ]
     results["gradient_flow"] = {
         "n_temporal_tensors": len(names),
         "n_zero_gradient": len(dead),
         "zero_gradient_examples": dead[:5],
+        # Parameters that CANNOT receive gradient for a stated structural reason
+        # (currently: the lead-time embedding weight when the main lead time is
+        # zero and no auxiliary lead is configured). Declared, so the pass
+        # criterion is "exactly the declared set is dead" rather than either a
+        # spurious failure or a blanket exemption.
+        "expected_dead": expected_dead,
+        "unexpected_dead": sorted(set(dead) - set(expected_dead)),
+        "history_half_receives_gradient": (
+            bool(
+                adapter.history_projection.weight.grad is not None
+                and float(adapter.history_projection.weight.grad.abs().sum()) > 0.0
+            )
+            if is_native_pair
+            else None
+        ),
     }
     model.zero_grad(set_to_none=True)
     runner.eval()
@@ -250,19 +366,22 @@ def cmd_check(args: argparse.Namespace) -> int:
     # 5. history sensitivity with the gate temporarily raised so an untrained
     #    adapter produces a measurable effect
     with torch.no_grad():
-        adapter.gate.fill_(1.0)
+        _amplify_temporal()
         base = runner(batch).predictions.clone()
         hist = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
         torch.manual_seed(99)
         hist["x"][:, :-1] = torch.randn_like(hist["x"][:, :-1])
         alt = runner(hist).predictions
         results["history_sensitivity"] = {
-            "note": "gate temporarily set to 1.0 to measure the pathway, not accuracy",
+            "note": (
+                "temporal contribution temporarily amplified to measure that the "
+                "pathway is wired, not to measure accuracy"
+            ),
             "max_abs_change_final_frame": float((alt[:, -1] - base[:, -1]).abs().max()),
             "field_scale": float(base[:, -1].abs().mean()),
             "time_features_identical": True,
         }
-        adapter.gate.copy_(saved_gate)
+    _restore_temporal()
 
     # 6. chunked vs single pass on real frames
     from granitewxc.temporal.inference import verify_chunk_consistency
@@ -282,7 +401,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     _emit(results, args.output)
     ok = (
         results["legacy_parity_gate_zero"]["bitwise_identical"]
-        and results["gradient_flow"]["n_zero_gradient"] == 0
+        and results["gradient_flow"]["unexpected_dead"] == []
         and results["causality"]["earlier_frames_bitwise_unchanged"]
         and results["history_sensitivity"]["max_abs_change_final_frame"] > 0.0
     )
@@ -295,9 +414,13 @@ def cmd_check(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 def cmd_train(args: argparse.Namespace) -> int:
     from granitewxc.temporal.training import train_temporal_model
+    from granitewxc.temporal.progress import emit_progress
 
-    config, cfg = _load(args.config)
+    config, cfg = _load(args.config, getattr(args, "overrides", None))
     device = _device(args.device, config)
+    if args.resume:
+        from dataclasses import replace
+        cfg = replace(cfg, resume_from_temporal_checkpoint=args.resume, init_from_spatial_checkpoint=None)
     summary = train_temporal_model(
         config,
         cfg,
@@ -308,6 +431,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        progress_callback=emit_progress if getattr(args, "notebook_output", False) else None,
     )
     _emit(summary, args.output)
     return 0
@@ -325,15 +449,15 @@ def cmd_infer(args: argparse.Namespace) -> int:
         _split_dates,
     )
 
-    config, cfg = _load(args.config)
+    config, cfg = _load(args.config, getattr(args, "overrides", None))
     device = _device(args.device, config)
 
     if args.checkpoint:
         cfg = type(cfg)(**{**cfg.__dict__, "resume_from_temporal_checkpoint": args.checkpoint,
                            "init_from_spatial_checkpoint": None})
 
-    probe = build_sequence_dataloaders(config, cfg, splits=("train",), batch_size=1, verbose=False)
-    time_dim, time_names = resolve_time_feature_dim(probe["train"])
+    probe = build_sequence_dataloaders(config, cfg, splits=(args.split,), batch_size=1, verbose=False)
+    time_dim, time_names = resolve_time_feature_dim(probe[args.split])
     runner, report, _ = build_temporal_model(
         config, cfg, time_feature_dim=time_dim, time_feature_names=time_names,
         device=device, verbose=True,
@@ -419,7 +543,7 @@ def cmd_infer(args: argparse.Namespace) -> int:
 def cmd_evaluate(args: argparse.Namespace) -> int:
     from granitewxc.temporal.metrics import evaluate_predictions
 
-    config, cfg = _load(args.config)
+    config, cfg = _load(args.config, getattr(args, "overrides", None))
     data = np.load(args.predictions, allow_pickle=False)
     output_vars = [str(v) for v in data["output_vars"]]
     run_ids = sorted(
@@ -466,8 +590,11 @@ def build_parser(prog: str = "temporal") -> argparse.ArgumentParser:
 
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--config", required=True, help="Case YAML with a temporal: block")
+        p.add_argument("--set", dest="overrides", action="append", default=[], help="Override an existing dotted.path=YAML_value; repeat for portable paths")
         p.add_argument("--device", default=None, help="cuda | cpu (default: config/auto)")
         p.add_argument("--output", default=None, help="Write the JSON report here as well")
+        p.add_argument("--notebook-output", action="store_true",
+                       help="Stream epoch progress and warnings to the selected workflow notebook")
 
     p = sub.add_parser("describe", help="Audit the config, splits and checkpoints")
     common(p)
@@ -485,7 +612,8 @@ def build_parser(prog: str = "temporal") -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument("--max-steps", type=int, default=None, help="Cap training steps per epoch")
+    p.add_argument("--max-steps", type=int, default=None, help="Cap actual successful optimizer updates per epoch (not microbatches)")
+    p.add_argument("--resume", default=None, help="Resume the selected temporal checkpoint; full state restored when available")
     p.add_argument("--max-val-steps", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=0)
     p.set_defaults(func=cmd_train)
@@ -523,8 +651,11 @@ def build_parser(prog: str = "temporal") -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None, *, prog: str = "temporal") -> int:
     args = build_parser(prog).parse_args(list(argv) if argv is not None else None)
+    from granitewxc.temporal.progress import warnings_once
+
     try:
-        return int(args.func(args))
+        with warnings_once(structured=args.notebook_output):
+            return int(args.func(args))
     except TemporalConfigError as exc:
         print(f"[config error] {exc}", file=sys.stderr)
         return 2

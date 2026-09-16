@@ -228,10 +228,79 @@ def attach_temporal_adapter(
     return adapter
 
 
+def attach_native_pair_adapter(
+    model: nn.Module,
+    cfg: TemporalConfig,
+) -> "NativePairAdapter":
+    """Attach the paired-state adapter for ``backend: native_pair``.
+
+    Uses the same ``temporal_adapter`` attribute name as the bottleneck adapter,
+    which is what makes checkpoint migration, the freeze policy and the
+    ``lr_temporal`` parameter group apply without any change: all three key off
+    the ``temporal_adapter.`` state-dict prefix, not off the class.
+
+    Unlike :func:`attach_temporal_adapter`, this adapter does not act on the
+    bottleneck at all -- it conditions the token stream before the transformer,
+    and the paired input is assembled by the sequence runner. It also validates
+    that ``data.n_input_timestamps`` agrees with ``history_offsets``, because a
+    mismatch there is silent: the patch embedding would simply read a differently
+    sized channel block and the model would train on garbage.
+    """
+    from granitewxc.temporal.native_pair import NativePairAdapter
+
+    if getattr(model, "temporal_adapter", None) is not None:
+        raise RuntimeError("A temporal adapter is already attached to this model.")
+    if cfg.backend != "native_pair":
+        raise ValueError(
+            f"attach_native_pair_adapter requires backend 'native_pair', got {cfg.backend!r}."
+        )
+
+    expected_ts = cfg.native_pair.n_input_timestamps
+    actual_ts = int(getattr(model, "n_input_timestamps", 1))
+    if actual_ts != expected_ts:
+        raise ValueError(
+            f"data.n_input_timestamps is {actual_ts} but temporal.native_pair.history_offsets="
+            f"{list(cfg.native_pair.history_offsets)} needs {expected_ts} "
+            f"(the history dates plus date t). Set data.n_input_timestamps: {expected_ts}. "
+            "These are not independent knobs: the patch embedding's input channel count is "
+            "what carries the time axis, exactly as upstream Prithvi-WxC does."
+        )
+
+    embedding = getattr(model, "embedding", None)
+    proj = getattr(embedding, "proj", None)
+    if proj is None:
+        raise AttributeError(
+            "Model has no embedding.proj; native-pair attachment expects the PatchEmbed "
+            "input head of a ClimateDownscaleFinetuneUNETModel."
+        )
+    total_in = int(proj.in_channels)
+    if total_in % expected_ts != 0:
+        raise ValueError(
+            f"embedding.proj has {total_in} input channels, which is not divisible by "
+            f"{expected_ts} timestamps."
+        )
+    per_timestamp = total_in // expected_ts
+
+    adapter = NativePairAdapter(
+        cfg=cfg,
+        embed_dim_backbone=int(getattr(model, "embed_dim_backbone")),
+        post_backbone_channels=_resolve_bottleneck_channels(model),
+        predictor_channels_per_timestamp=per_timestamp,
+        predictor_channel_names=getattr(model, "predictor_channel_names", None),
+    )
+    adapter.attach_history_projection(proj)
+    model.temporal_adapter = adapter
+    model._temporal_ctx = None
+    return adapter
+
+
 def detach_temporal_adapter(model: nn.Module) -> None:
     """Remove the adapter, restoring the exact legacy computation path."""
     if getattr(model, "temporal_adapter", None) is None:
         return
+    remove = getattr(model.temporal_adapter, "remove_history_projection", None)
+    if remove is not None:
+        remove()
     model.temporal_adapter = None
     model._temporal_ctx = None
 
@@ -269,6 +338,12 @@ class SequenceOutput:
     #: two by accident silently mis-scales the tendency loss (or, as it did once,
     #: raises a shape error).
     interval_ratio: torch.Tensor | None = None
+    #: Number of base-model (and therefore backbone) forward passes this call
+    #: performed. Recorded because variants sharing an optimizer-step budget do
+    #: not necessarily share a compute budget: the recurrent backends must run
+    #: every warm-up frame to build state, while a finite-history pathway runs
+    #: only the frames it emits.
+    backbone_evaluations: int = 0
 
 
 class TemporalSequenceModel(nn.Module):
@@ -312,6 +387,11 @@ class TemporalSequenceModel(nn.Module):
         super().__init__()
         self.base = base_model
         self.cfg = cfg
+        # Cold starts (repeating date t into the history slot when the run has no
+        # earlier date) are an *inference* policy. During training a supervised
+        # frame without real history means the window geometry is wrong, so the
+        # default is to raise; ``run_sequence_inference`` opts in explicitly.
+        self._allow_cold_start = False
         self.adapter = adapter if adapter is not None else getattr(base_model, "temporal_adapter", None)
         if self.adapter is None:
             raise ValueError(
@@ -320,10 +400,46 @@ class TemporalSequenceModel(nn.Module):
             )
 
     # -- helpers ----------------------------------------------------------
-    @staticmethod
-    def _frame(batch: dict[str, torch.Tensor], t: int) -> dict[str, torch.Tensor]:
+    @property
+    def is_native_pair(self) -> bool:
+        """True when temporal information enters before the transformer."""
+        return self.cfg.backend == "native_pair"
+
+    def _frame_x(self, batch: dict[str, torch.Tensor], t: int) -> torch.Tensor:
+        """Predictor tensor for frame ``t``: one date, or a channel-stacked pair.
+
+        For ``backend: native_pair`` this stacks the configured history dates and
+        date ``t`` along the channel axis, oldest first, which is the native
+        ``[B, time x parameter, H, W]`` layout the patch embedding expects. The
+        two dates therefore reach the transformer together instead of being
+        encoded separately and combined afterwards.
+        """
+        if not self.is_native_pair:
+            return batch["x"][:, t]
+        from granitewxc.temporal.native_pair import build_pair_input
+
+        # ``__position_offset`` is the absolute index of frame 0 of this batch
+        # within its contiguous run. Inference supplies it; training windows do
+        # not, and there the default of 0 is what makes a too-short window raise
+        # instead of quietly cold-starting a supervised frame.
+        position_offset = int(batch.get("__position_offset", 0) or 0)
+        return build_pair_input(
+            batch["x"],
+            t,
+            history_offsets=self.cfg.native_pair.history_offsets,
+            history_mode=self.cfg.native_pair.history_mode,
+            position_offset=position_offset,
+            allow_cold_start=bool(self._allow_cold_start),
+        )
+
+    def _frame(self, batch: dict[str, torch.Tensor], t: int) -> dict[str, torch.Tensor]:
         """Slice frame ``t`` into the dict the frame model expects."""
-        frame: dict[str, torch.Tensor] = {"x": batch["x"][:, t], "y": batch["y"][:, t]}
+        frame: dict[str, torch.Tensor] = {"x": self._frame_x(batch, t)}
+        # The decoder needs geometry, never verification values.
+        if "__output_shape" in batch:
+            frame["__output_shape"] = batch["__output_shape"]
+        elif "y" in batch:
+            frame["__output_shape"] = tuple(batch["y"].shape[-2:])
         for key in ("static_x", "static_y"):
             if key in batch:
                 frame[key] = batch[key]
@@ -378,7 +494,16 @@ class TemporalSequenceModel(nn.Module):
         normed: list[torch.Tensor] = []
         latents: list[torch.Tensor] = []
 
-        for t in range(t_total):
+        # A finite-history pathway has no hidden state to build, so a frame that
+        # is not emitted has no effect whatsoever and running it would be pure
+        # waste. Skipping those frames is what makes this pathway cost 5 backbone
+        # evaluations per SA window instead of 7, at identical emitted dates --
+        # recorded explicitly because equal optimizer steps do not imply equal
+        # compute.
+        visit = tuple(emit) if self.is_native_pair else tuple(range(t_total))
+        backbone_evaluations = 0
+
+        for t in visit:
             if self.cfg.state.reset_every_frame:
                 # Memory-disabled ablation: drop the carried state entirely, so the
                 # backend sees only this frame plus its calendar features. The
@@ -395,7 +520,26 @@ class TemporalSequenceModel(nn.Module):
                 "reset_mask": step_reset,
                 "capture_latent": bool(capture_latent),
             }
+            if self.is_native_pair:
+                from granitewxc.temporal.native_pair import pair_time_scalars
+
+                input_time, lead_time = pair_time_scalars(
+                    interval_ratio,
+                    t,
+                    history_offsets=self.cfg.native_pair.history_offsets,
+                    cadence_days=self.cfg.cadence_days,
+                    batch_size=b,
+                    device=x.device,
+                    dtype=x.dtype,
+                    lead_steps=0,  # zero predictor-to-target lead: same-day downscaling
+                    position_offset=int(batch.get("__position_offset", 0) or 0),
+                    allow_cold_start=bool(self._allow_cold_start),
+                    cold_start_time_mode=self.cfg.native_pair.cold_start_time_mode,
+                )
+                ctx["native_input_time_hours"] = input_time
+                ctx["native_lead_time_hours"] = lead_time
             self.base._temporal_ctx = ctx
+            backbone_evaluations += 1
             frame = self._frame(batch, t)
             try:
                 if return_normalized or capture_latent:
@@ -442,6 +586,7 @@ class TemporalSequenceModel(nn.Module):
             emitted_indices=emit,
             final_state=state,
             interval_ratio=emitted_ratio,
+            backbone_evaluations=backbone_evaluations,
         )
 
     # -- inference over a long continuous run -----------------------------
@@ -500,7 +645,15 @@ PARAM_GROUP_PREFIXES: dict[str, tuple[str, ...]] = {
 
 
 def classify_parameter(name: str) -> str:
-    """Map a parameter name to one of ``temporal|backbone|encoder|decoder|other``."""
+    """Classify learned weights separately from immutable physical scalers."""
+    # Parameters for checkpoint compatibility, never learned unit conversions.
+    if name.rsplit(".", 1)[-1] in {
+        "input_scalers_mu", "input_scalers_sigma",
+        "output_scalers_mu", "output_scalers_sigma",
+        "static_input_scalers_mu", "static_input_scalers_sigma",
+        "static_output_scalers_mu", "static_output_scalers_sigma",
+    }:
+        return "normalization"
     for group, prefixes in PARAM_GROUP_PREFIXES.items():
         if any(name.startswith(p) for p in prefixes):
             return group
@@ -528,7 +681,7 @@ def build_param_groups(
     }
     buckets: dict[str, list[nn.Parameter]] = {k: [] for k in lrs}
     for name, param in model.named_parameters():
-        if not param.requires_grad:
+        if not param.requires_grad or classify_parameter(name) == "normalization":
             continue
         buckets[classify_parameter(name)].append(param)
     groups: list[dict[str, Any]] = []
@@ -538,6 +691,8 @@ def build_param_groups(
         groups.append(
             {
                 "params": params,
+                "param_names": [name for name, param in model.named_parameters()
+                                if param.requires_grad and classify_parameter(name) == group],
                 "lr": float(lrs[group]) * float(scale.get(group, 1.0)),
                 "name": group,
             }
@@ -568,5 +723,6 @@ def apply_freeze_policy(model: nn.Module, cfg: TemporalConfig, epoch: int) -> di
                 else:
                     frozen[module] = False
     for name, param in model.named_parameters():
-        param.requires_grad = not frozen[classify_parameter(name)]
-    return {k: (not v) for k, v in frozen.items()}
+        group = classify_parameter(name)
+        param.requires_grad = group != "normalization" and not frozen[group]
+    return {**{k: (not v) for k, v in frozen.items()}, "normalization": False}

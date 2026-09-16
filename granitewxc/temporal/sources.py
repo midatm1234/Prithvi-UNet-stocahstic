@@ -37,6 +37,7 @@ from granitewxc.temporal.sequence_dataset import FrameRef
 __all__ = [
     "CordexFrameSource",
     "NarrPrismFrameSource",
+    "NarrPrismDatasetFrameSource",
     "load_module_from_path",
     "build_frame_source",
 ]
@@ -121,6 +122,7 @@ class CordexFrameSource:
         self.use_static = bool(use_static)
         self.target_units = list(getattr(self._dataset, "target_units", []))
         self._calendar = self._resolve_calendar(predictor_paths[0])
+        self._fine_coordinates = None
 
     @staticmethod
     def _resolve_calendar(path: str) -> CalendarSpec:
@@ -163,6 +165,37 @@ class CordexFrameSource:
 
     def fine_shape(self) -> tuple[int, int]:
         return tuple(int(v) for v in self._dataset.fine_shape)  # type: ignore[return-value]
+
+    def spatial_coordinates(self, lat_slice: slice, lon_slice: slice) -> tuple[np.ndarray, np.ndarray]:
+        """Return the actual target-grid coordinates for the emitted crop.
+
+        Read coordinate metadata only from the same target template used by
+        CordexDownscaleDataset. Physical axes are not reconstructed from sizes.
+        """
+        if self._fine_coordinates is None:
+            import xarray as xr
+            ds = self._dataset
+            with xr.open_dataset(ds.target_paths[0], decode_times=False) as handle:
+                latitude, longitude = handle[ds.fine_lat_name], handle[ds.fine_lon_name]
+                if latitude.ndim == longitude.ndim == 2:
+                    latitude = latitude.transpose(*ds.output_spatial_dims)
+                    longitude = longitude.transpose(*ds.output_spatial_dims)
+                lat, lon = latitude.values.copy(), longitude.values.copy()
+            if lat.ndim == lon.ndim == 1:
+                shape = (len(lat), len(lon))
+            elif lat.ndim == lon.ndim == 2 and lat.shape == lon.shape:
+                shape = lat.shape
+            else:
+                raise ValueError("CORDEX target coordinates must be paired 1D axes or 2D grids.")
+            if tuple(shape) != self.fine_shape():
+                raise ValueError("CORDEX target coordinates do not match the emitted grid.")
+            lat.setflags(write=False)
+            lon.setflags(write=False)
+            self._fine_coordinates = (lat, lon)
+        lat, lon = self._fine_coordinates
+        if lat.ndim == 1:
+            return lat[lat_slice], lon[lon_slice]
+        return lat[lat_slice, lon_slice], lon[lat_slice, lon_slice]
 
     def load_frame(self, ref: FrameRef, lat_slice: slice, lon_slice: slice) -> dict[str, torch.Tensor]:
         ds = self._dataset
@@ -280,6 +313,95 @@ class NarrPrismFrameSource:
         return self._static_channels
 
 
+class NarrPrismDatasetFrameSource:
+    """Reuse the strict NARR NetCDF dataset and its physical-unit contracts.
+
+    Daily coordinates, preprocessing signatures, mean-fill masks, variable
+    order and target units are checked by the existing spatial dataset. The
+    temporal sampler chooses one core/halo geometry for every date in a window.
+    """
+
+    def __init__(self, config: Any, split: str) -> None:
+        import tempfile
+        import yaml
+        from granitewxc.utils.prism_tiling import halo_crop_slices, pad_spatial_context
+
+        raw = config.to_dict() if hasattr(config, "to_dict") else dict(config)
+        mode = {"train": "training", "validation": "validation", "test": "inference"}[split]
+        directory = Path(__file__).resolve().parents[2] / "examples" / "NARR_PRISM"
+        load_module_from_path("narr_prism_utils", directory / "narr_prism_utils.py")
+        module = load_module_from_path("_temporal_narr_prism_dataset", directory / "narr_prism_dataset.py")
+        # The established dataset takes YAML. Its resolved dictionary is retained
+        # by the dataset; this private temporary file is only constructor input.
+        with tempfile.TemporaryDirectory(prefix="temporal_narr_config_") as temp_dir:
+            resolved = Path(temp_dir) / "resolved.yaml"
+            resolved.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+            self._dataset = module.NarrPrismDataset(resolved, mode=mode)
+        self._calendar = resolve_calendar(raw["data"].get("calendar", "standard"))
+        self.target_variables = list(raw["data"]["output_vars"])
+        if self.target_variables != self._dataset.target_vars:
+            raise ValueError("NARR temporal output_vars must preserve target_variables order.")
+        self.spatial_tiles = tuple(self._dataset._tile_slices or ())
+        self._static_channels = int(raw.get("model", {}).get("num_static_channels", 0))
+        if self._static_channels:
+            raise ValueError("NARR elevation and validity masks are dynamic-layout inputs; num_static_channels must be zero.")
+        self._halo_crop_slices = halo_crop_slices
+        self._pad_spatial_context = pad_spatial_context
+        self._dates = list(self._dataset.dates)
+        from granitewxc.utils.prism_tiling import TilePlan
+        infer = raw.get("inference", {}) or {}
+        boundary = infer.get("boundary_mitigation", {}) or {}
+        self.inference_tile_plan = TilePlan.build(
+            self.fine_shape(),
+            infer.get("inference_tile_size", boundary.get("tile_size", self._dataset.crop_size)),
+            overlap=infer.get("inference_overlap", boundary.get("overlap", (0, 0))),
+            halo=infer.get("inference_halo", boundary.get("halo", self._dataset.training_halo)),
+        )
+        self.inference_blend_mode = infer.get("inference_blend_window", boundary.get("blend_mode", "hann"))
+        if raw.get("model", {}).get("backbone_attention_scope") == "windowed_local":
+            self.inference_tile_plan.assert_globally_aligned(raw.get("mask_unit_size", (16, 16)))
+        self._inference_active = False
+
+    def frames(self) -> list[FrameRef]:
+        import cftime
+        return [FrameRef(file_index=i, predictor_time_index=0, target_time_index=0,
+            timestamp=cftime.datetime(day.year, day.month, day.day, calendar=self._calendar.name))
+            for i, day in enumerate(self._dates)]
+
+    def calendar(self) -> CalendarSpec:
+        return self._calendar
+
+    def fine_shape(self) -> tuple[int, int]:
+        return tuple(self._dataset.fine_shape)
+
+    def load_frame(self, ref: FrameRef, lat_slice: slice, lon_slice: slice) -> dict[str, Any]:
+        ds = self._dataset
+        day = self._dates[ref.file_index]
+        y = ds._load_targets(day, lat_slice, lon_slice)
+        origin = (ds._slice_start(lat_slice), ds._slice_start(lon_slice))
+        height, width = y.shape[-2:]
+        halo = self.inference_tile_plan.halo if self._inference_active else ds.training_halo
+        (input_lat, input_lon), padding = self._halo_crop_slices(
+            ds.fine_shape, origin, (height, width), halo
+        )
+        x = ds._load_predictor(day, input_lat, input_lon)
+        x = self._pad_spatial_context(x, padding, pad_mode="reflect")
+        valid = torch.isfinite(y)
+        return {
+            "x": x,
+            "y": torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0),
+            "valid_mask": valid,
+            "__scaler_offset": torch.tensor(origin, dtype=torch.long),
+            "__input_scaler_offset": torch.tensor([origin[0] - halo[0], origin[1] - halo[1]], dtype=torch.long),
+            "__output_scaler_offset": torch.tensor(origin, dtype=torch.long),
+            "__output_crop": torch.tensor([*halo, height, width], dtype=torch.long),
+        }
+
+    @property
+    def static_channels(self) -> int:
+        return self._static_channels
+
+
 # ---------------------------------------------------------------------------
 # factory
 # ---------------------------------------------------------------------------
@@ -322,7 +444,10 @@ def build_frame_source(config: Any, split: str):
             regrid_method=str(getattr(data, "regrid_method", "bilinear")),
         )
 
-    if dtype in {"narr_prism", "merra_prism"}:
+    if dtype == "narr_prism":
+        return NarrPrismDatasetFrameSource(config, split)
+
+    if dtype == "merra_prism":
         mode_map = {"train": "train", "validation": "validation", "test": "inference"}
         return NarrPrismFrameSource(
             getattr(data, "preprocessed_dir"),

@@ -90,8 +90,10 @@ ACTIVE_PIDS=()
 cleanup_shards() {
   local pid
   for pid in "${ACTIVE_PIDS[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null || true
+    # A shard may exit while one of its children still owns stdout/stderr.
+    # Kill its entire dedicated process group, even if the group leader exited.
+    if kill -0 -- "-$pid" 2>/dev/null; then
+      kill -TERM -- "-$pid" 2>/dev/null || true
     fi
   done
   for pid in "${ACTIVE_PIDS[@]}"; do
@@ -105,12 +107,16 @@ run_preprocess_mode() {
   local mode="$1"
   local shard pid failed=0
   ACTIVE_PIDS=()
+  # Bash job control gives each asynchronous shard its own process group.
+  # Descendants inherit that group, including a shell-to-executable handoff.
+  set -m
   for ((shard=0; shard<PREPROCESS_SHARDS; shard++)); do
     "$PYTHON_BIN" "$SCRIPT_DIR/preproc_merra_prism.py" \
       --config "$CONFIG" --mode "$mode" "${OVERWRITE_FLAG[@]}" \
       --date-shard-index "$shard" --date-shard-count "$PREPROCESS_SHARDS" &
     ACTIVE_PIDS+=("$!")
   done
+  set +m
   for pid in "${ACTIVE_PIDS[@]}"; do
     if ! wait "$pid"; then
       failed=1

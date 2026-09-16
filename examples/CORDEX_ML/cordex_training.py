@@ -1128,49 +1128,21 @@ def get_dataloaders(
     return train_loader, val_loader
 
 
-def load_pretrained_weights(model: torch.nn.Module, weights_path: str) -> Tuple[int, int]:
+def load_pretrained_weights(model: torch.nn.Module, weights_path: str,
+                            require_backbone: bool = False) -> Tuple[int, int]:
+    from granitewxc.models.model import audited_pretrained_load, extract_pretrained_state
     checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
-
-    if isinstance(checkpoint, dict) and "model" in checkpoint:
-        weights = checkpoint["model"]
-    else:
-        weights = checkpoint
-
-    if not isinstance(weights, dict):
-        weights = weights.state_dict() if hasattr(weights, "state_dict") else dict(weights)
-
-    model_state = model.state_dict()
-    weights_have_module_prefix = all(key.startswith("module.") for key in weights.keys())
-    model_expects_module_prefix = all(key.startswith("module.") for key in model_state.keys())
-
-    if model_expects_module_prefix and not weights_have_module_prefix:
-        weights = weights.__class__((f"module.{key}", value) for key, value in weights.items())
-    elif weights_have_module_prefix and not model_expects_module_prefix:
-        prefix_len = len("module.")
-        weights = weights.__class__((key[prefix_len:], value) for key, value in weights.items())
-
-    compatible = {}
-    skipped = 0
-    scaler_key_parts = (
-        "input_scalers_",
-        "output_scalers_",
-        "static_input_scalers_",
-        "static_output_scalers_",
+    report = audited_pretrained_load(
+        model, extract_pretrained_state(checkpoint), require_backbone=require_backbone,
     )
-    for key, value in weights.items():
-        # Keep run-specific normalization tensors from the current config/scaler files.
-        if any(part in key for part in scaler_key_parts):
-            skipped += 1
-            continue
-        target = model_state.get(key)
-        if target is None or target.shape != value.shape:
-            skipped += 1
-            continue
-        compatible[key] = value
-
-    model_state.update(compatible)
-    model.load_state_dict(model_state, strict=False)
-    return len(compatible), skipped
+    coverage = report["backbone_parameters"]
+    print(f"[pretrained] backbone learned parameters loaded "
+          f"{coverage['loaded_numel']:,}/{coverage['total_numel']:,}; "
+          f"{len(report['shape_mismatch'])} shape mismatches; "
+          f"{len(report['excluded_keys'])} normalization tensors retained.")
+    loaded = len(report["matched_keys"])
+    skipped = sum(len(report[k]) for k in ("shape_mismatch", "excluded_keys", "unexpected_keys"))
+    return loaded, skipped
 
 
 def create_finetune_model(config: ExperimentConfig, verbose: bool = True) -> torch.nn.Module:
@@ -1191,7 +1163,10 @@ def create_finetune_model(config: ExperimentConfig, verbose: bool = True) -> tor
     if target != "cpu" and torch.cuda.is_available():
         torch.cuda.empty_cache()
     model = get_finetune_model_UNET(config)
-    loaded, skipped = load_pretrained_weights(model, _resolve_path(config.path_model_weights))
+    loaded, skipped = load_pretrained_weights(
+        model, _resolve_path(config.path_model_weights),
+        require_backbone=bool(getattr(config, "require_pretrained_backbone", False)),
+    )
     if verbose:
         print(
             f"Loaded {loaded} tensors from {config.path_model_weights}. "

@@ -453,6 +453,20 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         #----------- From Config
 
         n_input_timestamps = config.data.n_input_timestamps
+        # These metadata fields are optional for legacy direct constructors.
+        # They become meaningful for temporal predictor semantics/target-free I/O.
+        predictor_vars = tuple(str(v) for v in getattr(config.data, "input_vars", ()))
+        predictor_levels = tuple(getattr(config.data, "input_levels", (1,)))
+        self.predictor_channel_names = (
+            predictor_vars if len(predictor_levels) == 1
+            else tuple(f"{var}_{level}" for var in predictor_vars for level in predictor_levels)
+        )
+        geometry_h = getattr(config.data, "target_size_lat", None)
+        geometry_w = getattr(config.data, "target_size_lon", None)
+        self.output_geometry = (
+            (int(geometry_h), int(geometry_w))
+            if geometry_h is not None and geometry_w is not None else None
+        )
         embed_dim_backbone = config.model.embed_dim
         return_logits = config.model.__dict__.get('loss_type')=='cross_entropy'
         residual = config.model.__dict__.get('residual', None)
@@ -1134,6 +1148,16 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
                 .flatten(1, 2)
             )  # [batch, embed, lat//patch_size, lon//patch_size] -> [batch, global seq, local seq, embed]
 
+            # Optional native-form temporal conditioning of the token stream
+            # (Prithvi-UNet_temporal_model branch, ``backend: native_pair``).
+            # This is where upstream Prithvi-WxC consumes its two time scalars:
+            # ``tokens = x_embedded + static_embedded + time_encoding``, once,
+            # before the encoder. Returns ``x_tokens`` unchanged -- the same
+            # object, no arithmetic -- unless an adapter exposing ``apply_tokens``
+            # is attached and a sequence step context is active, so the legacy
+            # spatial path is bit-for-bit preserved.
+            x_tokens = self._apply_temporal_tokens(x_tokens)
+
             if self.backbone_gradient_checkpointing and self.training:
                 backbone_fn = (
                     self.backbone
@@ -1218,7 +1242,14 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
             wet_logits = self.precip_wet_head(out)
 
         raw_out = x
-        expected_hw = batch["y"].shape[-2:]
+        expected_hw = batch.get("__output_shape")
+        if expected_hw is None:
+            expected_hw = batch["y"].shape[-2:] if "y" in batch else self.output_geometry
+        if expected_hw is None:
+            raise ValueError("Output geometry is unavailable; provide __output_shape or configured target_size_lat/lon.")
+        expected_hw = tuple(int(v) for v in expected_hw)
+        if len(expected_hw) != 2 or min(expected_hw) <= 0:
+            raise ValueError("__output_shape must contain two positive spatial dimensions.")
         raw_out, wet_logits = _prepare_normalized_outputs(
             raw_out,
             wet_logits,
@@ -1274,6 +1305,12 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         ctx = self._temporal_ctx
         if adapter is None or ctx is None:
             return out
+        if not getattr(adapter, "injects_at_bottleneck", True):
+            # A pathway that conditions the token stream before the transformer
+            # (``backend: native_pair``) must not also perturb the bottleneck.
+            # Returning ``out`` itself keeps that pathway's U-Net exactly the
+            # frame-independent one.
+            return out
         delta, new_state = adapter(
             out,
             ctx.get("state"),
@@ -1285,6 +1322,31 @@ class ClimateDownscaleFinetuneUNETModel(ClimateECCCFinetuneWrapper):
         if ctx.get("capture_latent"):
             ctx.setdefault("latents", []).append(delta)
         return out + delta
+
+    def _apply_temporal_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Condition the token stream immediately before the transformer.
+
+        Returns ``tokens`` untouched -- literally the same tensor object, with no
+        arithmetic applied -- unless an attached temporal adapter implements
+        ``apply_tokens`` and a sequence step context is active. Every legacy
+        spatial configuration, and both the ``recurrent`` and ``mamba`` temporal
+        backends (whose adapters have no ``apply_tokens``), therefore execute the
+        identical computation they did before.
+
+        This is the counterpart of :meth:`_apply_temporal_latent` on the other
+        side of the backbone. The bottleneck hook can only mix information that
+        has already been through the transformer separately; this hook lets two
+        dates enter the transformer together, which is the mechanism the
+        architecture natively uses for its paired input states.
+        """
+        adapter = self.temporal_adapter
+        ctx = self._temporal_ctx
+        if adapter is None or ctx is None:
+            return tokens
+        hook = getattr(adapter, "apply_tokens", None)
+        if hook is None:
+            return tokens
+        return hook(tokens, ctx)
 
     # ------------------------------------------------------------------
     # Optional Phase-1 spatial-feature capture (two-phase refinement)

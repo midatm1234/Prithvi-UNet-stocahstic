@@ -1,5 +1,14 @@
 # Temporal extension of Prithvi-UNet: literature review and architecture decisions
 
+> **2026-09-15 provenance correction:** Historical Phase-1 foundation
+> provenance remains unresolved. Current ECCC/Phase-1 shape incompatibility does
+> not prove random historical initialization, and weight histograms do not prove
+> untrained or useless time embeddings. The general/rollout cadence difference
+> is a transfer limitation, not a proof of impossibility. The original statements
+> below are retained as the handoff record and superseded on these points by
+> [the takeover evidence report](temporal_pretrained_transfer_takeover.md).
+
+
 **Review date: 2026-09-14.** Branch: `Prithvi-UNet_temporal_model`, based on
 `Prithvi-UNet-stochastic_refinement` @ `dd48c6f`.
 

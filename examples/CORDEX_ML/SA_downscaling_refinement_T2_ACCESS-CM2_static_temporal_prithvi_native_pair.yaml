@@ -1,0 +1,721 @@
+# =============================================================================
+# SA (South Africa) T2 ACCESS-CM2 static -- TEMPORAL, Prithvi-native paired state
+# =============================================================================
+# Sibling of ..._temporal_recurrent.yaml / ..._temporal_mamba.yaml. Every data
+# path, variable list, grid, scaler file, predictand block, loss block and model
+# geometry is IDENTICAL to those two files, so a comparison against them isolates
+# the temporal pathway and nothing else.
+#
+# WHAT IS DIFFERENT, and why
+# -------------------------
+# The recurrent and mamba backends encode each date through the transformer
+# SEPARATELY and then mix the resulting latents in a new module bolted onto the
+# U-Net bottleneck. Both failed the pre-registered acceptance criteria
+# (docs/temporal_model_results.md).
+#
+# This config instead uses the backbone's OWN multi-timestamp input axis. Upstream
+# Prithvi-WxC takes x as [batch, time, parameter, lat, lon] and folds the time
+# axis into patch-embedding channels before anything learned happens
+# (PrithviWxC/model.py:1364-1369); input_size_time has exactly one functional use
+# upstream, setting that conv's input channel count (model.py:1015-1019). There is
+# no temporal attention and no recurrence anywhere in the model. So the two input
+# states first meet each other INSIDE the transformer's self-attention.
+#
+# This repository's downstream model already reproduces that mechanism verbatim
+# (granitewxc/models/cordex_finetune_model.py:971) -- it was simply never used,
+# because every shipped config set n_input_timestamps: 1. Here it is 2, and the
+# second slot holds a REAL earlier date.
+#
+# HONEST SCOPE -- what this does NOT test
+# ---------------------------------------
+# PROVENANCE CORRECTION (2026-09-15). This architecture comparison does not
+# establish additional foundation-model transfer. The currently referenced ECCC
+# checkpoint has width 2560; this Phase-1 model has width 1024, so none of its
+# backbone parameters can load from that source with the current loader.
+# Historical Phase-1 provenance remains unresolved: its metadata records ECCC
+# initialization under a dirty source checkout, while historical SA notebooks
+# show a different best_rmse_UNET_small.pt initialization (198 tensors loaded).
+# The smaller source and its training chain are unavailable locally. Current
+# incompatibility is not proof that the Phase-1 backbone began from random weights.
+#
+# Native time maps here are newly initialized because the widths differ. Similar
+# pretrained/fresh weight histograms do not prove that pretrained time maps were
+# never trained or carry no useful information. See the additive evidence report:
+# docs/temporal_pretrained_transfer_takeover.md.
+#
+# CADENCE. Pretraining drew input_time from [-3,-6,-9,-12] hours on 3-hourly
+# instantaneous MERRA-2 states. This archive is daily and its predictors are daily
+# MEANS (cell_methods 'time: mean' on all 15, verified in the files). The model is
+# handed input_time = +24 h because 24 h is the truth. That is outside the
+# exercised support and is recorded as a limitation, not relabelled to fit.
+#
+# HOW MUCH HISTORY REACHES EACH OUTPUT: exactly one earlier date (t-1). This is a
+# finite-history conditional model, not an unbounded memory, and not a rollout --
+# no predicted output is ever fed back as an input. Predictor-to-target lead time
+# is still ZERO: same-day downscaling.
+# =============================================================================
+# Derived from examples/CORDEX_ML/SA_T2_ACCESS-CM2_static_diffusion_unet.yaml
+# (itself generated from SA_T2_ACCESS-CM2_static_v6.yaml). Both source files are
+# unchanged and remain runnable.
+#
+# What is preserved verbatim from the source case:
+#   * predictor variables and ordering  : u, v, q, t, z at 850, 700, 500 hPa
+#   * target variables and ordering     : pr (mm/day), tasmax (K)
+#   * static input                      : orog from Static_fields.nc
+#   * grid / domain                     : 128 x 128 SA CORDEX target grid
+#   * data paths and calendar           : D:/CORDEX/SA_domain, CF 'standard'
+#   * normalization                     : per-predictand blocks below, and the
+#                                         SAME scaler .npy files the Phase-1
+#                                         checkpoint was trained with
+#   * model geometry                    : embed_dim 1024, 8 encoder blocks,
+#                                         3 U-Net stages, pixel_shuffle encoder
+#
+# What is new: the `temporal:` block, and an explicit `temporal_splits:` block.
+#
+# TASK: causal, same-day, sequence-conditioned downscaling. For output date t the
+# model sees predictors at t and earlier only. Predictor-to-target lead time is
+# ZERO, exactly as in the source case -- this is conditional downscaling advanced
+# through daily predictors, NOT a free-running forecast. Targets are never shifted
+# and observed high-resolution fields never enter the model's input path.
+#
+# EVENT ALIGNMENT: verified empirically before enabling supervised sequence
+# training. Domain-mean deseasonalized t_850 vs tasmax anomaly correlation over
+# 1961-1970 peaks sharply at lag 0 (r = 0.9525) and falls to 0.80 at lag -1 /
+# 0.74 at lag +1. Predictors and targets therefore describe the same weather
+# (a perfect-model / pseudo-reality pairing), so day-by-day losses and
+# event-paired metrics are scientifically valid for this configuration.
+#
+# KNOWN INHERITED LIMITATION (normalization): the scaler .npy files below were
+# fitted by the existing Phase-1 workflow over the whole 1961-1980 + 2080-2099
+# record, so they saw the validation window. They cannot be recomputed without
+# invalidating the Phase-1 checkpoint this run initializes from, because
+# output_scalers_mu/sigma are stored *inside* that checkpoint as
+# [1, 2, 128, 128] fixed checkpoint parameters. Phase-1 checkpoint metadata
+# additionally shows training on the complete 1961-1980 + 2080-2099 record with
+# validation disabled. Thus the temporal 1977-1980 validation subset is not
+# independent of Phase-1 training. Shared exposure across variants does not prove
+# its effect is negligible or cancels. Keep the fixed-checkpoint scalers; qualify
+# model selection on that subset, and distinguish the independent 1981-1983 test.
+# =============================================================================
+
+data:
+  type: cordex
+
+  # --- training / validation source (1961-1980 + 2080-2099 in ONE file) -------
+  # NOTE: this file's time axis is NOT contiguous. It contains 12 discontinuities:
+  # ten 2-day gaps (29 February removed in 1964/68/72/76/80 and 2080/84/88/92/96)
+  # and one 36,160-day jump between the historical and end-century blocks. The
+  # sequence builder splits runs at every one of them; see docs/temporal_model_architecture.md.
+  training_predictor_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099_regridded.nc
+  training_target_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc
+  validation_predictor_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099_regridded.nc
+  validation_target_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc
+
+  # --- genuinely held-out TEST period (1981-2000), perfect predictors ---------
+  # The source config left these empty. They are populated here with the
+  # benchmark's own held-out historical period, which is disjoint from both the
+  # training (1961-1976) and validation (1977-1980) windows.
+  # These predictor files are on the NATIVE 16x16 coarse grid and are genuinely
+  # interpolated to 128x128 at load time; the training file was pre-regridded.
+  # Their time axis is 365-day while the target axis is Gregorian (7300 vs 7305
+  # records), which the dataset resolves by exact timestamp join -- never by
+  # position.
+  test_predictor_paths:
+  - D:/CORDEX/SA_domain/test/historical/predictors/perfect/ACCESS-CM2_1981-2000.nc
+  test_target_paths:
+  - D:/CORDEX/SA_domain/test/historical/target/pr_tasmax_ACCESS-CM2_1981-2000.nc
+
+  static_path: D:/CORDEX/SA_domain/train/Emulator_hist_future/predictors/Static_fields.nc
+  use_static: true
+  regrid_method: bilinear
+
+  input_vars:
+  - u
+  - v
+  - q
+  - t
+  - z
+  input_levels:
+  - 850.0
+  - 700.0
+  - 500.0
+  input_surface_vars: []
+  input_static_surface_vars:
+  - orog
+  vertical_pres_vars:
+  - u
+  - v
+  - q
+  - t
+  - z
+  vertical_level1_vars: []
+  vertical_level2_vars: []
+  other: []
+  output_vars:
+  - pr
+  - tasmax
+  input_level_pres:
+  - 850.0
+  - 700.0
+  - 500.0
+  input_level1: []
+  input_level2: []
+
+  # Backbone-native multi-timestamp axis -- the mechanism this configuration
+  # exists to use. 2 means the patch embedding accepts [t-1, t] stacked along the
+  # channel axis, oldest first, exactly as upstream flattens
+  # [batch, time, parameter, lat, lon] -> [batch, time x parameter, lat, lon].
+  #
+  # This value is NOT independent of temporal.native_pair.history_offsets: it must
+  # equal len(history_offsets) + 1, and attach_native_pair_adapter raises if it
+  # does not. A silent mismatch would make the patch embedding read a differently
+  # sized channel block and train on garbage.
+  #
+  # The outer temporal.context_length axis still exists and is still a different
+  # thing: it is the window the loader builds so that t-1 is available. History is
+  # real here -- a genuine earlier date, never a duplicated snapshot (for the
+  # deliberately duplicated case, see native_pair.history_mode).
+  n_input_timestamps: 2
+
+  n_random_windows: 1
+  input_size_lat: 16
+  input_size_lon: 16
+  target_size_lat: 128
+  target_size_lon: 128
+  train_crop_size_lat: 128
+  train_crop_size_lon: 128
+  crop_factor: 128
+  downsample_factor: 8
+  train_random_crop_offset:
+  - 0
+  - 0
+  scalers:
+    inputs_mean: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_mean.npy
+    inputs_std: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_std.npy
+    targets_mean: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_mean.npy
+    targets_std: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_std.npy
+
+# =============================================================================
+# Explicit, non-overlapping date splits. Applied BEFORE sequence windows are
+# built, so no window can straddle a boundary and no validation target can be
+# seen as training context.
+#
+#   train      1961-01-01 .. 1976-12-31   (16 yr, 5840 days, 5 contiguous runs)
+#   validation 1977-01-01 .. 1980-12-31   ( 4 yr, 1460 days, 2 contiguous runs)
+#   test       1981-01-01 .. 2000-12-31   (20 yr, held out, separate files)
+#
+# The 2080-2099 block in the training file is deliberately NOT used for training
+# or validation here; it is the climate-change application target and is
+# evaluated distributionally (see docs/temporal_model_architecture.md).
+# =============================================================================
+temporal_splits:
+  train:
+    start: '1961-01-01'
+    end: '1976-12-31'
+  validation:
+    start: '1977-01-01'
+    end: '1980-12-31'
+  test:
+    start: '1981-01-01'
+    end: '2000-12-31'
+
+# =============================================================================
+# TEMPORAL BLOCK
+# =============================================================================
+temporal:
+  enabled: true
+  backend: native_pair
+  mode: downscaling          # zero predictor-to-target lead time
+  causal: true
+  lead_time_days: 0.0
+  cadence_days: 1.0          # daily archive
+
+  # --- sequence geometry -----------------------------------------------------
+  # context_length = 7 is chosen from the data, not by assuming "longer is
+  # better". Measured on the training period (1961-1970, deseasonalized, local
+  # grid points), the variance of the target explained by a linear model on the
+  # coarse predictors is:
+  #     same-day only            pr 0.176   tasmax 0.833
+  #     + history lags 1-3       pr 0.199   tasmax 0.857
+  # i.e. history removes ~13-14% of the remaining unexplained variance, and the
+  # gain is concentrated in lags 1-3 (lag 1 alone contributes over half of it).
+  # Beyond ~lag 5 the apparent gain flattens to a constant per-lag increment,
+  # which is the signature of in-sample overfitting (15 free parameters per lag),
+  # not real signal. Target lag-1 autocorrelation is 0.82 (tasmax) / 0.57 (pr),
+  # decaying to 0.38 / 0.11 by lag 3. A 7-day window therefore spans the entire
+  # genuine memory with margin, and costs 7 forward passes per window at the
+  # bottleneck -- affordable, unlike a 30-day window.
+  context_length: 7
+  warmup_length: 2           # frames 0-1 build state only, are NOT supervised
+  output_length: 5           # frames 2-6 supervised, each with 2-6 days of history
+  # stride == output_length makes training windows tile the record exactly: each
+  # date is supervised once per epoch, with no double counting.
+  sequence_stride: 5
+
+  # --- hidden-state lifecycle ------------------------------------------------
+  state:
+    init: zeros
+    reset_on_discontinuity: true   # honoured by run splitting in the loader
+    carry_across_windows: false    # each training window starts fresh
+    detach_between_chunks: true
+    tbptt_chunk: 0                 # 0 = backprop through the whole 7-frame window
+
+  # --- temporal metadata -----------------------------------------------------
+  time_features:
+    # 'auto' emits hour-of-day sin/cos only if the archive resolves time of day.
+    # This one does not (every stamp is 12:00:00), so they are correctly omitted
+    # rather than fabricated from a constant.
+    include_hour_of_day: auto
+    include_lead_time: false
+  # Resulting channels: season_sin, season_cos, log_gap_excess,
+  # is_sequence_start, state_age  (5 channels).
+  # state_age and is_sequence_start are defined relative to the last state
+  # reset, not to the extent of the current array, so they are invariant to
+  # how a long run is split into inference chunks.
+
+  # --- where the temporal state lives ---------------------------------------
+  # UNUSED by backend: native_pair, which has no bottleneck adapter and no hidden
+  # state -- its influence enters before the transformer, and the U-Net bottleneck
+  # is left exactly as the frame-independent model computes it. Kept so this file
+  # differs from the recurrent/mamba siblings in as few places as possible.
+  latent:
+    site: bottleneck        # [B, 1024, 16, 16] for this case
+    hidden_channels: 256
+    # Small but NON-ZERO. Exactly 0 gives a bit-for-bit identity to the
+    # frame-independent model but also zeroes the gradient of every temporal
+    # parameter, so the module could never learn. 1e-3 keeps the pretrained
+    # prediction intact to ~0.1% while letting everything train from step 1.
+    adapter_init_gate: 0.001
+    norm: group
+    groups: 8
+    time_feature_hidden: 64
+
+  recurrent:
+    # ConvGRU over ConvLSTM: one state tensor instead of two (half the memory to
+    # carry across a TBPTT boundary and across inference chunks) and ~25% fewer
+    # gate parameters, with no consistent accuracy disadvantage in the
+    # nowcasting literature that introduced both. Set cell: convlstm to compare.
+    cell: convgru
+    kernel_size: 3
+    num_layers: 2
+    # Multi-timescale memory: layer 1 couples adjacent latent cells (~8 target
+    # pixels), layer 2 dilated by 2 reaches ~3 cells, giving a wider footprint
+    # for propagating systems without extra parameters.
+    dilations:
+    - 1
+    - 2
+
+  # Present but unused by backend: recurrent. Kept so the two backend configs
+  # differ in exactly one place and are otherwise comparable.
+  mamba:
+    implementation: reference
+    d_state: 16
+    d_conv: 4
+    expand: 2
+    n_layers: 2
+    headdim: 32
+    spatial_mixing: conv3x3
+    scan_axis: time
+    time_scale_from_metadata: true
+    dt_min: 0.001
+    dt_max: 0.1
+
+
+  # --- the paired-state pathway ---------------------------------------------
+  native_pair:
+    # Which earlier dates enter, in cadence steps. [1] = yesterday only, and is
+    # the honest statement of how much history reaches each output: ONE date.
+    # Deliberately minimal. A longer history is a separate, later question, and
+    # testing it first would confound "does native pairing help" with "does more
+    # history help".
+    history_offsets:
+    - 1
+    # 'real' uses the actual earlier date. 'duplicate_current' is the CAPACITY
+    # CONTROL: identical architecture, identical parameter count, identical time
+    # metadata, but the history slot receives a copy of date t, so it carries no
+    # information the frame-independent model did not already have. A gain that
+    # survives against that control cannot be attributed to the extra 30,720
+    # patch-embedding parameters.
+    history_mode: real
+    # Native additive token-level time conditioning: two Linear(1, embed_dim//4)
+    # maps combined as cat(cos(it), cos(lt), sin(it), sin(lt)) and added once to
+    # the token stream before the encoder -- the same form and the same injection
+    # point as PrithviWxC.time_encoding. input_time is the measured interval
+    # between the two input states in hours (+24 here, read from interval_ratio so
+    # a step across a removed 29 February is charged as the two days it is);
+    # lead_time is 0, because this is same-day downscaling.
+    time_conditioning: true
+    # Small but NON-ZERO, for the same reason as latent.adapter_init_gate: exactly
+    # 0 would leave the time-embedding weights with zero gradient on step 1. 1e-3
+    # keeps the inherited prediction intact to ~0.1% while everything trains from
+    # the first update.
+    time_conditioning_gate_init: 0.001
+    pretext:
+      # OFF here. The pretraining-aligned auxiliary objectives are a SEPARATE
+      # ablation (..._prithvi_native_pair_pretext.yaml) so that the architectural
+      # change is never confounded with an objective change in the same run.
+      masked_reconstruction:
+        enabled: false
+        weight: 0.0
+        mask_ratio: 0.5
+      transition:
+        enabled: false
+        weight: 0.0
+        lead_steps: 1
+      head_hidden: 128
+
+  # --- checkpoints -----------------------------------------------------------
+  # Initialize from the existing frame-independent Phase-1 checkpoint. Every one
+  # of its 208 tensors must load; the only keys allowed to be missing are
+  # temporal_adapter.*. The source checkpoint is opened read-only.
+  init_from_spatial_checkpoint: ./examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/phase1_unet/best.ckpt
+  resume_from_temporal_checkpoint: null
+
+  # --- staged fine-tuning ----------------------------------------------------
+  freeze:
+    backbone: true      # 170 of 208 tensors; frozen first so it is not wrecked
+    encoder: true
+    decoder: false      # decoder adapts to the new bottleneck content immediately
+    unfreeze_schedule:
+    - epoch: 3
+      modules:
+      - backbone
+      lr_scale: 1.0
+    lr_temporal: 0.0002
+    lr_decoder: 0.00005
+    lr_encoder: 0.00001
+    lr_backbone: 0.000001
+
+  # --- objectives ------------------------------------------------------------
+  # The per-frame spatial loss (config `loss:` below, unchanged from the source
+  # case) stays dominant. Temporal terms MATCH OBSERVED statistics; none of them
+  # penalizes variability, which would erase fronts and heat-event transitions.
+  losses:
+    per_frame_weight: 1.0
+    predictand_weights:
+      pr: 1.0
+      tasmax: 1.0
+    tendency:
+      # |d(pred) - d(truth)|, NOT |d(pred)|. Minimized by the correct evolution.
+      enabled: true
+      weight: 0.15
+      normalize_by_interval: true
+      predictands:
+        pr: 0.5
+        tasmax: 1.0
+    accumulation:
+      # 3- and 5-day precipitation totals: a distinct statistic from the daily
+      # field, and the one multi-day flood/drought impacts depend on.
+      enabled: true
+      weight: 0.10
+      windows:
+      - 3
+      - 5
+      predictands:
+      - pr
+    occurrence:
+      # Matches P(wet) AND the wet/dry transition probabilities. The transition
+      # term is what resists "add drizzle everywhere", which improves the
+      # marginal wet-day frequency while destroying spell structure.
+      enabled: true
+      weight: 0.05
+      variable: pr
+      wet_threshold: 1.0        # mm/day, physical units
+      transition_weight: 0.5
+      softness: 0.5
+    lag_autocorr:
+      # Disabled by default: with 5 supervised frames per window the per-cell
+      # lag-k correlation is a 5-sample estimate, i.e. mostly noise, and
+      # optimizing noise is worse than omitting the term. Autocorrelation is
+      # instead an EVALUATION metric (temporal.evaluation.autocorr_lags), scored
+      # over the full multi-year test series where the estimate is meaningful.
+      enabled: false
+      weight: 0.0
+      lags:
+      - 1
+      - 2
+      min_samples: 512
+
+  # --- stochastic refinement (optional; OFF for the deterministic baseline) ---
+  refinement:
+    # 'none' keeps the existing per-date Phase-2 path byte-identical, so all four
+    # existing refiners (diffusion/flow-matching x unet/transformer) and their
+    # checkpoints remain valid. Setting this to time_features or latent_state
+    # widens the refiner's conditioning and therefore REQUIRES retraining
+    # Phase 2 -- the code raises with the exact channel counts rather than
+    # loading mismatched weights.
+    temporal_conditioning: none
+    # iid_per_frame is the legacy behaviour. 'ar1_correlated' with 0 < rho < 1
+    # gives each ensemble member a temporally coherent trajectory while keeping
+    # each frame's marginal exactly N(0,1). rho = 1 (identical noise every date)
+    # is rejected by the config layer: it manufactures persistence.
+    noise: iid_per_frame
+    noise_rho: 0.0
+    ensemble_size: 1
+    per_member_state: true
+
+  # --- chunked inference -----------------------------------------------------
+  inference:
+    chunk_length: 64
+    chunk_warmup: 7
+    carry_state_across_chunks: true   # makes chunked == single-pass exactly
+    write_netcdf: true
+    output_dir: ./examples/CORDEX_ML/runs_temporal/SA_T2_ACCESS-CM2_static_temporal_prithvi_native_pair/inference
+
+  # --- evaluation ------------------------------------------------------------
+  evaluation:
+    # The SA perfect-predictor configuration IS event-aligned (verified above),
+    # so date-paired scores are valid here. For the free-running 2080-2099
+    # application, pass --not-event-aligned so only distributional, persistence
+    # and extreme-value diagnostics are reported.
+    event_paired: true
+    wet_threshold: 1.0
+    autocorr_lags:
+    - 1
+    - 2
+    - 3
+    - 5
+    accumulation_windows:
+    - 3
+    - 5
+    deseasonalize: true
+    boundary_width: 8
+    block_bootstrap_length: 30   # exceeds the ~3-5 day decorrelation time
+    n_bootstrap: 500
+
+  seed: 1234
+
+# =============================================================================
+# Everything below is inherited from the source case. The `predictands:`,
+# `loss:` and `model:` blocks are unchanged so the per-frame objective and the
+# output decoding are identical to the frame-independent baseline.
+# =============================================================================
+predictands:
+  pr:
+    name: pr
+    allow_negative_value: false
+    nonnegativity:
+      enabled: true
+      method: softplus
+    scaling:
+      method: divide_only
+      scale_stat: p95
+      fixed_scale: null
+    normalization:
+      method: divide_only
+      mode: global
+      eps_std: 1.0e-06
+      allow_negative_value: false
+  tasmax:
+    name: tasmax
+    allow_negative_value: false
+    nonnegativity:
+      enabled: false
+      method: none
+    scaling:
+      method: zscore
+      scale_stat: mean
+      fixed_scale: null
+    normalization:
+      method: standardize
+      mode: gridpoint
+      eps_std: 1.0e-06
+
+model:
+  input_mu: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_mean.npy
+  input_sigma: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_std.npy
+  target_mu: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_mean.npy
+  target_sigma: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_std.npy
+  embed_dim: 1024
+  n_blocks_encoder: 8
+  mlp_multiplier: 4
+  n_heads: 16
+  dropout_rate: 0.0
+  drop_path: 0.0
+  residual: none
+  num_static_channels: 1
+  token_size:
+  - 1
+  - 1
+  downscaling_patch_size:
+  - 2
+  - 2
+  downscaling_embed_dim: 512
+  encoder_decoder_type: conv
+  encoder_decoder_upsampling_mode: pixel_shuffle
+  encoder_decoder_kernel_size_per_stage:
+  - - 3
+  - - 3
+  encoder_decoder_scale_per_stage:
+  - - 2
+  - - 3
+  encoder_decoder_conv_channels: 128
+  residual_connection: true
+  encoder_shift: false
+  unet: true
+  static_embedding_scale: 1.0
+  static_skip_scale: 1
+  static_dropout_p: 0
+  decoder_upsampling_mode: bilinear
+  output_scaler_resize_mode: bilinear
+  output_scaler_align_corners: false
+  unet_upsample_scales:
+  - 2
+  - 2
+  - 2
+  unet_decoder_kernel_size:
+  - 3
+  - 3
+  - 3
+
+loss:
+  base: rmse
+  predictands:
+    pr:
+      distribution_loss:
+        enabled: false
+        weight: 0.0
+        method: cdf
+        bins: 100
+    tasmax:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: false
+        bins: 100
+  spatial_gradient:
+    enabled: true
+    weight: 0.03
+    predictands:
+      tasmax: 1.0
+      pr: 0.25
+    precipitation_wet_only: true
+    precipitation_wet_threshold: 0.1
+  use_gradient_loss: true
+  gradient_loss_weight: 0.03
+  use_tv_loss: false
+  tv_loss_weight: 0.0005
+  use_multiscale_loss: true
+  multiscale_loss_weight: 0.015
+  tv:
+    enabled: false
+    weight: 0.0005
+    predictands:
+      pr: 0.1
+      tasmax: 0.3
+  multiscale:
+    enabled: true
+    weight: 0.015
+    scales:
+    - 2
+    - 4
+    loss_type: l1
+  boundary_continuity:
+    enabled: true
+    weight: 0.01
+    predictands:
+      pr: 0.2
+      tasmax: 1.0
+    stride_lat: 16
+    stride_lon: 16
+    match_target: true
+
+job_id: SA_T2_ACCESS-CM2_static_temporal_prithvi_native_pair
+case_name: cordex_sa_t2_access_cm2_static_temporal_prithvi_native_pair
+type_training: full_dataset
+# One sequence per step: a 7-frame window already holds 7x the activations of a
+# single frame. Raise together with gradient_accumulation_steps if VRAM allows.
+batch_size: 1
+num_epochs: 6
+dl_num_workers: 2
+dl_prefetch_size: 1
+learning_rate: 0.0002
+max_grad_norm: 1.0
+limit_steps_train: 0
+limit_steps_valid: 100
+min_lr: 1.0e-06
+max_lr: 0.0002
+warm_up_steps: 0
+mask_unit_size:
+- 16
+- 16
+mask_ratio_inputs: 0.0
+mask_ratio_targets: 0.0
+max_batch_size: 4
+gradient_accumulation_steps: 16
+# New experiments and outputs live in their own directory; nothing existing is
+# overwritten.
+path_experiment: ./examples/CORDEX_ML/runs_temporal/SA_T2_ACCESS-CM2_static_temporal_prithvi_native_pair
+checkpoint_dir: ./examples/CORDEX_ML/runs_temporal/SA_T2_ACCESS-CM2_static_temporal_prithvi_native_pair/checkpoints
+run_dir: ./examples/CORDEX_ML/runs_temporal/SA_T2_ACCESS-CM2_static_temporal_prithvi_native_pair/runs
+path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET.pt
+backbone_use: true
+backbone_freeze: false
+backbone_prefix: encoder.
+finetune_w_static: true
+strict_matching: false
+device_target: cuda
+distributed_strategy: none
+fsdp_precision: bf16
+fsdp_min_num_params: 5000000
+backbone_gradient_checkpointing: true
+skip_activation_offload: true
+precip_model: single_head
+precip_wet_threshold: 0.01
+precip_occurrence_prob_threshold: 0.5
+precip_lambda_occurrence: 1.0
+precip_lambda_amount: 1.0
+precip_amount_loss_type: smoothl1
+resume_training: false
+resume_checkpoint_path: null
+auto_resume_if_checkpoint_exists: false
+training:
+  distributed: none
+  num_gpus: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  auto_resume_if_checkpoint_exists: false
+inference:
+  checkpoint_path: null
+  output_dir: ./examples/CORDEX_ML/runs_temporal/SA_T2_ACCESS-CM2_static_temporal_prithvi_native_pair/inference
+  mixed_precision: false
+  mixed_precision_dtype: bfloat16
+  # Full-frame inference: the SA target grid is 128x128, so no tiling is needed
+  # and no tile seams can be introduced.
+  force_full_frame: true
+  inference_tile_size:
+  - 128
+  - 128
+  inference_overlap:
+  - 0
+  - 0
+  inference_blend_window: hann
+  inference_blend_sigma: 0.35
+  use_seam_deblocking: false
+  seam_deblocking_strength: 0.1
+  boundary_mitigation:
+    enabled: false
+    tile_size:
+    - 128
+    - 128
+    overlap:
+    - 0
+    - 0
+    blend_mode: hann
+    force_full_frame: true
+    blend_window: hann
+    blend_sigma: 0.35
+    use_seam_deblocking: false
+    seam_deblocking_strength: 0.1
+    deblock:
+      enabled: false
+      boundary_width: 2
+      strength: 0.1
+      kernel_size: 3

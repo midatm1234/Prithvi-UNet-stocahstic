@@ -945,10 +945,100 @@ mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py train
 mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py infer    --config <yaml> --split test
 mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py evaluate --config <yaml> --predictions <npz>
 
-# five-variant bounded comparison with pre-registered acceptance tolerances
+# bounded comparison with pre-registered acceptance tolerances
 mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_experiment.py \
     --steps 600 --val-steps 60 --epochs 1 --test-years 3
 ```
 
 Notebook: `notebooks/SA_downscaling_temporal_T2_ACCESS-CM2_static.ipynb`.
 Outputs go to `runs_temporal/`, so nothing under `runs/` is touched.
+
+### Prithvi-native paired state
+
+`SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair.yaml`
+and its `..._pretext.yaml` sibling add a third pathway, `temporal.backend:
+native_pair`. Instead of a new memory module after the transformer, it sets
+`data.n_input_timestamps: 2` and puts a **real** earlier date in the second slot,
+so `t-1` and `t` are embedded together and interact inside the shared transformer.
+That is the mechanism upstream Prithvi-WxC uses for its own two input states: it
+folds `[batch, time, parameter, lat, lon]` into `[batch, time x parameter, ...]`
+before anything learned happens, and `input_size_time` exists only to size the
+patch-embedding convolution. The downstream model already reproduced that reshape
+(`cordex_finetune_model.py:971`); every shipped config just set it to 1.
+
+Both files differ from the recurrent config in only: the output paths,
+`data.n_input_timestamps`, `temporal.backend`, and the new `temporal.native_pair`
+block. The `loss:`, `temporal.losses`, `model:`, `predictands:`, `temporal_splits:`,
+`temporal.freeze` and `temporal.evaluation` blocks are byte-identical, so the
+architecture is not confounded with the objective; `tests/test_temporal_native_pair.py`
+asserts this.
+
+```bash
+CFG=examples/CORDEX_ML/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair.yaml
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py check --config $CFG --split validation
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_training.py train --config $CFG
+
+# the paired bounded comparison, with its matched controls
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_experiment.py \
+    --out examples/CORDEX_ML/runs_temporal/experiment_native_pair \
+    --steps 600 --val-steps 60 --epochs 1 --test-years 3 \
+    --variants baseline spatial_ft time_only native_pair native_pair_nohistory native_pair_pretext
+
+# figures, and the mechanically transcribed results tables
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_native_pair_plots.py \
+    --experiment examples/CORDEX_ML/runs_temporal/experiment_native_pair
+mamba run -n Prithvi python examples/CORDEX_ML/cordex_temporal_report.py \
+    --experiment examples/CORDEX_ML/runs_temporal/experiment_native_pair
+```
+
+`native_pair_nohistory` is the capacity control: identical architecture and
+parameter count, but the history slot holds a copy of date `t`. It is an
+**additional** hurdle the candidate must clear on top of the unchanged
+pre-registered `MUST_BEAT` controls, because the pathway widens the patch embedding
+by 30,720 parameters and a gain must not be attributable to capacity.
+
+⚠️ This tests an architectural claim, **not** foundation-model transfer: no
+Prithvi-WxC foundation weights are present in this pipeline. See
+`docs/temporal_native_pair.md` §2.
+
+Two defects this work had to fix, both recorded there: `n_input_timestamps > 1` was
+unreachable (it silently reset the orography scaler from sigma 576.94 to 1.0 before
+failing on a shape mismatch), and the train and test target files disagree on `pr`
+units (`mm/day` vs `kg m-2 s-1`, a factor of 86400).
+
+
+### Selected temporal workflow (takeover v2)
+
+Use `examples/CORDEX_ML/notebooks/Temporal_selected_training_v2.ipynb` to select
+one SA or NARR configuration and checkpoint for train, resume, infer and evaluate.
+Set `BACKEND` to `recurrent`, `mamba`, `native_pair`, or `native_pair_pretext`.
+The notebook uses each YAML's epoch count, accumulation and complete data splits;
+short-run update/validation caps are optional. All action switches default to false.
+Mamba's shipped `implementation: reference` uses the repository's PyTorch backend.
+The spatial-only `SA_downscaling_finetune_T2_ACCESS-CM2_static.ipynb` rejects temporal
+YAMLs early: its frame trainer and two-GPU FSDP setup do not implement the temporal
+workflow. The temporal notebook invokes the dedicated CLI from the repository root.
+The shared CLI accepts `train --resume CHECKPOINT` and repeated
+`--set dotted.path=YAML_value` overrides for existing configuration keys.
+`--max-steps` counts actual successful optimizer updates per epoch; microbatches
+and temporal-parameter updates are recorded separately.
+
+Optional `*_temporal_prithvi_native_pair*_extended_v2.yaml` configurations add
+20-epoch development schedules. They are not launched automatically and are
+separate from the frozen-encoder 600-update comparison. NARR retains
+`case_name: narr_prism_California`, its real NetCDF source contracts, 32 predictor
+channels, `ppt,tmax,tmin` output order, masks and hurdle precipitation.
+
+See `docs/temporal_codex_handoff.md` for current execution/evidence and
+`docs/temporal_pretrained_transfer_takeover.md` for the separate transfer path.
+Existing recurrent/Mamba results remain not accepted. Refinement interface
+compatibility does not establish calibration after changing Phase-1 predictions.
+
+
+Fourteen obsolete/standalone transfer-control YAMLs were removed from the active
+example directories. One current `*_regional_pretrained_transfer_v2.yaml` remains
+per case; select controls using `--initialization` and `--history-mode` instead.
+Archived copies and hashes: `artifacts/config_cleanup_20260915/cleanup_manifest.json`.
+The notebook generator creates no YAMLs by default; `--include-extended-configs`
+explicitly creates missing optional native training schedules. Existing experiment
+snapshots, resolved configurations, scientific recipes and outputs are preserved.

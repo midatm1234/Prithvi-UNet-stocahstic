@@ -1,0 +1,440 @@
+# Optional extended development run; NOT launched by asset generation.
+# Distinct from the frozen-encoder 600-update comparison.
+# Epochs 4/10 unfreeze encoder/backbone at scaled group rates.
+# Existing Adam state is retained; immutable physical scalers stay frozen.
+# Use --max-steps to cap actual optimizer updates per epoch.
+data:
+  type: cordex
+  training_predictor_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099_regridded.nc
+  training_target_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc
+  validation_predictor_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/predictors/ACCESS-CM2_1961-1980_2080-2099_regridded.nc
+  validation_target_paths:
+  - D:/CORDEX/SA_domain/train/Emulator_hist_future/target/pr_tasmax_ACCESS-CM2_1961-1980_2080-2099.nc
+  test_predictor_paths:
+  - D:/CORDEX/SA_domain/test/historical/predictors/perfect/ACCESS-CM2_1981-2000.nc
+  test_target_paths:
+  - D:/CORDEX/SA_domain/test/historical/target/pr_tasmax_ACCESS-CM2_1981-2000.nc
+  static_path: D:/CORDEX/SA_domain/train/Emulator_hist_future/predictors/Static_fields.nc
+  use_static: true
+  regrid_method: bilinear
+  input_vars:
+  - u
+  - v
+  - q
+  - t
+  - z
+  input_levels:
+  - 850.0
+  - 700.0
+  - 500.0
+  input_surface_vars: []
+  input_static_surface_vars:
+  - orog
+  vertical_pres_vars:
+  - u
+  - v
+  - q
+  - t
+  - z
+  vertical_level1_vars: []
+  vertical_level2_vars: []
+  other: []
+  output_vars:
+  - pr
+  - tasmax
+  input_level_pres:
+  - 850.0
+  - 700.0
+  - 500.0
+  input_level1: []
+  input_level2: []
+  n_input_timestamps: 2
+  n_random_windows: 1
+  input_size_lat: 16
+  input_size_lon: 16
+  target_size_lat: 128
+  target_size_lon: 128
+  train_crop_size_lat: 128
+  train_crop_size_lon: 128
+  crop_factor: 128
+  downsample_factor: 8
+  train_random_crop_offset:
+  - 0
+  - 0
+  scalers:
+    inputs_mean: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_mean.npy
+    inputs_std: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_std.npy
+    targets_mean: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_mean.npy
+    targets_std: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_std.npy
+temporal_splits:
+  train:
+    start: '1961-01-01'
+    end: '1976-12-31'
+  validation:
+    start: '1977-01-01'
+    end: '1980-12-31'
+  test:
+    start: '1981-01-01'
+    end: '2000-12-31'
+temporal:
+  enabled: true
+  backend: native_pair
+  mode: downscaling
+  causal: true
+  lead_time_days: 0.0
+  cadence_days: 1.0
+  context_length: 7
+  warmup_length: 2
+  output_length: 5
+  sequence_stride: 5
+  state:
+    init: zeros
+    reset_on_discontinuity: true
+    carry_across_windows: false
+    detach_between_chunks: true
+    tbptt_chunk: 0
+  time_features:
+    include_hour_of_day: auto
+    include_lead_time: false
+  latent:
+    site: bottleneck
+    hidden_channels: 256
+    adapter_init_gate: 0.001
+    norm: group
+    groups: 8
+    time_feature_hidden: 64
+  recurrent:
+    cell: convgru
+    kernel_size: 3
+    num_layers: 2
+    dilations:
+    - 1
+    - 2
+  mamba:
+    implementation: reference
+    d_state: 16
+    d_conv: 4
+    expand: 2
+    n_layers: 2
+    headdim: 32
+    spatial_mixing: conv3x3
+    scan_axis: time
+    time_scale_from_metadata: true
+    dt_min: 0.001
+    dt_max: 0.1
+  native_pair:
+    history_offsets:
+    - 1
+    history_mode: real
+    time_conditioning: true
+    time_conditioning_gate_init: 0.001
+    pretext:
+      masked_reconstruction:
+        enabled: true
+        weight: 0.05
+        mask_ratio: 0.5
+      transition:
+        enabled: true
+        weight: 0.05
+        lead_steps: 1
+      head_hidden: 128
+  init_from_spatial_checkpoint: ./examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/checkpoints/phase1_unet/best.ckpt
+  resume_from_temporal_checkpoint: null
+  freeze:
+    backbone: true
+    encoder: true
+    decoder: false
+    unfreeze_schedule:
+    - epoch: 4
+      modules:
+      - encoder
+      lr_scale: 0.1
+    - epoch: 10
+      modules:
+      - backbone
+      lr_scale: 0.05
+    lr_temporal: 0.0002
+    lr_decoder: 5.0e-05
+    lr_encoder: 1.0e-05
+    lr_backbone: 1.0e-06
+  losses:
+    per_frame_weight: 1.0
+    predictand_weights:
+      pr: 1.0
+      tasmax: 1.0
+    tendency:
+      enabled: true
+      weight: 0.15
+      normalize_by_interval: true
+      predictands:
+        pr: 0.5
+        tasmax: 1.0
+    accumulation:
+      enabled: true
+      weight: 0.1
+      windows:
+      - 3
+      - 5
+      predictands:
+      - pr
+    occurrence:
+      enabled: true
+      weight: 0.05
+      variable: pr
+      wet_threshold: 1.0
+      transition_weight: 0.5
+      softness: 0.5
+    lag_autocorr:
+      enabled: false
+      weight: 0.0
+      lags:
+      - 1
+      - 2
+      min_samples: 512
+  refinement:
+    temporal_conditioning: none
+    noise: iid_per_frame
+    noise_rho: 0.0
+    ensemble_size: 1
+    per_member_state: true
+  inference:
+    chunk_length: 64
+    chunk_warmup: 7
+    carry_state_across_chunks: true
+    write_netcdf: true
+    output_dir: ./examples/CORDEX_ML/runs_temporal/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair_pretext_extended_v2/inference
+  evaluation:
+    event_paired: true
+    wet_threshold: 1.0
+    autocorr_lags:
+    - 1
+    - 2
+    - 3
+    - 5
+    accumulation_windows:
+    - 3
+    - 5
+    deseasonalize: true
+    boundary_width: 8
+    block_bootstrap_length: 30
+    n_bootstrap: 500
+  seed: 1234
+predictands:
+  pr:
+    name: pr
+    allow_negative_value: false
+    nonnegativity:
+      enabled: true
+      method: softplus
+    scaling:
+      method: divide_only
+      scale_stat: p95
+      fixed_scale: null
+    normalization:
+      method: divide_only
+      mode: global
+      eps_std: 1.0e-06
+      allow_negative_value: false
+  tasmax:
+    name: tasmax
+    allow_negative_value: false
+    nonnegativity:
+      enabled: false
+      method: none
+    scaling:
+      method: zscore
+      scale_stat: mean
+      fixed_scale: null
+    normalization:
+      method: standardize
+      mode: gridpoint
+      eps_std: 1.0e-06
+model:
+  input_mu: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_mean.npy
+  input_sigma: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/inputs_std.npy
+  target_mu: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_mean.npy
+  target_sigma: d:/granite-wxc/examples/CORDEX_ML/runs/SA_T2_ACCESS-CM2_static_train/SA_T2_ACCESS-CM2_static_twophase/scalars/targets_std.npy
+  embed_dim: 1024
+  n_blocks_encoder: 8
+  mlp_multiplier: 4
+  n_heads: 16
+  dropout_rate: 0.0
+  drop_path: 0.0
+  residual: none
+  num_static_channels: 1
+  token_size:
+  - 1
+  - 1
+  downscaling_patch_size:
+  - 2
+  - 2
+  downscaling_embed_dim: 512
+  encoder_decoder_type: conv
+  encoder_decoder_upsampling_mode: pixel_shuffle
+  encoder_decoder_kernel_size_per_stage:
+  - - 3
+  - - 3
+  encoder_decoder_scale_per_stage:
+  - - 2
+  - - 3
+  encoder_decoder_conv_channels: 128
+  residual_connection: true
+  encoder_shift: false
+  unet: true
+  static_embedding_scale: 1.0
+  static_skip_scale: 1
+  static_dropout_p: 0
+  decoder_upsampling_mode: bilinear
+  output_scaler_resize_mode: bilinear
+  output_scaler_align_corners: false
+  unet_upsample_scales:
+  - 2
+  - 2
+  - 2
+  unet_decoder_kernel_size:
+  - 3
+  - 3
+  - 3
+loss:
+  base: rmse
+  predictands:
+    pr:
+      distribution_loss:
+        enabled: false
+        weight: 0.0
+        method: cdf
+        bins: 100
+    tasmax:
+      distribution_loss:
+        enabled: true
+        method: cdf
+        weight: 0.05
+        use_mean: true
+        use_std: true
+        use_skewness: false
+        bins: 100
+  spatial_gradient:
+    enabled: true
+    weight: 0.03
+    predictands:
+      tasmax: 1.0
+      pr: 0.25
+    precipitation_wet_only: true
+    precipitation_wet_threshold: 0.1
+  use_gradient_loss: true
+  gradient_loss_weight: 0.03
+  use_tv_loss: false
+  tv_loss_weight: 0.0005
+  use_multiscale_loss: true
+  multiscale_loss_weight: 0.015
+  tv:
+    enabled: false
+    weight: 0.0005
+    predictands:
+      pr: 0.1
+      tasmax: 0.3
+  multiscale:
+    enabled: true
+    weight: 0.015
+    scales:
+    - 2
+    - 4
+    loss_type: l1
+  boundary_continuity:
+    enabled: true
+    weight: 0.01
+    predictands:
+      pr: 0.2
+      tasmax: 1.0
+    stride_lat: 16
+    stride_lon: 16
+    match_target: true
+job_id: SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair_pretext_extended_v2
+case_name: SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair_pretext_extended_v2
+type_training: full_dataset
+batch_size: 1
+num_epochs: 20
+dl_num_workers: 2
+dl_prefetch_size: 1
+learning_rate: 0.0002
+max_grad_norm: 1.0
+limit_steps_train: 0
+limit_steps_valid: 100
+min_lr: 1.0e-06
+max_lr: 0.0002
+warm_up_steps: 0
+mask_unit_size:
+- 16
+- 16
+mask_ratio_inputs: 0.0
+mask_ratio_targets: 0.0
+max_batch_size: 4
+gradient_accumulation_steps: 16
+path_experiment: ./examples/CORDEX_ML/runs_temporal/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair_pretext_extended_v2
+checkpoint_dir: ./examples/CORDEX_ML/runs_temporal/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair_pretext_extended_v2/checkpoints
+run_dir: ./examples/CORDEX_ML/runs_temporal/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair_pretext_extended_v2/runs
+path_model_weights: ./granite-geospatial-wxc-downscaling/ECCC/weights/best_rmse_UNET.pt
+backbone_use: true
+backbone_freeze: false
+backbone_prefix: encoder.
+finetune_w_static: true
+strict_matching: false
+device_target: cuda
+distributed_strategy: none
+fsdp_precision: bf16
+fsdp_min_num_params: 5000000
+backbone_gradient_checkpointing: true
+skip_activation_offload: true
+precip_model: single_head
+precip_wet_threshold: 0.01
+precip_occurrence_prob_threshold: 0.5
+precip_lambda_occurrence: 1.0
+precip_lambda_amount: 1.0
+precip_amount_loss_type: smoothl1
+resume_training: false
+resume_checkpoint_path: null
+auto_resume_if_checkpoint_exists: false
+training:
+  distributed: none
+  num_gpus: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  auto_resume_if_checkpoint_exists: false
+inference:
+  checkpoint_path: null
+  output_dir: ./examples/CORDEX_ML/runs_temporal/SA_downscaling_refinement_T2_ACCESS-CM2_static_temporal_prithvi_native_pair_pretext_extended_v2/inference
+  mixed_precision: false
+  mixed_precision_dtype: bfloat16
+  force_full_frame: true
+  inference_tile_size:
+  - 128
+  - 128
+  inference_overlap:
+  - 0
+  - 0
+  inference_blend_window: hann
+  inference_blend_sigma: 0.35
+  use_seam_deblocking: false
+  seam_deblocking_strength: 0.1
+  boundary_mitigation:
+    enabled: false
+    tile_size:
+    - 128
+    - 128
+    overlap:
+    - 0
+    - 0
+    blend_mode: hann
+    force_full_frame: true
+    blend_window: hann
+    blend_sigma: 0.35
+    use_seam_deblocking: false
+    seam_deblocking_strength: 0.1
+    deblock:
+      enabled: false
+      boundary_width: 2
+      strength: 0.1
+      kernel_size: 3

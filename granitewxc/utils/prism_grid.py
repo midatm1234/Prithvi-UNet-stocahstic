@@ -23,8 +23,9 @@ import numpy as np
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - PRISM workflows run on POSIX hosts
+except ImportError:  # Windows uses an OS byte-range lock instead.
     fcntl = None
+    import msvcrt
 
 
 GRID_ARRAYS_NAME = "prism_grid.npz"
@@ -42,11 +43,20 @@ def _initialization_lock(case_dir: Path | str):
     with open(lock_path, "a+b") as handle:
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        else:
+            # Lock the same byte on every independent file descriptor. Windows
+            # permits locking beyond EOF, so no unlocked initialization write
+            # can race a different publisher's lock.
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
         try:
             yield
         finally:
             if fcntl is not None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            else:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def _axis_hash(name: str, values: np.ndarray) -> str:

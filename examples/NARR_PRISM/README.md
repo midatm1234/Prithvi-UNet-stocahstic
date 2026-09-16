@@ -269,3 +269,75 @@ mamba run -n Prithvi python examples/NARR_PRISM/narr_prism_temporal.py evaluate 
 ```
 
 Outputs go to `runs_temporal/`, so the existing `experiments/` tree is untouched.
+
+### Prithvi-native paired state
+
+`NARR_PRISM_subdomain_temporal_prithvi_native_pair.yaml` and its `..._pretext.yaml`
+sibling add `temporal.backend: native_pair`, which adds no memory module at all.
+It sets `data.n_input_timestamps: 2` and puts a **real** earlier date in the second
+slot, so `t-1` and `t` are embedded together and interact inside the shared
+transformer -- the mechanism upstream Prithvi-WxC uses for its own two input states,
+which it implements by folding the time axis into patch-embedding channels.
+
+Case-specific notes:
+
+- `num_static_channels: 0` is unchanged, so the paired input carries **2 x 32 = 64**
+  channels. The 16 validity masks genuinely differ per date, so pairing them is
+  meaningful; `elev` is time-invariant and is therefore duplicated. One redundant
+  channel out of 64 is accepted deliberately rather than special-cased, because
+  carving elevation out of `x` would break the frame-independent contract these
+  configs must stay compatible with.
+- The **pretext** variant uses `context_length: 6` and `warmup_length: 2`, not
+  `5`/`1`: the auxiliary transition pass needs `x[t-2]`, so a supervised frame needs
+  two frames of real history. `output_length` and `sequence_stride` are unchanged,
+  so the per-window supervision count and tiling density match -- but the emitted
+  frames shift by one within each window, so that variant is **not date-identical**
+  to the other NARR variants and would need its own matched controls. The SA case
+  needs no such change; its `warmup_length: 2` already suffices.
+
+> **Also not executed.** Same blocker as above, and additionally the paired pathway
+> is initialized from the `narr_prism_California` Phase-1 checkpoint, which is
+> absent. These configs are validated by the config layer and by
+> `tests/test_temporal_native_pair.py` (which checks the `num_static_channels: 0`
+> path and the three-target ordering) and by nothing else.
+
+⚠️ Like the SA case, this tests an architectural claim rather than
+foundation-model transfer: no Prithvi-WxC foundation weights are present anywhere
+in this pipeline. See `docs/temporal_native_pair.md` §2.
+
+
+### Selected temporal workflow (takeover v2)
+
+Use `examples/CORDEX_ML/notebooks/Temporal_selected_training_v2.ipynb` to select
+one SA or NARR configuration and checkpoint for train, resume, infer and evaluate.
+Set `BACKEND` to `recurrent`, `mamba`, `native_pair`, or `native_pair_pretext`.
+The notebook uses each YAML's epoch count, accumulation and complete data splits;
+short-run update/validation caps are optional. All action switches default to false.
+Mamba's shipped `implementation: reference` uses the repository's PyTorch backend.
+The spatial-only `SA_downscaling_finetune_T2_ACCESS-CM2_static.ipynb` rejects temporal
+YAMLs early: its frame trainer and two-GPU FSDP setup do not implement the temporal
+workflow. The temporal notebook invokes the dedicated CLI from the repository root.
+The shared CLI accepts `train --resume CHECKPOINT` and repeated
+`--set dotted.path=YAML_value` overrides for existing configuration keys.
+`--max-steps` counts actual successful optimizer updates per epoch; microbatches
+and temporal-parameter updates are recorded separately.
+
+Optional `*_temporal_prithvi_native_pair*_extended_v2.yaml` configurations add
+20-epoch development schedules. They are not launched automatically and are
+separate from the frozen-encoder 600-update comparison. NARR retains
+`case_name: narr_prism_California`, its real NetCDF source contracts, 32 predictor
+channels, `ppt,tmax,tmin` output order, masks and hurdle precipitation.
+
+See `docs/temporal_codex_handoff.md` for current execution/evidence and
+`docs/temporal_pretrained_transfer_takeover.md` for the separate transfer path.
+Existing recurrent/Mamba results remain not accepted. Refinement interface
+compatibility does not establish calibration after changing Phase-1 predictions.
+
+
+Fourteen obsolete/standalone transfer-control YAMLs were removed from the active
+example directories. One current `*_regional_pretrained_transfer_v2.yaml` remains
+per case; select controls using `--initialization` and `--history-mode` instead.
+Archived copies and hashes: `artifacts/config_cleanup_20260915/cleanup_manifest.json`.
+The notebook generator creates no YAMLs by default; `--include-extended-configs`
+explicitly creates missing optional native training schedules. Existing experiment
+snapshots, resolved configurations, scientific recipes and outputs are preserved.

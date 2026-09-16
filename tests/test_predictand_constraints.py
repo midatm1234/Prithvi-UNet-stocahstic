@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from granitewxc.utils.normalization import target_mode
@@ -16,9 +17,17 @@ def _make_config(output_vars: list[str], predictands: dict | None = None):
     )
 
 
-def test_predictand_defaults_enable_softplus_divide_only_for_pr():
+def test_predictand_defaults_enable_softplus_divide_only_for_pr(capsys):
     config = _make_config(["pr", "tasmax"])
-    specs = build_predictand_specs(config, output_vars=["pr", "tasmax"])
+    with pytest.warns(UserWarning) as captured:
+        specs = build_predictand_specs(config, output_vars=["pr", "tasmax"])
+    assert len(captured) == 1
+    assert captured[0].category is UserWarning
+    assert str(captured[0].message) == (
+        "[predictands] tasmax: allow_negative_value=False but nonnegativity.enabled=False. "
+        "This is expected for temperature-like variables."
+    )
+    assert capsys.readouterr().out == "", "Notices must use warning handling, not stdout prints"
     by_name = {spec.name: spec for spec in specs}
 
     assert by_name["pr"].allow_negative_value is False

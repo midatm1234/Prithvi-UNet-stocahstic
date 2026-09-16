@@ -161,3 +161,30 @@ def test_launcher_rejects_zero_shards(
     )
     assert result.returncode == 2
     assert "must be a positive integer" in result.stderr
+
+
+
+@pytest.mark.parametrize("launcher,preprocessor,scalar_script", LAUNCHERS)
+def test_failed_shard_terminates_descendant_pipe_owners(tmp_path,launcher,preprocessor,scalar_script):
+    """A shard's child must not keep communicate() blocked after launcher exit."""
+    config=tmp_path/"case.yaml"
+    config.write_text("case_name: descendant-cleanup-test\n",encoding="utf-8")
+    log=tmp_path/"calls.log"
+    stub=_stub_python(tmp_path)
+    code=stub.read_text(encoding="utf-8")
+    # Handshake ensures the sibling has a live child before the first shard
+    # fails; this reproduces the orphan deterministically rather than by load.
+    code=code.replace("exit 7", 'while [[ ! -f "$CALL_LOG.child" ]]; do sleep 0.02; done\n    exit 7')
+    code=code.replace("exec sleep 30", 'sleep 30 &\n  child=$!\n  printf "%s\\n" "$child" > "$CALL_LOG.child"\n  wait "$child"')
+    stub.write_text(code,encoding="utf-8")
+    env={**os.environ,"PYTHON_BIN":str(stub),"CALL_LOG":str(log),
+         "HAS_VALIDATION":"0","FAIL_TRAIN_SHARD":"0"}
+    result=subprocess.run(["bash",str(launcher),config.name,"--shards","2"],
+               cwd=tmp_path,env=env,text=True,capture_output=True,timeout=10)
+    assert result.returncode != 0
+    assert (tmp_path/"calls.log.child").exists()
+    calls=log.read_text(encoding="utf-8").splitlines()
+    assert len(calls)==2
+    assert all(preprocessor in call and "--mode training" in call for call in calls)
+    assert all(scalar_script not in call for call in calls)
+    assert "scalars were not recomputed" in result.stderr
