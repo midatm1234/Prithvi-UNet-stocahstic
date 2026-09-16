@@ -210,6 +210,9 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
         self.logit_normal_mean = f.logit_normal_mean
         self.logit_normal_std = f.logit_normal_std
         self.mean_path_loss_weight = float(f.mean_path_loss_weight)
+        self.mean_path_channel_weights = tuple(f.mean_path_channel_weights)
+        if self.mean_path_channel_weights and len(self.mean_path_channel_weights)!=residual_channels:
+            raise ValueError("mean_path_channel_weights must match residual channels")
         self.reconstruction_loss_weight = float(
             getattr(config, "reconstruction_loss_weight", 0.25)
         )
@@ -246,6 +249,12 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
             t = torch.sigmoid(z * self.logit_normal_std + self.logit_normal_mean)
         return t.to(device).clamp(0.0, 1.0)
 
+    def predict_process(self, state, conditioning, time):
+        from granitewxc.refinement.preconditioning import flow_coefficients, predict_process
+        return predict_process(self.net, state, conditioning, self._embed_time(time),
+                               flow_coefficients(time, self.sigma_min, state),
+                               self.config.process_preconditioning_channels)
+
     # -- training --------------------------------------------------------
     def training_loss(
         self,
@@ -264,8 +273,10 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
             x0, residual_target, t, self.sigma_min
         )
 
-        prediction = self.net(x_t.to(conditioning.dtype), conditioning, self._embed_time(t))
-        process_loss = masked_loss(prediction, velocity_target, valid_mask, self.loss_kind)
+        prediction = self.predict_process(x_t, conditioning, t)
+        from granitewxc.refinement.process_losses import boundary_balanced_process_weights
+        process_mask = boundary_balanced_process_weights(prediction, valid_mask, self.config.process_boundary_balance_channels)
+        process_loss = masked_loss(prediction, velocity_target, process_mask, self.loss_kind)
         clean_prediction = flow_to_clean(
             x_t, prediction, t, self.sigma_min
         )
@@ -280,6 +291,7 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
             valid_mask,
             zero_anchor,
             self.apply_correction_gate if hasattr(self, "correction_gate") else None,
+            excluded_channels=self.config.native_only_channels,
         )
 
         # The stochastic Gaussian branch above is the actual flow-matching
@@ -294,15 +306,22 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
         if self.mean_path_loss_weight > 0.0:
             t_view = _flow_time_like(t, residual_target)
             mean_path_state = t_view * residual_target
-            mean_path_velocity_prediction = self.net(
-                mean_path_state, conditioning, self._embed_time(t)
-            )
+            mean_path_velocity_prediction = self.predict_process(mean_path_state, conditioning, t)
             mean_path_loss = masked_loss(
                 mean_path_velocity_prediction,
                 residual_target,
                 valid_mask,
                 "huber",
             )
+            if self.mean_path_channel_weights or self.config.native_only_channels:
+                mask = torch.ones_like(residual_target,dtype=torch.bool) if valid_mask is None else torch.broadcast_to(valid_mask.to(dtype=torch.bool),residual_target.shape)
+                terms_by_channel = torch.stack([masked_loss(mean_path_velocity_prediction[:,c:c+1],residual_target[:,c:c+1],mask[:,c:c+1],"huber") for c in range(self.residual_channels)])
+                weights = terms_by_channel.new_tensor(self.mean_path_channel_weights or (1.,) * self.residual_channels)
+                weights[list(self.config.native_only_channels)] = 0.
+                # Keep each retained variable's original coefficient. Removing
+                # precipitation supervision must not double Tmax's weight.
+                active = mask.any(dim=(0,2,3)).sum().clamp(min=1)
+                mean_path_loss = (terms_by_channel*weights).sum()/active
         loss = (
             process_loss
             + self.reconstruction_loss_weight
@@ -361,7 +380,7 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
 
         def velocity(state: torch.Tensor, t_scalar: torch.Tensor) -> torch.Tensor:
             t_batch = t_scalar.expand(batch)
-            return self.net(state.to(dtype), conditioning, self._embed_time(t_batch))
+            return self.predict_process(state, conditioning, t_batch)
 
         endpoint = integrate_flow(
             x, velocity, steps=steps, solver=self.solver,
@@ -371,9 +390,7 @@ class _BaseFlowMatchingRefiner(ResidualRefiner):
             clean = endpoint
         else:
             terminal_time = torch.ones(batch, device=device, dtype=torch.float32)
-            terminal_velocity = self.net(
-                endpoint.to(dtype), conditioning, self._embed_time(terminal_time)
-            )
+            terminal_velocity = self.predict_process(endpoint, conditioning, terminal_time)
             clean = flow_to_clean(endpoint, terminal_velocity, terminal_time, self.sigma_min)
         if trajectory_callback is not None:
             trajectory_callback(
@@ -459,7 +476,16 @@ class FlowMatchingTransformerRefiner(_BaseFlowMatchingRefiner):
             )
         shape = [1] * residual.ndim
         shape[-3] = self.residual_channels
-        return residual * self.correction_gate.reshape(shape).to(residual.dtype)
+        gate = self.correction_gate.reshape(shape).to(residual.dtype)
+        if self.config.unit_correction_gate_channels:
+            if any(c >= self.residual_channels for c in self.config.unit_correction_gate_channels):
+                raise ValueError("Unit correction gate channel is absent from residual field")
+            selected = torch.zeros_like(gate, dtype=torch.bool)
+            indices = [slice(None)] * residual.ndim
+            indices[-3] = list(self.config.unit_correction_gate_channels)
+            selected[tuple(indices)] = True
+            gate = torch.where(selected, torch.ones_like(gate), gate)
+        return residual * gate
 
     def _build_net(self, config: RefinementConfig) -> torch.nn.Module:
         t = config.transformer

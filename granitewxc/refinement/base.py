@@ -293,6 +293,7 @@ def residual_reconstruction_terms(
     valid_mask: torch.Tensor | None,
     zero_anchor: torch.Tensor,
     correction_gate: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    *, excluded_channels: tuple[int, ...] = (),
 ) -> dict[str, torch.Tensor]:
     """Shared deterministic residual losses and detached gate calibration.
 
@@ -313,6 +314,19 @@ def residual_reconstruction_terms(
             f"{tuple(zero_anchor.shape)} and {tuple(clean_prediction.shape)}."
         )
 
+    original_clean = clean_prediction
+    excluded = None
+    if excluded_channels:
+        if len(set(excluded_channels)) != len(excluded_channels) or any(type(c) is not int or c < 0 or c >= clean_prediction.shape[1] for c in excluded_channels):
+            raise ValueError("Excluded auxiliary channels must be unique valid indices")
+        excluded = torch.zeros((1, clean_prediction.shape[1], 1, 1), device=clean_prediction.device, dtype=torch.bool)
+        excluded[:, list(excluded_channels)] = True
+        # Retain original masks/denominators, including active-channel counts.
+        # Equal anchors give exactly zero selected-channel errors for every
+        # reconstruction/structure/gate term without changing Tmax's coefficient.
+        clean_prediction = torch.where(excluded, zero_anchor.detach(), clean_prediction)
+        residual_target = torch.where(excluded, zero_anchor.detach(), residual_target)
+
     reconstruction = masked_loss(
         clean_prediction, residual_target, valid_mask, "huber"
     )
@@ -330,6 +344,11 @@ def residual_reconstruction_terms(
         gate_calibration = masked_loss(
             effective, residual_target, valid_mask, "huber"
         )
+    if excluded is not None:
+        # Diagnostic predictions remain the real model estimates; only the
+        # auxiliary loss evaluation above uses matched zero-error anchors.
+        original_effective = original_clean if correction_gate is None else zero_anchor + correction_gate((original_clean - zero_anchor).detach())
+        effective = torch.where(excluded, original_effective, effective)
     return {
         "reconstruction_loss": reconstruction,
         "gate_calibration_loss": gate_calibration,
@@ -356,6 +375,10 @@ class ResidualRefiner(nn.Module, abc.ABC):
         self.residual_channels = int(residual_channels)
         self.cond_channels = int(cond_channels)
         self.loss_kind = config.loss
+        if any(c >= self.residual_channels for c in config.native_only_channels):
+            raise ValueError("Native-only channel index exceeds residual channels")
+        if any(c >= self.residual_channels for c in config.process_boundary_balance_channels):
+            raise ValueError("Boundary-balance channel index exceeds residual channels")
         self._noise_source: NoiseSource | None = None
 
     @contextlib.contextmanager

@@ -244,6 +244,8 @@ class DiffusionConfig:
 
     training_timesteps: int = 1000
     inference_steps: int = 50
+    solver: str = "ddim"
+    velocity_loss_channels: tuple[int, ...] = ()
     # Direct clean-residual prediction is the schema-2 default. Epsilon
     # prediction is mathematically supported, but small errors at the high-noise
     # endpoint are divided by sqrt(alpha_bar) and produced the observed
@@ -260,6 +262,8 @@ class DiffusionConfig:
     _KEYS = (
         "training_timesteps",
         "inference_steps",
+        "solver",
+        "velocity_loss_channels",
         "prediction_type",
         "schedule",
         "beta_start",
@@ -276,9 +280,14 @@ class DiffusionConfig:
         _reject_unknown("refinement.diffusion", raw, cls._KEYS)
         d = cls()
         sec = "refinement.diffusion"
+        channels=raw.get("velocity_loss_channels", [])
+        if not isinstance(channels,(list,tuple)) or any(isinstance(c,bool) or not isinstance(c,int) or c<0 for c in channels) or len(set(channels))!=len(channels):
+            raise ConfigValidationError("velocity_loss_channels must contain unique nonnegative integer indices")
         out = cls(
+            velocity_loss_channels=tuple(channels),
             training_timesteps=_as_int(sec, "training_timesteps", raw.get("training_timesteps"), d.training_timesteps),
             inference_steps=_as_int(sec, "inference_steps", raw.get("inference_steps"), d.inference_steps),
+            solver=_as_choice(sec, "solver", raw.get("solver"), d.solver, ("ddim", "heun")),
             prediction_type=_as_choice(sec, "prediction_type", raw.get("prediction_type"), d.prediction_type, _PREDICTION_TYPES),
             schedule=_as_choice(sec, "schedule", raw.get("schedule"), d.schedule, _SCHEDULES),
             beta_start=_as_float(sec, "beta_start", raw.get("beta_start"), d.beta_start, minimum=0.0),
@@ -288,6 +297,10 @@ class DiffusionConfig:
             clip_sample_range=_as_float(sec, "clip_sample_range", raw.get("clip_sample_range"), d.clip_sample_range, minimum=0.0),
             eta=_as_float(sec, "eta", raw.get("eta"), d.eta, minimum=0.0, maximum=1.0),
         )
+        if out.velocity_loss_channels and out.prediction_type != "sample":
+            raise ConfigValidationError("velocity_loss_channels requires sample prediction")
+        if out.solver == "heun" and (out.eta != 0.0 or out.clip_sample):
+            raise ConfigValidationError("Diffusion Heun requires eta=0 and clip_sample=false")
         if out.inference_steps > out.training_timesteps:
             raise ConfigValidationError(
                 "refinement.diffusion.inference_steps "
@@ -326,6 +339,7 @@ class FlowMatchingConfig:
     # Optional deterministic zero-source trajectory supervision.  Keeping the
     # default at zero preserves existing checkpoints and training objectives.
     mean_path_loss_weight: float = 0.0
+    mean_path_channel_weights: tuple[float, ...] = ()
 
     _KEYS = (
         "integration_steps",
@@ -337,6 +351,7 @@ class FlowMatchingConfig:
         "logit_normal_mean",
         "logit_normal_std",
         "mean_path_loss_weight",
+        "mean_path_channel_weights",
     )
 
     @classmethod
@@ -345,7 +360,12 @@ class FlowMatchingConfig:
         _reject_unknown("refinement.flow_matching", raw, cls._KEYS)
         d = cls()
         sec = "refinement.flow_matching"
+        weights = raw.get("mean_path_channel_weights", [])
+        if not isinstance(weights,(list,tuple)):
+            raise ConfigValidationError("mean_path_channel_weights must be a list")
+        weights = tuple(_as_float(sec,"mean_path_channel_weights",v,1.,minimum=0.) for v in weights)
         return cls(
+            mean_path_channel_weights=weights,
             integration_steps=_as_int(sec, "integration_steps", raw.get("integration_steps"), d.integration_steps),
             solver=_as_choice(sec, "solver", raw.get("solver"), d.solver, _SOLVERS),
             source_distribution=_as_choice(sec, "source_distribution", raw.get("source_distribution"), d.source_distribution, _SOURCE_DISTRIBUTIONS),
@@ -394,10 +414,13 @@ class ResidualNormalizationConfig:
     # channel without a non-negativity constraint are unaffected.
     signed_log_nonnegative_channels: bool = False
     signed_log_scale: float = 1.0
+    signed_sqrt_nonnegative_channels: bool = False
+    signed_sqrt_scale: float = 1.0
 
     _KEYS = (
         "method", "epsilon", "minimum_scale", "require_fitted",
         "signed_log_nonnegative_channels", "signed_log_scale",
+        "signed_sqrt_nonnegative_channels", "signed_sqrt_scale",
     )
 
     @classmethod
@@ -415,6 +438,11 @@ class ResidualNormalizationConfig:
             raw.get("signed_log_nonnegative_channels"),
             d.signed_log_nonnegative_channels,
         )
+        signed_sqrt = _as_bool(sec,"signed_sqrt_nonnegative_channels",raw.get("signed_sqrt_nonnegative_channels"),False)
+        if signed_log and signed_sqrt:
+            raise ConfigValidationError("Signed-log and signed-square-root residual transforms are mutually exclusive")
+        if signed_sqrt and method != "standardize":
+            raise ConfigValidationError("signed_sqrt_nonnegative_channels requires method='standardize'")
         if signed_log and method != "standardize":
             raise ConfigValidationError(
                 "refinement.residual_normalization.signed_log_nonnegative_channels "
@@ -422,6 +450,8 @@ class ResidualNormalizationConfig:
                 "statistics have no defined meaning under method='identity'."
             )
         return cls(
+            signed_sqrt_nonnegative_channels=signed_sqrt,
+            signed_sqrt_scale=_as_float(sec,"signed_sqrt_scale",raw.get("signed_sqrt_scale"),1.,minimum=1e-6),
             method=method,
             epsilon=_as_float(
                 sec, "epsilon", raw.get("epsilon"), d.epsilon, minimum=0.0
@@ -540,7 +570,7 @@ class TransformerConfig:
             zero_init_output=_as_bool(sec, "zero_init_output", raw.get("zero_init_output"), d.zero_init_output),
             spatial_alignment=_as_choice(
                 sec, "spatial_alignment", raw.get("spatial_alignment"),
-                d.spatial_alignment, ("legacy", "coordinates"),
+                d.spatial_alignment, ("legacy", "coordinates", "endpoints"),
             ),
         )
         if int(embedding_dim // num_heads) % 2 != 0:
@@ -642,6 +672,15 @@ class RefinementConfig:
     train_on_residual: bool = True
     ensemble_size: int = 1
     loss: str = "mse"
+    process_preconditioning_channels: tuple[int, ...] = ()
+    unit_correction_gate_channels: tuple[int, ...] = ()
+    process_boundary_balance_channels: tuple[int, ...] = ()
+    native_only_channels: tuple[int, ...] = ()
+    clean_boundary_channels: tuple[int, ...] = ()
+    clean_boundary_weight: float = 0.0
+    clean_boundary_alpha: float = 3.0
+    clean_boundary_length: float = 8.0
+    clean_boundary_delta: float = 1.0
     reconstruction_loss_weight: float = 0.25
     multiscale_loss_weight: float = 0.10
     gradient_loss_weight: float = 0.05
@@ -670,6 +709,15 @@ class RefinementConfig:
         "train_on_residual",
         "ensemble_size",
         "loss",
+        "process_preconditioning_channels",
+        "unit_correction_gate_channels",
+        "process_boundary_balance_channels",
+        "native_only_channels",
+        "clean_boundary_channels",
+        "clean_boundary_weight",
+        "clean_boundary_alpha",
+        "clean_boundary_length",
+        "clean_boundary_delta",
         "reconstruction_loss_weight",
         "multiscale_loss_weight",
         "gradient_loss_weight",
@@ -711,6 +759,15 @@ class RefinementConfig:
             "train_on_residual": self.train_on_residual,
             "ensemble_size": self.ensemble_size,
             "loss": self.loss,
+            "process_preconditioning_channels": list(self.process_preconditioning_channels),
+            "unit_correction_gate_channels": list(self.unit_correction_gate_channels),
+            "process_boundary_balance_channels": list(self.process_boundary_balance_channels),
+            "native_only_channels": list(self.native_only_channels),
+            "clean_boundary_channels": list(self.clean_boundary_channels),
+            "clean_boundary_weight": self.clean_boundary_weight,
+            "clean_boundary_alpha": self.clean_boundary_alpha,
+            "clean_boundary_length": self.clean_boundary_length,
+            "clean_boundary_delta": self.clean_boundary_delta,
             "reconstruction_loss_weight": self.reconstruction_loss_weight,
             "multiscale_loss_weight": self.multiscale_loss_weight,
             "gradient_loss_weight": self.gradient_loss_weight,
@@ -1050,7 +1107,39 @@ def resolve_refinement_config(config: Any) -> RefinementConfig:
     seed_raw = raw.get("seed")
     seed = None if seed_raw is None else int(seed_raw)
 
+    native_only = raw.get("native_only_channels", [])
+    if not isinstance(native_only, (list, tuple)) or any(type(v) is not int or v < 0 for v in native_only) or len(set(native_only)) != len(native_only):
+        raise ConfigValidationError("native_only_channels must contain unique nonnegative integers")
+    clean_channels = raw.get("clean_boundary_channels", [])
+    if not isinstance(clean_channels, (list, tuple)) or any(type(v) is not int or v < 0 for v in clean_channels) or len(set(clean_channels)) != len(clean_channels):
+        raise ConfigValidationError("clean_boundary_channels must contain unique nonnegative integers")
+    clean_values = {name: _as_float("refinement", "clean_boundary_" + name, raw.get("clean_boundary_" + name), default, minimum=0.0)
+                    for name, default in (("weight", 0.0), ("alpha", 3.0), ("length", 8.0), ("delta", 1.0))}
+    import math
+    if not all(math.isfinite(v) for v in clean_values.values()) or clean_values['length'] <= 0 or clean_values['delta'] <= 0:
+        raise ConfigValidationError("Clean boundary loss parameters must be finite, with positive length and delta")
+    if clean_values['weight'] > 0 and (not clean_channels or raw.get('process_boundary_balance_channels')):
+        raise ConfigValidationError("Clean boundary auxiliary requires selected channels and an unchanged native spatial objective")
+    if clean_values['weight'] > 0 and set(native_only).intersection(clean_channels):
+        raise ConfigValidationError("Native-only channels cannot also have a clean boundary auxiliary")
+    balanced = raw.get("process_boundary_balance_channels", [])
+    if not isinstance(balanced,(list,tuple)) or any(type(v) is not int or v < 0 for v in balanced) or len(set(balanced)) != len(balanced):
+        raise ConfigValidationError("process_boundary_balance_channels must contain unique nonnegative integer channel indices")
+    unit_gate = raw.get("unit_correction_gate_channels", [])
+    if not isinstance(unit_gate,(list,tuple)) or any(type(v) is not int or v < 0 for v in unit_gate) or len(set(unit_gate)) != len(unit_gate):
+        raise ConfigValidationError("unit_correction_gate_channels must contain unique nonnegative integer channel indices")
+    if resolved_type in _TRANSFORMER_TYPES and not set(native_only).issubset(unit_gate):
+        raise ConfigValidationError("Native-only Transformer channels require explicit unit correction gates")
+    preconditioned = raw.get("process_preconditioning_channels", [])
+    if not isinstance(preconditioned, (list, tuple)) or any(type(i) is not int or i < 0 for i in preconditioned) or len(set(preconditioned)) != len(preconditioned):
+        raise ConfigValidationError("process_preconditioning_channels must contain unique nonnegative integer channel indices")
     cfg = RefinementConfig(
+        process_preconditioning_channels=tuple(preconditioned),
+        unit_correction_gate_channels=tuple(unit_gate),
+        process_boundary_balance_channels=tuple(balanced),
+        native_only_channels=tuple(native_only),
+        clean_boundary_channels=tuple(clean_channels),
+        **{'clean_boundary_' + k: v for k, v in clean_values.items()},
         enabled=enabled,
         type=resolved_type if enabled else "none",
         checkpoint=checkpoint,

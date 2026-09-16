@@ -151,18 +151,18 @@ class ExperimentalRefiner(nn.Module):
         if self.recipe.mean_path_loss > 0:
             t = native["flow_time"]
             state = t.reshape(-1, 1, 1, 1) * residual_target
-            zero_source_prediction = self.refiner.net(state.to(conditioning.dtype), conditioning, self.refiner._embed_time(t))
+            zero_source_prediction = self.refiner.predict_process(state, conditioning, t)
         terms: dict[str, list[torch.Tensor]] = {key: [] for key in _TERMS}
         for index in range(self.residual_channels):
             sl = slice(index, index+1)
             gate = None
             if hasattr(self.refiner, "correction_gate"):
-                gate = lambda value, index=index: value * self.refiner.correction_gate[:, index:index+1].to(value)
-            component = residual_reconstruction_terms(clean[:, sl], residual_target[:, sl], valid[:, sl], zero[:, sl], gate)
+                gate = lambda value, index=index: (value if index in self.config.unit_correction_gate_channels else value * self.refiner.correction_gate[:, index:index+1].to(value))
+            component = residual_reconstruction_terms(clean[:, sl], residual_target[:, sl], valid[:, sl], zero[:, sl], gate, excluded_channels=(0,) if index in self.config.native_only_channels else ())
             terms["process_loss"].append(masked_loss(native["prediction"][:, sl], process_target[:, sl], valid[:, sl], "mse"))
             for key in _TERMS[1:-1]:
                 terms[key].append(component[key])
-            terms["mean_path_loss"].append(clean[:, sl].sum() * 0 if zero_source_prediction is None else masked_loss(zero_source_prediction[:, sl], residual_target[:, sl], valid[:, sl], "huber"))
+            terms["mean_path_loss"].append(clean[:, sl].sum() * 0 if zero_source_prediction is None or index in self.config.native_only_channels else masked_loss(zero_source_prediction[:, sl], residual_target[:, sl], valid[:, sl], "huber"))
         per_variable = {key: torch.stack(values) for key, values in terms.items()}
         per_variable_total = sum(getattr(self.recipe, key) * value for key, value in per_variable.items())
         weights = torch.tensor(self.recipe.variable_weights, device=clean.device, dtype=torch.float32) * valid.any(dim=(0, 2, 3))

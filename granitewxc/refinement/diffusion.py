@@ -173,6 +173,10 @@ class _BaseDiffusionRefiner(ResidualRefiner):
         super().__init__(config, residual_channels=residual_channels, cond_channels=cond_channels)
         d = config.diffusion
         self.prediction_type = d.prediction_type
+        if d.velocity_loss_channels and (self.prediction_type != "sample" or self.loss_kind != "mse"):
+            raise ValueError("Velocity-equivalent loss requires sample prediction and MSE")
+        if any(channel >= residual_channels for channel in d.velocity_loss_channels):
+            raise ValueError("Velocity-loss channel is absent from the residual field")
         self.num_train_timesteps = d.training_timesteps
         self.num_inference_steps = d.inference_steps
         self.eta = d.eta
@@ -218,6 +222,14 @@ class _BaseDiffusionRefiner(ResidualRefiner):
         """Feed the raw integer noise index to the embedding (float cast only)."""
         return timesteps.float()
 
+    def predict_process(self, state, conditioning, timesteps):
+        from granitewxc.refinement.preconditioning import diffusion_coefficients, predict_process
+        alpha = self.schedule.sqrt_alphas_cumprod[timesteps]
+        sigma = self.schedule.sqrt_one_minus_alphas_cumprod[timesteps]
+        return predict_process(self.net, state, conditioning, self._embed_time(timesteps),
+                               diffusion_coefficients(alpha, sigma, self.prediction_type, state),
+                               self.config.process_preconditioning_channels)
+
     # -- training --------------------------------------------------------
     def training_loss(
         self,
@@ -241,8 +253,14 @@ class _BaseDiffusionRefiner(ResidualRefiner):
 
         noisy = self.schedule.add_noise(residual_target, noise, timesteps)
         target = self.schedule.training_target(self.prediction_type, residual_target, noise, timesteps)
-        prediction = self.net(noisy.to(conditioning.dtype), conditioning, self._embed_time(timesteps))
-        process_loss = masked_loss(prediction, target, valid_mask, self.loss_kind)
+        prediction = self.predict_process(noisy, conditioning, timesteps)
+        from granitewxc.refinement.process_losses import clean_prediction_process_loss, boundary_balanced_process_weights
+        process_mask = boundary_balanced_process_weights(prediction, valid_mask, self.config.process_boundary_balance_channels)
+        process_loss = clean_prediction_process_loss(
+            prediction, target, process_mask, self.loss_kind,
+            self.schedule.sqrt_one_minus_alphas_cumprod[timesteps],
+            self.config.diffusion.velocity_loss_channels,
+        )
         clean_prediction = self.schedule.to_clean(
             self.prediction_type, prediction, noisy, timesteps
         )
@@ -257,6 +275,7 @@ class _BaseDiffusionRefiner(ResidualRefiner):
             valid_mask,
             zero_anchor,
             self.apply_correction_gate if hasattr(self, "correction_gate") else None,
+            excluded_channels=self.config.native_only_channels,
         )
         loss = (
             process_loss
@@ -289,6 +308,7 @@ class _BaseDiffusionRefiner(ResidualRefiner):
         num_steps: int | None = None,
         initial_state: torch.Tensor | None = None,
         step_noises: Sequence[torch.Tensor] | torch.Tensor | None = None,
+        solver: str | None = None,
         trajectory_callback: Callable[[str, int, torch.Tensor, torch.Tensor], None] | None = None,
     ) -> torch.Tensor:
         """Sample with optional shared random fields and detached snapshots.
@@ -324,12 +344,26 @@ class _BaseDiffusionRefiner(ResidualRefiner):
             if any(tuple(value.shape) != tuple(shape) for value in step_noises):
                 raise ValueError(f"Every DDIM step noise must have shape {shape}")
         timesteps = self.schedule.inference_timesteps(steps, device)
+        selected_solver = self.config.diffusion.solver if solver is None else solver
+        if selected_solver not in {"ddim", "heun"}:
+            raise ValueError(f"Unsupported diffusion solver {selected_solver!r}")
+        if selected_solver == "heun":
+            if self.eta != 0.0 or self.clip_sample or step_noises is not None:
+                raise ValueError("Diffusion Heun requires eta=0, no clipping, and no step noises")
+            from granitewxc.refinement.diffusion_integrators import integrate_noise_angle
+
+            def predict_clean(state, timestep):
+                batch_time = timestep.expand(shape[0])
+                prediction = self.predict_process(state, conditioning, batch_time)
+                return self.schedule.to_clean(self.prediction_type, prediction, state, batch_time)
+
+            return integrate_noise_angle(x, timesteps, self.schedule, predict_clean, trajectory_callback)
         if trajectory_callback is not None:
             trajectory_callback("initial", 0, timesteps[0].detach().clone(), x.detach().clone())
         for idx in range(steps):
             t = timesteps[idx]
             t_batch = t.expand(shape[0])
-            model_out = self.net(x.to(dtype), conditioning, self._embed_time(t_batch))
+            model_out = self.predict_process(x, conditioning, t_batch)
             prev_index = timesteps[idx + 1] if idx + 1 < steps else None
             step_noise = None
             if self.eta > 0.0 and prev_index is not None:
@@ -367,7 +401,7 @@ class _BaseDiffusionRefiner(ResidualRefiner):
         device, dtype = conditioning.device, conditioning.dtype
         x = torch.zeros(shape, device=device, dtype=dtype)
         t = torch.full((shape[0],), self.num_train_timesteps - 1, device=device, dtype=torch.long)
-        model_out = self.net(x, conditioning, self._embed_time(t))
+        model_out = self.predict_process(x, conditioning, t)
         return self.schedule.to_clean(self.prediction_type, model_out, x, t)
 
 
@@ -417,7 +451,16 @@ class DiffusionTransformerRefiner(_BaseDiffusionRefiner):
             )
         shape = [1] * residual.ndim
         shape[-3] = self.residual_channels
-        return residual * self.correction_gate.reshape(shape).to(residual.dtype)
+        gate = self.correction_gate.reshape(shape).to(residual.dtype)
+        if self.config.unit_correction_gate_channels:
+            if any(c >= self.residual_channels for c in self.config.unit_correction_gate_channels):
+                raise ValueError("Unit correction gate channel is absent from residual field")
+            selected = torch.zeros_like(gate, dtype=torch.bool)
+            indices = [slice(None)] * residual.ndim
+            indices[-3] = list(self.config.unit_correction_gate_channels)
+            selected[tuple(indices)] = True
+            gate = torch.where(selected, torch.ones_like(gate), gate)
+        return residual * gate
 
     def _build_net(self, config: RefinementConfig) -> torch.nn.Module:
         t = config.transformer

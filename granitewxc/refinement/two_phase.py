@@ -661,6 +661,24 @@ class TwoPhaseDownscalingModel(nn.Module):
         self.initialize_refiner(cond.shape[1])
         return physical, normalized, cond.to(next(self.refiner.parameters()).dtype)
 
+    def add_clean_boundary_loss(self, losses, target_physical, valid):
+        """Add only selected physical clean-state supervision; keep native losses intact."""
+        cfg = self.refinement_config
+        if cfg.clean_boundary_weight == 0:
+            return losses
+        from granitewxc.refinement.clean_boundary_loss import physical_clean_boundary_loss
+        if self.residual_normalizer is None:
+            raise RuntimeError("Physical clean supervision requires the residual normalizer")
+        clean = self.residual_normalizer.denormalize(losses['clean_residual_prediction'].float())
+        clean = self._effective_physical_residual(clean)
+        auxiliary = physical_clean_boundary_loss(
+            clean, target_physical, valid, cfg.clean_boundary_channels,
+            alpha=cfg.clean_boundary_alpha, length=cfg.clean_boundary_length,
+            delta=cfg.clean_boundary_delta,
+        )
+        return {**losses, 'loss': losses['loss'] + cfg.clean_boundary_weight * auxiliary,
+                'clean_boundary_loss': auxiliary}
+
     def training_step(
         self,
         batch: Mapping[str, torch.Tensor],
@@ -702,6 +720,7 @@ class TwoPhaseDownscalingModel(nn.Module):
             generator=generator,
             zero_residual=zero_residual.to(cond.dtype),
         )
+        losses = self.add_clean_boundary_loss(losses, target_physical, valid)
         return TwoPhaseOutput(
             deterministic=physical,
             deterministic_normalized=normalized,
@@ -1042,6 +1061,9 @@ def build_two_phase_model(
     """Build the wrapper from a raw experiment configuration."""
     refinement = resolve_refinement_config(config)
     performance = resolve_performance_config(config)
+    from granitewxc.refinement.precision import configure_refinement_precision
+
+    configure_refinement_precision(performance)
     if performance.precision.allow_tf32:
         warnings.warn(
             "performance.precision.allow_tf32 is enabled; validate numerical "

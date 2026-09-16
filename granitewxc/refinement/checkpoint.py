@@ -239,6 +239,9 @@ def _residual_normalization_contract(config: Any) -> dict[str, Any]:
     if bool(getattr(section, "signed_log_nonnegative_channels", False)):
         contract["signed_log_nonnegative_channels"] = True
         contract["signed_log_scale"] = float(getattr(section, "signed_log_scale"))
+    if bool(getattr(section, "signed_sqrt_nonnegative_channels", False)):
+        contract["signed_sqrt_nonnegative_channels"] = True
+        contract["signed_sqrt_scale"] = float(getattr(section, "signed_sqrt_scale"))
     return contract
 
 
@@ -247,6 +250,11 @@ def _build_scientific_contract(config: Any) -> dict[str, Any]:
     if refinement_type.startswith("diffusion_"):
         family = "diffusion"
         process = _config_section(getattr(config, "diffusion"))
+        if not process.get("velocity_loss_channels"):
+            process.pop("velocity_loss_channels", None)
+        # Existing checkpoints predate the optional numerical integrator.
+        if process.get("solver", "ddim") == "ddim":
+            process.pop("solver", None)
     elif refinement_type.startswith("flow_matching_"):
         family = "flow_matching"
         process = _config_section(getattr(config, "flow_matching"))
@@ -254,6 +262,8 @@ def _build_scientific_contract(config: Any) -> dict[str, Any]:
         # not contain this key.  An explicit zero is exactly the old objective,
         # so omit it from the scientific contract for backward compatibility;
         # any positive opt-in remains fingerprinted and must match on load.
+        if not process.get("mean_path_channel_weights"):
+            process.pop("mean_path_channel_weights", None)
         if float(process.get("mean_path_loss_weight", 0.0)) == 0.0:
             process.pop("mean_path_loss_weight", None)
     else:
@@ -291,6 +301,15 @@ def _build_scientific_contract(config: Any) -> dict[str, Any]:
             "contract_version": REFINEMENT_CONTRACT_VERSION,
             "refinement_type": refinement_type,
             "residual_contract": "physical_ground_truth_minus_phase1_v1",
+            **({"process_preconditioning": {"version": "gaussian_source_endpoint_v1", "channels": list(config.process_preconditioning_channels)}}
+               if config.process_preconditioning_channels else {}),
+            **({"unit_correction_gate_channels": list(config.unit_correction_gate_channels)} if config.unit_correction_gate_channels else {}),
+            **({"process_boundary_balance": {"version": "half_global_half_seven_frame_bands_v1", "channels": list(config.process_boundary_balance_channels)}} if config.process_boundary_balance_channels else {}),
+            **({"clean_boundary_loss": {"version": "physical_huber_exponential_frame_distance_v1",
+                "channels": list(config.clean_boundary_channels), "weight": config.clean_boundary_weight,
+                "alpha": config.clean_boundary_alpha, "length": config.clean_boundary_length,
+                "delta": config.clean_boundary_delta}} if config.clean_boundary_weight > 0 else {}),
+            **({"native_only_channels": list(config.native_only_channels)} if config.native_only_channels else {}),
             "train_on_residual": bool(getattr(config, "train_on_residual")),
             "reconstruction_loss_weight": float(
                 getattr(config, "reconstruction_loss_weight", 0.0)

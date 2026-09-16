@@ -44,6 +44,12 @@ class ResidualNormalizer(nn.Module):
         self.require_fitted = bool(config.require_fitted)
         self.signed_log_enabled = bool(config.signed_log_nonnegative_channels)
         self.signed_log_scale = float(config.signed_log_scale)
+        self.signed_sqrt_enabled = bool(config.signed_sqrt_nonnegative_channels)
+        self.signed_sqrt_scale = float(config.signed_sqrt_scale)
+        if self.signed_log_enabled and self.signed_sqrt_enabled:
+            raise ValueError("Signed residual transformations are mutually exclusive")
+        if self.signed_sqrt_enabled and self.method != "standardize":
+            raise RuntimeError("signed_sqrt_nonnegative_channels requires method='standardize'")
         if self.signed_log_enabled and self.method != "standardize":
             raise RuntimeError(
                 "signed_log_nonnegative_channels requires method='standardize'."
@@ -56,10 +62,10 @@ class ResidualNormalizer(nn.Module):
         self.register_buffer("_m2", torch.zeros(shape, dtype=torch.float64), persistent=persistent)
         self.register_buffer("fitted", torch.tensor(self.method == "identity"), persistent=persistent)
 
-        if self.signed_log_enabled:
+        if self.signed_log_enabled or self.signed_sqrt_enabled:
             if nonnegative_mask is None:
                 raise RuntimeError(
-                    "signed_log_nonnegative_channels is enabled but no "
+                    "A signed residual transformation is enabled but no "
                     "nonnegative_mask was supplied to ResidualNormalizer."
                 )
             mask = nonnegative_mask.detach().to(dtype=torch.bool).reshape(-1)
@@ -71,29 +77,43 @@ class ResidualNormalizer(nn.Module):
             mask = mask.reshape(shape)
         else:
             mask = torch.zeros(shape, dtype=torch.bool)
-        self.register_buffer("signed_log_mask", mask, persistent=self.signed_log_enabled)
+        self.register_buffer("signed_log_mask", mask if self.signed_log_enabled else torch.zeros_like(mask), persistent=self.signed_log_enabled)
+        self.register_buffer("signed_sqrt_mask", mask if self.signed_sqrt_enabled else torch.zeros_like(mask), persistent=self.signed_sqrt_enabled)
 
-    # -- signed-log residual transform ------------------------------------
+    # -- signed residual transformations ------------------------------------
     def _forward_transform(self, values: torch.Tensor) -> torch.Tensor:
-        """``sign(r) * log1p(|r| / scale)`` on the configured nonnegative channels.
+        """Apply the configured signed log or signed square-root residual map.
 
         Compresses the dynamic range of heavy-tailed precipitation residuals
         (a small fraction of extreme wet-cell errors otherwise dominates a
         per-channel MSE/Huber loss) while remaining exactly invertible and
         leaving unmasked channels (e.g. temperature) bit-for-bit unchanged.
         """
+        if self.signed_sqrt_enabled:
+            # Rationalized form avoids cancellation around dry/zero residuals.
+            scaled = values / self.signed_sqrt_scale
+            transformed = scaled / (torch.sqrt(1 + scaled.abs()) + 1)
+            return torch.where(self.signed_sqrt_mask.to(values.device), transformed, values)
         if not self.signed_log_enabled:
             return values
         mask = self.signed_log_mask.to(device=values.device)
         transformed = torch.sign(values) * torch.log1p(torch.abs(values) / self.signed_log_scale)
+        # sign/abs has a spurious zero autodiff slope at exactly zero. Keep
+        # every nonzero forward value unchanged and use the analytic limit.
+        transformed = torch.where(values == 0, values / self.signed_log_scale, transformed)
         return torch.where(mask, transformed, values)
 
     def _inverse_transform(self, values: torch.Tensor) -> torch.Tensor:
         """Exact inverse of :meth:`_forward_transform`."""
+        if self.signed_sqrt_enabled:
+            # s*z*(abs(z)+2) is the signed quadratic inverse, including z=0.
+            reconstructed = self.signed_sqrt_scale * values * (values.abs() + 2)
+            return torch.where(self.signed_sqrt_mask.to(values.device), reconstructed, values)
         if not self.signed_log_enabled:
             return values
         mask = self.signed_log_mask.to(device=values.device)
         reconstructed = torch.sign(values) * torch.expm1(torch.abs(values)) * self.signed_log_scale
+        reconstructed = torch.where(values == 0, values * self.signed_log_scale, reconstructed)
         return torch.where(mask, reconstructed, values)
 
     @property
@@ -226,9 +246,8 @@ class ResidualNormalizer(nn.Module):
         """JSON-safe provenance and summary statistics.
 
         ``mean``/``scale`` are reported in the space actually standardized:
-        the signed-log-transformed residual for channels where
-        ``signed_log_nonnegative_channels`` is enabled, physical units
-        otherwise.
+        the signed-log or signed-square-root residual for enabled channels,
+        and physical residual units for the remaining channels.
         """
         meta = {
             "method": self.method,
@@ -244,4 +263,8 @@ class ResidualNormalizer(nn.Module):
             meta["signed_log_nonnegative_channels"] = True
             meta["signed_log_scale"] = self.signed_log_scale
             meta["signed_log_mask"] = self.signed_log_mask.detach().cpu().reshape(-1).tolist()
+        if self.signed_sqrt_enabled:
+            meta["signed_sqrt_nonnegative_channels"] = True
+            meta["signed_sqrt_scale"] = self.signed_sqrt_scale
+            meta["signed_sqrt_mask"] = self.signed_sqrt_mask.detach().cpu().reshape(-1).tolist()
         return meta

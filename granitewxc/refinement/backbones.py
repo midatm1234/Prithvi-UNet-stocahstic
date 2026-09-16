@@ -458,7 +458,9 @@ class SpatialResidualTransformer(nn.Module):
     are reshaped back to that grid, bilinearly resized, and decoded by local
     convolutions with full-resolution stem skips.  Trailing-edge padding is
     cropped exactly, preserving the original latitude/longitude orientation and
-    avoiding independent per-patch pixel reconstruction.
+    avoiding independent per-patch pixel reconstruction. The opt-in endpoints
+    mode adds real trailing-edge token centers and removes the constant coarse
+    border extension; it changes attention geometry and requires retraining.
     """
 
     def __init__(
@@ -484,7 +486,7 @@ class SpatialResidualTransformer(nn.Module):
     ) -> None:
         super().__init__()
         self.spatial_alignment = str(spatial_alignment).lower()
-        if self.spatial_alignment not in {"legacy", "coordinates"}:
+        if self.spatial_alignment not in {"legacy", "coordinates", "endpoints"}:
             raise ValueError(f"Unsupported spatial_alignment {spatial_alignment!r}")
         self.patch_h, self.patch_w = int(patch_size[0]), int(patch_size[1])
         if self.patch_h < 1 or self.patch_w < 1:
@@ -646,6 +648,31 @@ class SpatialResidualTransformer(nn.Module):
             self._sincos_cache[key] = cached
         return cached
 
+    def _positional_at_centers(self, centers_y, centers_x, dtype):
+        """Encode physical centers in the existing per-axis stride units."""
+        from granitewxc.refinement.spatial_lattice import interpolate_position_table
+        y, x = centers_y / self.patch_h, centers_x / self.patch_w
+        if self.positional_encoding == "learned_2d":
+            # Generated centers are nonnegative and their ceiling in stride
+            # units is exactly len(axis)-1. Check static sizes once per call,
+            # avoiding GPU synchronization for known geometry at every step.
+            if len(centers_y) > len(self.pos_lat) or len(centers_x) > len(self.pos_lon):
+                raise ValueError("Endpoint token coordinates exceed max_tokens")
+            lat = interpolate_position_table(self.pos_lat, y, validate=False)
+            lon = interpolate_position_table(self.pos_lon, x, validate=False)
+            return (lat[:, None] + lon[None, :]).reshape(-1, self.embedding_dim).to(dtype)
+        if self.embedding_dim % 4:
+            raise ValueError("sincos_2d positional encoding requires embedding_dim divisible by four")
+        quarter = self.embedding_dim // 4
+        omega = torch.arange(quarter, device=y.device, dtype=torch.float32)
+        omega = 1.0 / (10000.0 ** (omega / quarter))
+        def encode(axis):
+            phase = axis[:, None] * omega[None, :]
+            return torch.cat((phase.sin(), phase.cos()), dim=-1)
+        lat = encode(y)[:, None].expand(-1, len(x), -1)
+        lon = encode(x)[None, :].expand(len(y), -1, -1)
+        return torch.cat((lat, lon), dim=-1).reshape(-1, self.embedding_dim).to(dtype)
+
     # -- forward ---------------------------------------------------------
     def forward(self, x: torch.Tensor, cond: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4 or cond.ndim != 4:
@@ -687,8 +714,15 @@ class SpatialResidualTransformer(nn.Module):
         padded_h, padded_w = x.shape[-2:]
         state_features = self.state_stem(x)
         condition_features = self.condition_stem(cond)
-        state_grid = self.state_patch_embed(state_features)
-        condition_grid = self.condition_patch_embed(condition_features)
+        if self.spatial_alignment == "endpoints":
+            from granitewxc.refinement.spatial_lattice import endpoint_patch_embed
+            state_grid, centers_y, centers_x = endpoint_patch_embed(self.state_patch_embed, state_features)
+            condition_grid, condition_y, condition_x = endpoint_patch_embed(self.condition_patch_embed, condition_features)
+            if self.state_patch_embed.stride != self.condition_patch_embed.stride:
+                raise RuntimeError("State/conditioning physical token centers differ")
+        else:
+            state_grid = self.state_patch_embed(state_features)
+            condition_grid = self.condition_patch_embed(condition_features)
         if state_grid.shape != condition_grid.shape:
             raise RuntimeError(
                 "State and conditioning patch embeddings disagree: "
@@ -699,6 +733,8 @@ class SpatialResidualTransformer(nn.Module):
             (padded_h + self.patch_h - 1) // self.patch_h,
             (padded_w + self.patch_w - 1) // self.patch_w,
         )
+        if self.spatial_alignment == "endpoints":
+            expected_grid = (len(centers_y), len(centers_x))
         if (grid_h, grid_w) != expected_grid:
             raise RuntimeError(
                 f"Overlapping patch embedding produced {(grid_h, grid_w)}, expected "
@@ -707,7 +743,11 @@ class SpatialResidualTransformer(nn.Module):
         tokens = state_grid.flatten(2).transpose(1, 2)
         spatial_cond = condition_grid.flatten(2).transpose(1, 2)
         tokens = tokens + spatial_cond
-        tokens = tokens + self._positional(grid_h, grid_w, tokens.device, tokens.dtype).unsqueeze(0)
+        if self.spatial_alignment == "endpoints":
+            position = self._positional_at_centers(centers_y, centers_x, tokens.dtype)
+        else:
+            position = self._positional(grid_h, grid_w, tokens.device, tokens.dtype)
+        tokens = tokens + position.unsqueeze(0)
 
         cond_emb = self.time_embed(t).to(tokens.dtype)
         for block in self.blocks:
@@ -727,7 +767,9 @@ class SpatialResidualTransformer(nn.Module):
         token_grid = tokens.transpose(1, 2).reshape(
             b, self.embedding_dim, grid_h, grid_w
         )
-        if self.spatial_alignment == "coordinates":
+        if self.spatial_alignment == "endpoints":
+            decoded = _resize_from_centers(token_grid, centers_y, centers_x, (h, w))
+        elif self.spatial_alignment == "coordinates":
             decoded = _resize_from_centers(
                 token_grid,
                 torch.arange(grid_h, device=token_grid.device) * self.patch_h,
