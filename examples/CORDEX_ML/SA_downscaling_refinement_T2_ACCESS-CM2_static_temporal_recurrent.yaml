@@ -520,7 +520,7 @@ type_training: full_dataset
 # One sequence per step: a 7-frame window already holds 7x the activations of a
 # single frame. Raise together with gradient_accumulation_steps if VRAM allows.
 batch_size: 1
-num_epochs: 6
+num_epochs: 25
 dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 0.0002
