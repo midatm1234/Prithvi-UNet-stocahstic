@@ -31,7 +31,10 @@ from narr_prism_inference import (
 from narr_prism_refinement import (
     _refinement_checkpoint,
     _require_checkpoint_path,
+    _resume_with_batch_size_migration,
+    _save_epochs_vs_loss_curve,
     _seed_training,
+    _validation_rank_limit,
 )
 from narr_prism_refinement_inference import (
     CoordinateAlignedNoiseSource,
@@ -75,6 +78,138 @@ def test_checkpoint_guard_accepts_file_and_yaml_phase2_fallback(
     assert _require_checkpoint_path(
         str(checkpoint), label="Phase-2 refinement"
     ) == str(checkpoint.resolve())
+
+
+def _batch_resume_contract(
+    *, batch_size: int, epochs: int = 50
+) -> dict[str, object]:
+    scale = 4 // batch_size
+    return {
+        "contract_version": 1,
+        "optimizer": "torch.optim.AdamW",
+        "min_learning_rate": 1.0e-6,
+        "scheduler_t_max": epochs * 3125,
+        "epochs": epochs,
+        "per_device_batch_size": batch_size,
+        "gradient_accumulation_steps": 8 * scale,
+        "limit_steps_train": 25000 * scale,
+        "limit_steps_valid": 25 * scale,
+        "effective_train_batches_per_epoch": 25000 * scale,
+        "optimizer_steps_per_epoch": 3125,
+        "total_optimizer_steps": epochs * 3125,
+    }
+
+
+def test_batch_size_resume_migration_preserves_training_budget(tmp_path) -> None:
+    saved = _batch_resume_contract(batch_size=1)
+    saved.pop("per_device_batch_size")
+    current = _batch_resume_contract(batch_size=4)
+    checkpoint = tmp_path / "last.ckpt"
+    torch.save({"resolved_config": {"training": saved}}, checkpoint)
+
+    class FakeTrainer:
+        def __init__(self):
+            self.resolved_config = {"training": current}
+            self.resume_calls = []
+
+        def resume(self, path):
+            assert self.resolved_config["training"] == saved
+            self.resume_calls.append(path)
+            return "resumed"
+
+    trainer = FakeTrainer()
+    state = _resume_with_batch_size_migration(
+        trainer,
+        str(checkpoint),
+        previous_per_device_batch_size=1,
+        current_per_device_batch_size=4,
+        announce=False,
+    )
+    assert state == "resumed"
+    assert trainer.resume_calls == [str(checkpoint)]
+    assert trainer.resolved_config["training"] == current
+
+
+def test_batch_size_resume_migration_rejects_changed_sample_budget(tmp_path) -> None:
+    saved = _batch_resume_contract(batch_size=1)
+    saved.pop("per_device_batch_size")
+    current = _batch_resume_contract(batch_size=4)
+    current["limit_steps_train"] = 24999
+    checkpoint = tmp_path / "last.ckpt"
+    torch.save({"resolved_config": {"training": saved}}, checkpoint)
+    trainer = SimpleNamespace(resolved_config={"training": current})
+
+    with pytest.raises(RuntimeError, match="changes limit_steps_train"):
+        _resume_with_batch_size_migration(
+            trainer,
+            str(checkpoint),
+            previous_per_device_batch_size=1,
+            current_per_device_batch_size=4,
+            announce=False,
+        )
+
+
+def test_resume_migration_extends_cosine_from_checkpoint_lr(tmp_path) -> None:
+    saved = _batch_resume_contract(batch_size=1, epochs=50)
+    saved.pop("per_device_batch_size")
+    current = _batch_resume_contract(batch_size=4, epochs=100)
+    checkpoint = tmp_path / "last.ckpt"
+    torch.save({"resolved_config": {"training": saved}}, checkpoint)
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW([parameter], lr=1.0e-4)
+    checkpoint_lr = 2.1404630011522674e-5
+
+    class FakeTrainer:
+        def __init__(self):
+            self.resolved_config = {"training": current}
+            self.optimizer = optimizer
+            self.scheduler = None
+
+        def resume(self, _path):
+            self.optimizer.param_groups[0]["lr"] = checkpoint_lr
+            return SimpleNamespace(epoch=35, global_step=109375)
+
+    trainer = FakeTrainer()
+    _resume_with_batch_size_migration(
+        trainer,
+        str(checkpoint),
+        previous_per_device_batch_size=1,
+        current_per_device_batch_size=4,
+        previous_num_epochs=50,
+        current_num_epochs=100,
+        announce=False,
+    )
+    extension = trainer.resolved_config["training"]["schedule_extension"]
+    assert extension["from_epochs"] == 50
+    assert extension["to_epochs"] == 100
+    assert extension["at_epoch"] == 35
+    assert extension["remaining_optimizer_steps"] == 65 * 3125
+    assert trainer.scheduler.T_max == 65 * 3125
+    assert trainer.optimizer.param_groups[0]["lr"] == pytest.approx(checkpoint_lr)
+
+
+def test_epochs_vs_loss_curve_uses_complete_resumed_history(tmp_path) -> None:
+    state = SimpleNamespace(
+        train_loss_history=[1.0, 0.5, 0.25],
+        val_loss_history=[0.8, 0.3, 0.4],
+    )
+    observed = _save_epochs_vs_loss_curve(state, str(tmp_path))
+    expected = tmp_path / "epochs_vs_loss.png"
+    assert observed == str(expected)
+    assert expected.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert not (tmp_path / "epochs_vs_loss.png.tmp").exists()
+
+
+def test_epochs_vs_loss_curve_skips_empty_history(tmp_path) -> None:
+    state = SimpleNamespace(train_loss_history=[], val_loss_history=[])
+    assert _save_epochs_vs_loss_curve(state, str(tmp_path)) is None
+    assert not (tmp_path / "epochs_vs_loss.png").exists()
+
+
+def test_validation_limit_is_distributed_without_extra_batches() -> None:
+    per_rank = [_validation_rank_limit(25, 4, rank) for rank in range(4)]
+    assert per_rank == [7, 6, 6, 6]
+    assert sum(per_rank) == 25
 
 
 def test_checkpoint_guard_reports_recursive_symlink(tmp_path) -> None:
@@ -417,6 +552,42 @@ def test_predictor_only_inference_sample_never_loads_prism_targets() -> None:
     assert sample["y"].shape == (3, 3, 4)
     assert torch.count_nonzero(sample["y"]) == 0
     assert sample["date"] == "2016-01-01"
+
+
+def test_predictor_alignment_announcement_is_optional_and_prints_once(
+    capsys,
+) -> None:
+    stacked = np.zeros((2, 3, 4), dtype=np.float32)
+    crop_lat = np.arange(3)
+    crop_lon = np.arange(4)
+
+    dataset = object.__new__(NarrPrismDataset)
+    dataset.use_preprocessed = True
+    dataset._log_alignment = True
+    dataset._check_predictor_alignment(stacked, crop_lat, crop_lon)
+    dataset._check_predictor_alignment(stacked, crop_lat, crop_lon)
+    assert capsys.readouterr().out.count(
+        "[dataset] predictor->PRISM alignment OK"
+    ) == 1
+
+    quiet_dataset = object.__new__(NarrPrismDataset)
+    quiet_dataset.use_preprocessed = True
+    quiet_dataset._log_alignment = False
+    quiet_dataset._check_predictor_alignment(stacked, crop_lat, crop_lon)
+    assert capsys.readouterr().out == ""
+
+
+def test_disabled_alignment_announcement_does_not_disable_validation() -> None:
+    dataset = object.__new__(NarrPrismDataset)
+    dataset.use_preprocessed = True
+    dataset._log_alignment = False
+
+    with pytest.raises(ValueError, match="Predictor regrid misaligned"):
+        dataset._check_predictor_alignment(
+            np.zeros((2, 2, 4), dtype=np.float32),
+            np.arange(3),
+            np.arange(4),
+        )
 
 
 def _noise(origin, *, sample_date="2016-01-01", member=0):

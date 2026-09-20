@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -25,6 +26,11 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -463,6 +469,8 @@ def _predict_tile_ensemble(
     base_seed: int,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     deterministic, normalized, conditioning = model._prepare(batch)
+    # Preserve the original FP32 physical tile as well as its exact encoding.
+    deterministic = batch.get("__phase1_physical", deterministic)
     if model.refiner is None:
         raise RuntimeError(
             "active refinement model did not initialize its refiner"
@@ -681,6 +689,138 @@ def _load_phase2(
     return fingerprint, payload
 
 
+def _resume_existing_output(
+    path: Path,
+    *,
+    variables: Sequence[str],
+    sample_date: Any,
+    refinement_type: str,
+    ensemble_size: int,
+    base_seed: int,
+    phase1_checkpoint: str,
+    refinement_checkpoint: str,
+    split: str,
+    compression: bool,
+    compression_level: int,
+    phase1_cache_digest: str | None = None,
+) -> bool:
+    """Validate and, when possible, normalize an existing daily product.
+
+    Existing products with more members than requested are reduced to the
+    deterministic member prefix and rewritten atomically. Coordinate-aligned
+    seeding guarantees those prefix members are identical to a fresh smaller
+    ensemble run.
+    """
+    if not path.is_file():
+        return False
+    import xarray as xr
+
+    expected_date = _date_key(sample_date)
+    expected_order = json.dumps(list(variables))
+    try:
+        with xr.open_dataset(path) as existing:
+            attrs = dict(existing.attrs)
+            required = {
+                "refinement_type": refinement_type,
+                "phase1_checkpoint": str(phase1_checkpoint),
+                "phase2_checkpoint": str(refinement_checkpoint),
+                "dataset_split": split,
+                "inference_date": expected_date,
+                "variable_order": expected_order,
+                "base_seed": int(base_seed),
+            }
+            if phase1_cache_digest is not None:
+                required["phase1_cache_digest"] = phase1_cache_digest
+            for key, expected in required.items():
+                if str(attrs.get(key)) != str(expected):
+                    return False
+            available_members = min(
+                sum(
+                    name.startswith(f"{variable}_member_")
+                    for name in existing.data_vars
+                )
+                for variable in variables
+            )
+            if available_members < ensemble_size:
+                return False
+            if available_members == ensemble_size and int(
+                attrs.get("ensemble_size", -1)
+            ) == ensemble_size:
+                return True
+
+            lat = existing["lat"].values
+            lon = existing["lon"].values
+            valid_mask = existing["prism_valid_mask"].values.astype(bool)
+            phase1 = np.stack(
+                [
+                    existing[f"{variable}_phase1"].isel(time=0).values
+                    for variable in variables
+                ]
+            ).astype(np.float32)
+            members = np.stack(
+                [
+                    np.stack(
+                        [
+                            existing[f"{variable}_member_{member:03d}"]
+                            .isel(time=0)
+                            .values
+                            for variable in variables
+                        ]
+                    )
+                    for member in range(ensemble_size)
+                ]
+            ).astype(np.float32)
+    except (KeyError, OSError, ValueError):
+        return False
+
+    attrs["ensemble_size"] = int(ensemble_size)
+    attrs["coordinate_seed_digest"] = hashlib.sha256(
+        json.dumps(
+            [
+                _coordinate_stream_seed(base_seed, sample_date, member, 0)
+                for member in range(ensemble_size)
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+    attrs["resumed_ensemble_subset_from"] = int(available_members)
+    attrs.pop("refined_tmin_gt_tmax_rate", None)
+    attrs.pop("max_member_tmin_gt_tmax_rate", None)
+    normalized = build_daily_refined_dataset(
+        variables=variables,
+        sample_date=sample_date,
+        lat=lat,
+        lon=lon,
+        valid_mask=valid_mask,
+        phase1=phase1,
+        members=members,
+        attrs=attrs,
+    )
+    write_refined_netcdf(
+        normalized,
+        path,
+        compression=compression,
+        compression_level=compression_level,
+        chunk_sizes={"time": 1},
+        atomic=True,
+    )
+    normalized.close()
+    return True
+
+
+def _write_progress_state(path: str | None, *, completed: int, total: int) -> None:
+    if not path:
+        return
+    destination = Path(path)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.tmp"
+    )
+    temporary.write_text(
+        json.dumps({"completed": int(completed), "total": int(total)}),
+        encoding="utf-8",
+    )
+    temporary.replace(destination)
+
+
 def run_refined_inference(
     *,
     config_path: str,
@@ -697,8 +837,14 @@ def run_refined_inference(
     batch_size: int = 1,
     limit_days: int = 0,
     split: str = "inference",
+    date_shard_index: int = 0,
+    date_shard_count: int = 1,
+    resume_existing: bool = False,
+    show_progress: bool = True,
+    progress_file: str | None = None,
+    phase1_cache_dir: str | None = None,
 ) -> Path:
-    """Run exact-date daily Phase-1 + Phase-2 tiled inference."""
+    """Run daily refinement using validated, reusable FP32 Phase-1 tiles."""
     split = _validate_prediction_split(split)
     ensemble_size = int(ensemble_size)
     if ensemble_size < 1:
@@ -721,8 +867,15 @@ def run_refined_inference(
     inference_dates = configured_split_dates
     if limit_days:
         inference_dates = inference_dates[: int(limit_days)]
+    shard_count = int(date_shard_count)
+    shard_index = int(date_shard_index)
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError(
+            f"invalid date shard {shard_index}/{shard_count}"
+        )
+    inference_dates = inference_dates[shard_index::shard_count]
     if not inference_dates:
-        raise ValueError(f"configured {split} period contains no samples")
+        raise ValueError(f"configured {split} period contains no samples for shard")
 
     variables = list(config.data.output_vars)
     if variables != list(cfg.get("data", {}).get("target_variables", [])):
@@ -772,17 +925,95 @@ def run_refined_inference(
             "no refinement inference tiles remain after mask filtering"
         )
 
+    case_name = get_case_name(cfg)
+    output_path = case_output_dir(_split_output_root(output_dir, split), case_name)
+    output_path.mkdir(parents=True, exist_ok=True)
+    from narr_prism_inference_cache import (
+        FP32Phase1InferenceCache,
+        inference_cache_contract,
+    )
+
+    pad_multiple = _pad_multiple_from_config(config)
+    cache = FP32Phase1InferenceCache(
+        phase1_cache_dir or Path(output_dir).parent / "phase1_inference_cache",
+        inference_cache_contract(
+            cfg=cfg, config=config, phase1_fingerprint=phase1_fingerprint,
+            plan=plan, positions=positions, lat=target_lat, lon=target_lon,
+            valid_mask=valid_mask, mask_provenance=target_valid_mask_provenance,
+            split=split, batch_size=batch_size, pad_multiple=pad_multiple,
+            blend_mode=blend_mode,
+        ),
+    )
+    print(f"[phase1-cache] FP32 inference conditioning: {cache.directory}", flush=True)
+
+    def tile_batch(predictors, start, stop):
+        return _make_tile_batch(
+            predictors, positions[start:stop], plan,
+            n_targets=len(variables), pad_multiple=pad_multiple,
+            device=device, domain_valid_mask=valid_mask,
+        )
+
+    def cached_day(sample_date, predictors):
+        return cache.load_or_build(
+            sample_date, predictors, model,
+            lambda start, stop: tile_batch(predictors, start, stop), device,
+        )
+
+    io_cfg = model.performance_config.io
+    tile_batches_per_day = (
+        len(positions) + batch_size - 1
+    ) // batch_size
+    shard_date_count = len(inference_dates)
+    progress_total = shard_date_count * tile_batches_per_day
+    progress_completed = 0
+    _write_progress_state(
+        progress_file, completed=progress_completed, total=progress_total
+    )
+    if resume_existing:
+        pending_dates = []
+        resumed = 0
+        for sample_date in inference_dates:
+            date_token = _date_key(sample_date).replace("-", "")
+            existing_path = output_path / (
+                f"{case_name}_{model.refinement_config.type}_refined_{date_token}.nc"
+            )
+            if _resume_existing_output(
+                existing_path,
+                variables=variables,
+                sample_date=sample_date,
+                refinement_type=model.refinement_config.type,
+                ensemble_size=ensemble_size,
+                base_seed=base_seed,
+                phase1_checkpoint=phase1_checkpoint,
+                refinement_checkpoint=refinement_checkpoint,
+                split=split,
+                compression=io_cfg.netcdf_compression,
+                compression_level=io_cfg.netcdf_compression_level,
+                phase1_cache_digest=cache.digest,
+            ):
+                resumed += 1
+            else:
+                pending_dates.append(sample_date)
+        inference_dates = pending_dates
+        progress_completed = resumed * tile_batches_per_day
+        _write_progress_state(
+            progress_file,
+            completed=progress_completed,
+            total=progress_total,
+        )
+        print(
+            f"[refinement] shard={shard_index}/{shard_count} resumed={resumed} "
+            f"pending={len(inference_dates)}"
+        )
+        if not inference_dates:
+            return output_path
+
     # Initialize the lazy head with production inference geometry, then verify
     # and load its checkpoint. This never uses validation targets.
     first_predictors = dataset._load_predictor_day(inference_dates[0])
-    probe = _make_tile_batch(
-        first_predictors,
-        positions[:1],
-        plan,
-        n_targets=len(variables),
-        pad_multiple=_pad_multiple_from_config(config),
-        device=device,
-        domain_valid_mask=valid_mask,
+    first_cache = cached_day(inference_dates[0], first_predictors)
+    probe = cache.attach(
+        tile_batch(first_predictors, 0, 1), first_cache, 0, 1, device,
     )
     model.initialize_from_batch(probe)
     model.to(device).eval()
@@ -790,11 +1021,8 @@ def run_refined_inference(
         model,
         refinement_checkpoint,
     )
-    del probe, first_predictors
+    del probe
 
-    case_name = get_case_name(cfg)
-    output_path = case_output_dir(_split_output_root(output_dir, split), case_name)
-    output_path.mkdir(parents=True, exist_ok=True)
     pad_multiple = _pad_multiple_from_config(config)
     mixed_precision = device.type == "cuda" and str(
         model.performance_config.precision.mode
@@ -811,9 +1039,27 @@ def run_refined_inference(
         f"tiles={len(positions)} core={plan.core_shape} halo={plan.halo} "
         f"ensemble={ensemble_size}"
     )
-    with torch.inference_mode():
-        for sample_date in inference_dates:
-            day_predictors = dataset._load_predictor_day(sample_date)
+    progress_context = (
+        tqdm(
+            total=len(inference_dates) * tile_batches_per_day,
+            desc="Refined inference",
+            unit="tile-batch",
+            dynamic_ncols=True,
+            disable=not sys.stderr.isatty(),
+        )
+        if tqdm is not None and show_progress
+        else nullcontext(None)
+    )
+    with torch.inference_mode(), progress_context as progress:
+        for day_index, sample_date in enumerate(inference_dates):
+            if progress is not None:
+                progress.set_postfix(date=_date_key(sample_date), refresh=False)
+            if day_index == 0:
+                day_predictors, day_cache = first_predictors, first_cache
+                del first_predictors, first_cache
+            else:
+                day_predictors = dataset._load_predictor_day(sample_date)
+                day_cache = cached_day(sample_date, day_predictors)
             baseline_stitcher = WeightedTileStitcher(
                 len(variables), domain_shape
             )
@@ -832,6 +1078,7 @@ def run_refined_inference(
                     device=device,
                     domain_valid_mask=valid_mask,
                 )
+                cache.attach(batch, day_cache, start, start + len(chunk), device)
                 amp_context = (
                     torch.autocast(device_type="cuda", dtype=amp_dtype)
                     if mixed_precision
@@ -861,6 +1108,14 @@ def run_refined_inference(
                             members_np[member][local_index], position, window
                         )
                 del batch, phase1_tiles, member_tiles, phase1_np, members_np
+                progress_completed += 1
+                _write_progress_state(
+                    progress_file,
+                    completed=progress_completed,
+                    total=progress_total,
+                )
+                if progress is not None:
+                    progress.update(1)
 
             if np.any(valid_mask & (baseline_stitcher.weight <= 0.0)):
                 raise ValueError(
@@ -882,10 +1137,16 @@ def run_refined_inference(
             ).astype(np.float32)
             mean = members.astype(np.float64).mean(axis=0).astype(np.float32)
             _sanity_check_outputs(
-                phase1[None], variables, f"{sample_date} Phase-1"
+                phase1[None],
+                variables,
+                f"{sample_date} Phase-1",
+                report_crossings=False,
             )
             _sanity_check_outputs(
-                mean[None], variables, f"{sample_date} refined mean"
+                mean[None],
+                variables,
+                f"{sample_date} refined mean",
+                report_crossings=False,
             )
             temperature_order_diagnostics: dict[str, float] = {}
             if "tmin" in variables and "tmax" in variables:
@@ -953,6 +1214,11 @@ def run_refined_inference(
                 # for a refined product, the active checkpoint is Phase 2.
                 "checkpoint": str(refinement_checkpoint),
                 "phase1_fingerprint": str(phase1_fingerprint),
+                "phase1_cache_digest": cache.digest,
+                "phase1_cache_directory": str(cache.directory),
+                "phase1_compute_dtype": "float32",
+                "phase1_autocast": "disabled",
+                "phase1_tf32": "disabled",
                 "phase2_fingerprint": phase2_fingerprint,
                 "config_path": resolved_config_path,
                 "config_fingerprint": active_config_fingerprint,
@@ -981,7 +1247,6 @@ def run_refined_inference(
             output_file = output_path / (
                 f"{case_name}_{model.refinement_config.type}_refined_{date_token}.nc"
             )
-            io_cfg = model.performance_config.io
             write_refined_netcdf(
                 daily,
                 output_file,
@@ -991,9 +1256,9 @@ def run_refined_inference(
                 atomic=True,
             )
             daily.close()
-            print(f"[refinement] wrote {output_file}")
             del (
                 day_predictors,
+                day_cache,
                 baseline_stitcher,
                 member_stitchers,
                 phase1,

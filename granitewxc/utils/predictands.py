@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, MutableMapping, Sequence
 
@@ -34,6 +35,7 @@ ALLOWED_PRECIP_MODELS = {
     "bg",
     "zero_inflated_gamma",
 }
+_WARNED_MESSAGES: set[str] = set()
 
 
 @dataclass
@@ -75,6 +77,9 @@ def _coerce_mapping(value: Any) -> dict[str, Any]:
 
 
 def _warn(message: str) -> None:
+    if os.environ.get("RANK", "0") != "0" or message in _WARNED_MESSAGES:
+        return
+    _WARNED_MESSAGES.add(message)
     print(f"[predictands] {message}")
 
 

@@ -40,7 +40,9 @@ import math
 import os
 import random
 import socket
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -158,7 +160,8 @@ def build_model(
     verbose: bool = True,
 ):
     """Build the two-phase model and load the deterministic Phase-1 weights."""
-    log_case_context(config, "refinement")
+    if verbose:
+        log_case_context(config, "refinement")
     assert_scalars_available(config, role="refinement")
     apply_scalar_paths(config)
 
@@ -206,6 +209,224 @@ def _first_batch(loader):
 
 def _to_device(batch, device):
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+
+def _resume_with_batch_size_migration(
+    trainer: RefinementTrainer,
+    path: str,
+    *,
+    previous_per_device_batch_size: int,
+    current_per_device_batch_size: int,
+    previous_num_epochs: int = 0,
+    current_num_epochs: int = 0,
+    announce: bool = True,
+):
+    """Resume a validated batch migration and optional epoch-budget extension."""
+    previous_batch = int(previous_per_device_batch_size)
+    current_batch = int(current_per_device_batch_size)
+    previous_epochs = int(previous_num_epochs or 0)
+    current_epochs = int(current_num_epochs or 0)
+    if previous_batch < 1 or current_batch < 1:
+        raise ValueError("Per-device batch sizes must be positive")
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    saved_training = (payload.get("resolved_config") or {}).get("training")
+    current_training = trainer.resolved_config.get("training")
+    if not isinstance(saved_training, Mapping) or not isinstance(
+        current_training, Mapping
+    ):
+        raise RuntimeError(
+            "Batch-size migration requires saved and current training contracts"
+        )
+    saved_training = dict(saved_training)
+    current_training = dict(current_training)
+    saved_extension = saved_training.get("schedule_extension")
+    if saved_extension is not None:
+        current_training["schedule_extension"] = saved_extension
+        trainer.resolved_config["training"] = current_training
+    recorded_batch = saved_training.get("per_device_batch_size")
+    saved_epochs = int(saved_training.get("epochs", current_epochs or 0))
+    configured_epochs = int(current_training.get("epochs", current_epochs or 0))
+    if (
+        recorded_batch is not None
+        and int(recorded_batch) == current_batch
+        and saved_epochs == configured_epochs
+    ):
+        return trainer.resume(path)
+    if recorded_batch is not None and int(recorded_batch) != previous_batch:
+        raise RuntimeError(
+            "Batch-size migration source mismatch: checkpoint records "
+            f"per_device_batch_size={recorded_batch}, requested={previous_batch}."
+        )
+
+    scaled_fields = (
+        "gradient_accumulation_steps",
+        "limit_steps_train",
+        "limit_steps_valid",
+        "effective_train_batches_per_epoch",
+    )
+    for field in scaled_fields:
+        if field not in saved_training or field not in current_training:
+            raise RuntimeError(f"Batch-size migration contract lacks {field}")
+        saved_samples = int(saved_training[field]) * previous_batch
+        current_samples = int(current_training[field]) * current_batch
+        if saved_samples != current_samples:
+            raise RuntimeError(
+                f"Batch-size migration changes {field}: "
+                f"saved={saved_training[field]}x{previous_batch}, "
+                f"current={current_training[field]}x{current_batch}."
+            )
+
+    epoch_changed = saved_epochs != configured_epochs
+    epoch_fields: set[str] = set()
+    if epoch_changed:
+        if previous_epochs != saved_epochs or current_epochs != configured_epochs:
+            raise RuntimeError(
+                "Epoch-budget migration source mismatch: "
+                f"checkpoint={saved_epochs}, requested={previous_epochs}, "
+                f"configured={configured_epochs}, requested_current={current_epochs}."
+            )
+        if configured_epochs <= saved_epochs:
+            raise RuntimeError("Epoch-budget migration must extend the saved budget")
+        saved_updates = int(saved_training["optimizer_steps_per_epoch"])
+        current_updates = int(current_training["optimizer_steps_per_epoch"])
+        if saved_updates != current_updates:
+            raise RuntimeError(
+                "Epoch-budget migration must preserve optimizer steps per epoch"
+            )
+        expected_saved_total = saved_epochs * saved_updates
+        expected_current_total = configured_epochs * current_updates
+        for field in ("scheduler_t_max", "total_optimizer_steps"):
+            if int(saved_training[field]) != expected_saved_total:
+                raise RuntimeError(
+                    f"Saved {field} is inconsistent with its epoch budget"
+                )
+            if int(current_training[field]) != expected_current_total:
+                raise RuntimeError(
+                    f"Current {field} is inconsistent with its epoch budget"
+                )
+        epoch_fields = {"epochs", "scheduler_t_max", "total_optimizer_steps"}
+
+    mutable_fields = set(scaled_fields) | {
+        "per_device_batch_size",
+        "schedule_extension",
+    } | epoch_fields
+    saved_fixed = {
+        key: value for key, value in saved_training.items() if key not in mutable_fields
+    }
+    current_fixed = {
+        key: value for key, value in current_training.items() if key not in mutable_fields
+    }
+    if saved_fixed != current_fixed:
+        changed = sorted(
+            key
+            for key in set(saved_fixed) | set(current_fixed)
+            if saved_fixed.get(key, "<missing>")
+            != current_fixed.get(key, "<missing>")
+        )
+        raise RuntimeError(
+            "Batch-size migration cannot change non-batch training fields: "
+            + ", ".join(changed)
+        )
+
+    trainer.resolved_config["training"] = saved_training
+    try:
+        state = trainer.resume(path)
+    finally:
+        trainer.resolved_config["training"] = current_training
+
+    if epoch_changed:
+        remaining_epochs = configured_epochs - int(state.epoch)
+        remaining_steps = remaining_epochs * int(
+            current_training["optimizer_steps_per_epoch"]
+        )
+        if remaining_steps <= 0:
+            raise RuntimeError("Extended epoch budget has no remaining optimizer steps")
+        start_lrs = [float(group["lr"]) for group in trainer.optimizer.param_groups]
+        for group, start_lr in zip(
+            trainer.optimizer.param_groups, start_lrs, strict=True
+        ):
+            group["initial_lr"] = start_lr
+        trainer.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            trainer.optimizer,
+            T_max=remaining_steps,
+            eta_min=float(current_training["min_learning_rate"]),
+        )
+        current_training["schedule_extension"] = {
+            "from_epochs": saved_epochs,
+            "to_epochs": configured_epochs,
+            "at_epoch": int(state.epoch),
+            "at_global_step": int(state.global_step),
+            "remaining_optimizer_steps": remaining_steps,
+            "start_lrs": start_lrs,
+        }
+        trainer.resolved_config["training"] = current_training
+    if announce:
+        message = (
+            "[refinement] validated resume migration: "
+            f"per_device={previous_batch}->{current_batch}; "
+            "sample budget and optimizer batch unchanged"
+        )
+        if epoch_changed:
+            message += (
+                f"; epochs={saved_epochs}->{configured_epochs}; cosine schedule "
+                f"continued from lr={start_lrs[0]:.8g} over {remaining_steps} steps"
+            )
+        print(message)
+    return state
+
+
+def _save_epochs_vs_loss_curve(state: Any, checkpoint_dir: str) -> str | None:
+    """Atomically render the complete resumed train/validation loss history."""
+    train_loss = [float(value) for value in state.train_loss_history]
+    val_loss = [float(value) for value in state.val_loss_history]
+    if not train_loss and not val_loss:
+        return None
+
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    output = Path(checkpoint_dir) / "epochs_vs_loss.png"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(".png.tmp")
+    figure, axis = plt.subplots(figsize=(10, 6), constrained_layout=True)
+    if train_loss:
+        train_epochs = np.arange(1, len(train_loss) + 1)
+        axis.plot(train_epochs, train_loss, label="Training loss", linewidth=1.8)
+    if val_loss:
+        val_epochs = np.arange(1, len(val_loss) + 1)
+        axis.plot(val_epochs, val_loss, label="Validation loss", linewidth=1.8)
+        finite = np.asarray(val_loss, dtype=np.float64)
+        if np.isfinite(finite).any():
+            best_index = int(np.nanargmin(finite))
+            best_epoch = best_index + 1
+            best_loss = float(finite[best_index])
+            axis.scatter(
+                [best_epoch], [best_loss], color="black", marker="*", s=110,
+                zorder=5, label=f"Best validation: epoch {best_epoch}",
+            )
+            axis.annotate(
+                f"{best_loss:.5g}",
+                (best_epoch, best_loss),
+                xytext=(7, 7), textcoords="offset points",
+            )
+    combined = np.asarray(train_loss + val_loss, dtype=np.float64)
+    finite_positive = combined[np.isfinite(combined) & (combined > 0)]
+    if finite_positive.size and finite_positive.max() / finite_positive.min() >= 20:
+        axis.set_yscale("log")
+        axis.set_ylabel("Loss (log scale)")
+    else:
+        axis.set_ylabel("Loss")
+    axis.set_xlabel("Epoch")
+    axis.set_title("Phase-2 refinement: epochs versus loss")
+    axis.grid(True, which="both", alpha=0.25)
+    axis.legend()
+    figure.savefig(temporary, format="png", dpi=160)
+    plt.close(figure)
+    os.replace(temporary, output)
+    return str(output)
 
 
 def _seed_training(seed: int) -> None:
@@ -260,6 +481,7 @@ def _load_phase1_cache(
     performance,
     validate_inventory: bool = True,
     show_inventory_progress: bool = True,
+    verbose: bool = True,
 ):
     """Open and authenticate the immutable daily Phase-1/residual cache."""
     cache_cfg = performance.phase1_cache
@@ -293,11 +515,12 @@ def _load_phase1_cache(
     # validation/open for every spatial crop inside DataLoader workers.
     reader.validate_daily = False
     manifest = reader.manifest
-    print(
-        "[refinement] authenticated Phase-1 residual cache: "
-        f"manifest={manifest['_manifest_path']} "
-        f"contract_digest={manifest['contract_digest']}"
-    )
+    if verbose:
+        print(
+            "[refinement] authenticated Phase-1 residual cache: "
+            f"manifest={manifest['_manifest_path']} "
+            f"contract_digest={manifest['contract_digest']}"
+        )
     return reader, manifest
 
 
@@ -752,6 +975,16 @@ def _rank_limit(global_limit: int, world_size: int) -> int:
     return math.ceil(global_limit / world_size) if global_limit > 0 else 0
 
 
+def _validation_rank_limit(global_limit: int, world_size: int, rank: int) -> int:
+    """Distribute validation batches exactly; validation has no DDP backward."""
+    if global_limit <= 0:
+        return 0
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError("Invalid validation rank/world size")
+    quotient, remainder = divmod(global_limit, world_size)
+    return quotient + int(rank < remainder)
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -793,12 +1026,27 @@ def _run_train(args, *, rank: int = 0, world_size: int = 1) -> int:
         performance=performance,
         validate_inventory=(rank == 0),
         show_inventory_progress=(rank == 0),
+        verbose=(rank == 0),
     )
     train_loader, val_loader = get_dataloaders(
         args.config, config, rank=rank, world_size=world_size,
         phase1_cache_reader=cache_reader,
+        log_alignment=False,
     )
     probe = _to_device(_first_batch(train_loader), device)
+    if distributed:
+        dist.barrier()
+    if rank == 0:
+        base_dataset = getattr(train_loader.dataset, "base", train_loader.dataset)
+        source = (
+            "strict preprocessed product"
+            if base_dataset.use_preprocessed
+            else "on-the-fly coarse-to-fine regridding"
+        )
+        print(
+            f"[dataset] predictor->PRISM alignment OK: {source} is on the "
+            f"canonical target grid {tuple(base_dataset.fine_shape)} before tiling."
+        )
     model.initialize_from_batch(probe)
     model.to(device)
     residual_norm = model.refinement_config.residual_normalization
@@ -877,7 +1125,9 @@ def _run_train(args, *, rank: int = 0, world_size: int = 1) -> int:
         )
     local_accumulation = max(1, accumulation // world_size)
     local_limit_steps_train = _rank_limit(limit_steps_train, world_size)
-    local_limit_steps_valid = _rank_limit(limit_steps_valid, world_size)
+    local_limit_steps_valid = _validation_rank_limit(
+        limit_steps_valid, world_size, rank
+    )
     optimizer_steps = max(1, math.ceil(steps / max(1, accumulation)))
     scheduler_t_max = max(1, epochs * optimizer_steps)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -923,6 +1173,7 @@ def _run_train(args, *, rank: int = 0, world_size: int = 1) -> int:
                 "scheduler": "torch.optim.lr_scheduler.CosineAnnealingLR",
                 "scheduler_t_max": scheduler_t_max,
                 "warmup_steps": warmup_steps,
+                "per_device_batch_size": int(getattr(config, "batch_size", 1)),
                 "gradient_accumulation_steps": accumulation,
                 "max_grad_norm": max_grad_norm,
                 "epochs": epochs,
@@ -945,6 +1196,7 @@ def _run_train(args, *, rank: int = 0, world_size: int = 1) -> int:
         max_grad_norm=max_grad_norm,
         seed=model.refinement_config.seed,
         warmup_steps=warmup_steps,
+        logger=print if rank == 0 else lambda _message: None,
         **distributed_trainer_kwargs,
     )
     if fingerprint:
@@ -952,7 +1204,20 @@ def _run_train(args, *, rank: int = 0, world_size: int = 1) -> int:
 
     if args.resume:
         resume_path = args.resume if isinstance(args.resume, str) else os.path.join(checkpoint_dir, "last.ckpt")
-        trainer.resume(resume_path)
+        previous_batch = int(getattr(args, "resume_batch_size_from", 0) or 0)
+        previous_epochs = int(getattr(args, "resume_epochs_from", 0) or 0)
+        if previous_batch:
+            _resume_with_batch_size_migration(
+                trainer,
+                resume_path,
+                previous_per_device_batch_size=previous_batch,
+                current_per_device_batch_size=int(getattr(config, "batch_size", 1)),
+                announce=rank == 0,
+                previous_num_epochs=previous_epochs,
+                current_num_epochs=epochs,
+            )
+        else:
+            trainer.resume(resume_path)
         if cache_statistics is not None:
             _assert_cache_statistics_match_resume(
                 model,
@@ -975,7 +1240,7 @@ def _run_train(args, *, rank: int = 0, world_size: int = 1) -> int:
             f"completed={trainer.state.epoch} total={epochs} "
             f"remaining={epochs_remaining}"
         )
-    trainer.fit(
+    state = trainer.fit(
         train_loader,
         val_loader,
         num_epochs=epochs_remaining,
@@ -983,6 +1248,10 @@ def _run_train(args, *, rank: int = 0, world_size: int = 1) -> int:
         limit_steps_valid=local_limit_steps_valid,
         save_every=int(args.save_every),
     )
+    if rank == 0:
+        curve_path = _save_epochs_vs_loss_curve(state, checkpoint_dir)
+        if curve_path is not None:
+            print(f"[refinement] epochs-versus-loss curve -> {curve_path}")
     return 0
 
 
@@ -1031,7 +1300,216 @@ def cmd_train(args) -> int:
     return 0
 
 
+def _infer_output_root(cfg: Mapping[str, Any], refinement_type: str, override: str | None) -> str:
+    if override:
+        return str(Path(override).expanduser().resolve())
+    base = cfg.get("inference", {}).get(
+        "refinement_output_dir",
+        cfg.get("inference", {}).get("output_dir", "./refinement_inference_output"),
+    )
+    return str(Path(_resolve(base)) / f"refinement_{refinement_type}")
+
+
+def _tail_worker_log(path: Path, lines: int = 30) -> str:
+    try:
+        return "".join(path.read_text(errors="replace").splitlines(True)[-lines:])
+    except OSError as exc:
+        return f"<unable to read {path}: {exc}>"
+
+
+def _run_parallel_infer(args, requested: int) -> int:
+    if not torch.cuda.is_available() or not str(args.device).startswith("cuda"):
+        raise RuntimeError("Multi-GPU refinement inference requires CUDA")
+    visible = torch.cuda.device_count()
+    if requested > visible:
+        raise RuntimeError(
+            f"Requested {requested} GPUs, but only {visible} are visible"
+        )
+
+    config = get_config(args.config)
+    refinement = resolve_refinement_config(config)
+    if not refinement.is_active:
+        raise SystemExit("infer requires an active model.refinement configuration")
+    phase1_checkpoint = _require_checkpoint_path(
+        _phase1_checkpoint(config, args.phase1_checkpoint),
+        label="Phase-1 deterministic",
+    )
+    refinement_checkpoint = _require_checkpoint_path(
+        _refinement_checkpoint(config, args.refinement_checkpoint),
+        label="Phase-2 refinement",
+    )
+    cfg = load_yaml(args.config)
+    output = _infer_output_root(cfg, refinement.type, args.output)
+    from narr_prism_inference import _split_output_root
+    from narr_prism_refinement_inference import _write_progress_state
+    from narr_prism_utils import case_output_dir, parse_date_range_from_config
+
+    output_path = case_output_dir(
+        _split_output_root(output, args.split), get_case_name(cfg)
+    )
+    output_path.mkdir(parents=True, exist_ok=True)
+    start, end = parse_date_range_from_config(cfg, args.split)
+    total_dates = (end - start).days + 1
+    if args.limit_days:
+        total_dates = min(total_dates, max(0, int(args.limit_days)))
+    if total_dates < requested:
+        raise ValueError(
+            f"Refinement inference has {total_dates} dates for {requested} GPUs"
+        )
+
+    configured_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    physical_ids = (
+        [item.strip() for item in configured_visible.split(",") if item.strip()]
+        if configured_visible
+        else [str(index) for index in range(visible)]
+    )[:requested]
+    pattern = f"{get_case_name(cfg)}_{refinement.type}_refined_*.nc"
+    initial_done = min(len(list(output_path.glob(pattern))), total_dates)
+    print(
+        f"[refinement] parallel inference: GPUs={requested} "
+        f"resume_files={initial_done}/{total_dates} -> {output_path}",
+        flush=True,
+    )
+
+    processes = []
+    logs = []
+    handles = []
+    progress_paths = []
+    progress_token = f"{os.getpid()}_{time.time_ns()}"
+    try:
+        for shard_index, physical_id in enumerate(physical_ids):
+            log_path = output_path / f"parallel_worker_{shard_index}_gpu{physical_id}.log"
+            progress_path = output_path / (
+                f".parallel_progress_{progress_token}_{shard_index}.json"
+            )
+            progress_paths.append(progress_path)
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "infer",
+                "--config", args.config,
+                "--phase1-checkpoint", phase1_checkpoint,
+                "--refinement-checkpoint", refinement_checkpoint,
+                "--device", "cuda:0",
+                "--num-gpus", "1",
+                "--date-shard-index", str(shard_index),
+                "--date-shard-count", str(requested),
+                "--batch-size", str(args.batch_size),
+                "--output", output,
+                "--split", args.split,
+                "--no-progress",
+                "--progress-file", str(progress_path),
+            ]
+            if args.resume_existing:
+                command.append("--resume-existing")
+            if args.ensemble_size is not None:
+                command.extend(["--ensemble-size", str(args.ensemble_size)])
+            if args.seed is not None:
+                command.extend(["--seed", str(args.seed)])
+            if args.limit_days:
+                command.extend(["--limit-days", str(args.limit_days)])
+            if getattr(args, "phase1_cache_dir", None):
+                command.extend(["--phase1-cache-dir", args.phase1_cache_dir])
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = physical_id
+            env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+            handle = open(log_path, "w", encoding="utf-8")
+            handles.append(handle)
+            logs.append(log_path)
+            processes.append(
+                subprocess.Popen(
+                    command,
+                    cwd=str(REPO_ROOT),
+                    env=env,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
+
+        progress = tqdm(
+            total=None,
+            desc="Refined inference (starting workers)",
+            unit="tile-batch",
+            dynamic_ncols=True,
+            # Notebook subprocess streams cannot redraw a terminal bar.
+            disable=bool(args.no_progress) or not sys.stderr.isatty(),
+        )
+        try:
+            while True:
+                states = []
+                for progress_path in progress_paths:
+                    try:
+                        states.append(json.loads(progress_path.read_text()))
+                    except (FileNotFoundError, json.JSONDecodeError, OSError):
+                        pass
+                if len(states) == requested:
+                    progress.total = sum(int(state["total"]) for state in states)
+                    progress.n = sum(int(state["completed"]) for state in states)
+                    _write_progress_state(
+                        args.progress_file,
+                        completed=progress.n,
+                        total=progress.total,
+                    )
+                    progress.set_description("Refined inference", refresh=False)
+                progress.set_postfix(
+                    live_workers=sum(proc.poll() is None for proc in processes),
+                    resumed_days=initial_done,
+                    refresh=True,
+                )
+                failures = [
+                    (index, proc.returncode)
+                    for index, proc in enumerate(processes)
+                    if proc.poll() not in (None, 0)
+                ]
+                if failures or all(proc.poll() is not None for proc in processes):
+                    break
+                time.sleep(2.0)
+        finally:
+            progress.close()
+
+        if failures:
+            for handle in handles:
+                handle.flush()
+            raise RuntimeError(
+                "Parallel refinement inference worker failure(s): "
+                + ", ".join(
+                    f"worker {index} rc={code} log={logs[index]}"
+                    for index, code in failures
+                )
+                + "\n\n"
+                + "\n\n".join(
+                    f"--- worker {index} tail ---\n{_tail_worker_log(logs[index])}"
+                    for index, _code in failures
+                )
+            )
+    except BaseException:
+        for proc in processes:
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in processes:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        raise
+    finally:
+        for handle in handles:
+            handle.close()
+        for progress_path in progress_paths:
+            progress_path.unlink(missing_ok=True)
+
+    print(f"[refinement] all inference workers finished -> {output_path}")
+    return 0
+
+
 def cmd_infer(args) -> int:
+    requested = max(1, int(args.num_gpus))
+    if requested > 1:
+        if int(args.date_shard_count) != 1 or int(args.date_shard_index) != 0:
+            raise ValueError("Parent multi-GPU inference cannot also be a date shard")
+        return _run_parallel_infer(args, requested)
+
     config = get_config(args.config)
     device = torch.device(args.device)
     refinement = resolve_refinement_config(config)
@@ -1052,13 +1530,7 @@ def cmd_infer(args) -> int:
     )
 
     cfg = load_yaml(args.config)
-    output = args.output
-    if not output:
-        base = cfg.get("inference", {}).get(
-            "refinement_output_dir",
-            cfg.get("inference", {}).get("output_dir", "./refinement_inference_output"),
-        )
-        output = str(Path(_resolve(base)) / f"refinement_{refinement.type}")
+    output = _infer_output_root(cfg, refinement.type, args.output)
 
     from narr_prism_refinement_inference import run_refined_inference
 
@@ -1081,6 +1553,19 @@ def cmd_infer(args) -> int:
         batch_size=max(1, int(args.batch_size)),
         limit_days=max(0, int(args.limit_days or 0)),
         split=args.split,
+        date_shard_index=int(args.date_shard_index),
+        date_shard_count=int(args.date_shard_count),
+        resume_existing=bool(args.resume_existing),
+        show_progress=not bool(args.no_progress),
+        progress_file=args.progress_file,
+        phase1_cache_dir=(
+            _resolve(args.phase1_cache_dir)
+            if getattr(args, "phase1_cache_dir", None)
+            else _resolve(cfg.get("inference", {}).get(
+                "phase1_cache_dir",
+                "./examples/NARR_PRISM/experiments/phase1_inference_cache",
+            ))
+        ),
     )
     print(f"[refinement] daily refined outputs saved -> {result}")
     return 0
@@ -1105,6 +1590,18 @@ def main() -> int:
 
     train = sub.add_parser("train", parents=[common], help="train the configured Phase-2 refiner")
     train.add_argument("--resume", nargs="?", const=True, default=False)
+    train.add_argument(
+        "--resume-batch-size-from",
+        type=int,
+        default=0,
+        help="explicit prior per-device batch for a budget-equivalent resume migration",
+    )
+    train.add_argument(
+        "--resume-epochs-from",
+        type=int,
+        default=0,
+        help="explicit prior epoch budget for a validated schedule extension",
+    )
     train.add_argument("--num-epochs", type=int, default=None)
     train.add_argument(
         "--num-gpus",
@@ -1130,7 +1627,32 @@ def main() -> int:
         help="optional number of leading inference dates (legacy alias: --limit-batches)",
     )
     infer.add_argument("--batch-size", type=int, default=1, help="tile batch size")
+    infer.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="independent date-shard workers on visible CUDA devices",
+    )
+    infer.add_argument(
+        "--resume-existing",
+        action="store_true",
+        help="validate and skip existing daily products; larger ensembles are reduced atomically",
+    )
+    infer.add_argument("--date-shard-index", type=int, default=0, help=argparse.SUPPRESS)
+    infer.add_argument("--date-shard-count", type=int, default=1, help=argparse.SUPPRESS)
+    infer.add_argument(
+        "--no-progress", action="store_true",
+        help="disable inference progress bars, including the multi-GPU parent",
+    )
+    infer.add_argument("--progress-file", default=None, help=argparse.SUPPRESS)
     infer.add_argument("--output", default=None, help="daily NetCDF output root directory")
+    infer.add_argument(
+        "--phase1-cache-dir", default=None,
+        help=(
+            "shared FP32 Phase-1 tile cache; missing days are built with "
+            "autocast/TF32 disabled, validated and reused across refinement heads"
+        ),
+    )
     infer.add_argument(
         "--split",
         choices=("validation", "inference"),

@@ -145,6 +145,7 @@ class NarrPrismDataset(Dataset):
         load_observed_targets: Optional[bool] = None,
         cache_predictor_days: bool = False,
         cache_target_days: bool = False,
+        log_alignment: bool = True,
     ) -> None:
         if xr is None:
             raise ImportError("xarray is required for NarrPrismDataset")
@@ -152,6 +153,7 @@ class NarrPrismDataset(Dataset):
         self.cfg = load_yaml(config_path)
         self.mode = mode
         self.dtype = dtype
+        self._log_alignment = bool(log_alignment)
         # Opt-in, per-process one-day predictor cache. Date-grouped Phase-2
         # sampling enables this so every worker reads/regrids a daily predictor
         # product once rather than once per spatial tile. Ordinary Phase-1 and
@@ -905,7 +907,9 @@ class NarrPrismDataset(Dataset):
                 f"Predictor regrid misaligned with PRISM grid: got "
                 f"{tuple(stacked.shape[-2:])}, expected {exp_hw} (the PRISM crop)."
             )
-        if not getattr(self, "_alignment_logged", False):
+        if getattr(self, "_log_alignment", False) and not getattr(
+            self, "_alignment_logged", False
+        ):
             source = (
                 "strict preprocessed product"
                 if self.use_preprocessed

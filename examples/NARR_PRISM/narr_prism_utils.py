@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import hashlib
+import subprocess
 import warnings
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,88 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def select_idle_gpus(
+    max_gpus: int,
+    visible_devices: str | None = None,
+) -> List[str]:
+    """Select up to ``max_gpus`` idle NVIDIA GPUs for an inference subprocess.
+
+    Respect CUDA_VISIBLE_DEVICES unless an explicit physical-ID/UUID list is
+    supplied. An idle GPU has no compute processes, at most 1 GiB allocated,
+    and at most 5% utilization. Return UUIDs so the child CUDA device order
+    cannot redirect inference to a different physical GPU.
+
+    This is a snapshot, not a reservation; call immediately before launching.
+    No CUDA contexts are created in the calling process.
+    """
+    if max_gpus < 1:
+        raise ValueError("max_gpus must be at least 1")
+    if visible_devices is None:
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+
+    def query(arguments: str) -> str:
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", arguments, "--format=csv,noheader,nounits"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                "Unable to check GPU occupancy with nvidia-smi. "
+                "Restore nvidia-smi access or select CPU inference."
+            ) from exc
+        return result.stdout
+
+    inventory = query(
+        "--query-gpu=index,uuid,memory.used,utilization.gpu"
+    )
+    busy = {
+        line.strip()
+        for line in query("--query-compute-apps=gpu_uuid").splitlines()
+        if line.strip()
+    }
+    devices = []
+    for line in inventory.splitlines():
+        if not line.strip():
+            continue
+        index, uuid, memory, utilization = (
+            field.strip() for field in line.split(",")
+        )
+        try:
+            idle = float(memory) <= 1024 and float(utilization) <= 5
+        except ValueError:
+            idle = False  # Unknown occupancy is not evidence of an idle GPU.
+        devices.append((index, uuid, idle and uuid not in busy))
+
+    if visible_devices is not None:
+        allowed = []
+        for token in visible_devices.split(","):
+            token = token.strip()
+            matches = [
+                device for device in devices
+                if device[0] == token
+                or (token.startswith("GPU-") and device[1].startswith(token))
+            ]
+            # CUDA ignores entries following an invalid device identifier.
+            if len(matches) != 1:
+                break
+            if matches[0] not in allowed:
+                allowed.append(matches[0])
+        devices = allowed
+
+    selected = [uuid for _index, uuid, idle in devices if idle][:max_gpus]
+    if not selected:
+        raise RuntimeError(
+            "No idle GPUs are available within CUDA_VISIBLE_DEVICES="
+            f"{visible_devices!r}. Retry when a GPU is free, choose another "
+            "visible GPU, or select CPU inference."
+        )
+    return selected
 
 
 # ---------------------------------------------------------------------------

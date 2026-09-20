@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from granitewxc.utils import predictands as predictand_module
 from granitewxc.utils.normalization import target_mode
 from granitewxc.utils.predictands import build_predictand_specs
 from granitewxc.utils.target_transforms import apply_pr_positive_link
@@ -32,6 +33,22 @@ def test_predictand_defaults_enable_softplus_divide_only_for_pr():
     assert by_name["tasmax"].allow_negative_value is False
     assert by_name["tasmax"].nonnegativity.enabled is False
     assert by_name["tasmax"].scaling.method == "zscore"
+
+
+def test_predictand_information_prints_once_on_rank_zero(monkeypatch, capsys):
+    monkeypatch.setenv("RANK", "0")
+    predictand_module._WARNED_MESSAGES.clear()
+    config = _make_config(["tmax"])
+    build_predictand_specs(config)
+    build_predictand_specs(config)
+    assert capsys.readouterr().out.count("[predictands] tmax:") == 1
+
+
+def test_predictand_information_is_silent_on_nonzero_rank(monkeypatch, capsys):
+    monkeypatch.setenv("RANK", "2")
+    predictand_module._WARNED_MESSAGES.clear()
+    build_predictand_specs(_make_config(["tmax"]))
+    assert capsys.readouterr().out == ""
 
 
 def test_predictand_nonnegative_link_and_inverse_scale_never_negative():

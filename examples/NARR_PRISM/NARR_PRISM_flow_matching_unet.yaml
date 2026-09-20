@@ -315,7 +315,7 @@ job_id: NARR_PRISM_flow_matching_unet
 case_name: narr_prism_California
 type_training: full_dataset
 batch_size: 1
-num_epochs: 10
+num_epochs: 100
 dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 0.0001

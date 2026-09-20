@@ -318,14 +318,14 @@ model:
 job_id: NARR_PRISM_diffusion_transformer
 case_name: narr_prism_California
 type_training: full_dataset
-batch_size: 1
-num_epochs: 50
+batch_size: 4
+num_epochs: 100
 dl_num_workers: 2
 dl_prefetch_size: 1
 learning_rate: 0.0001
 max_grad_norm: 1.0
-limit_steps_train: 100000
-limit_steps_valid: 100
+limit_steps_train: 25000
+limit_steps_valid: 25
 min_lr: 1.0e-06
 max_lr: 0.0001
 warm_up_steps: 0
@@ -353,10 +353,10 @@ skip_activation_offload: true
 training:
   distributed: null
   num_gpus: 1
-  per_device_batch_size: 1
-  gradient_accumulation_steps: 32
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 8
   auto_resume_if_checkpoint_exists: true
-gradient_accumulation_steps: 32
+gradient_accumulation_steps: 8
 loss:
   base: rmse
   predictands:

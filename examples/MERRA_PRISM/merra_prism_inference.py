@@ -117,12 +117,15 @@ def _load_model(
     checkpoint_path: str,
     device: torch.device,
     data_parallel: bool = False,
+    max_gpus: int | None = None,
 ) -> torch.nn.Module:
     """Re-create the model architecture and load trained weights.
 
     When ``data_parallel`` is True and more than one CUDA device is visible, the
     model is wrapped in ``torch.nn.DataParallel`` so a batch of tiles is split
-    across all visible GPUs.
+    across up to ``max_gpus`` visible GPUs (all of them if ``max_gpus`` is None).
+    This lets inference honor the same GPU budget the config declared for
+    training rather than silently claiming every visible device.
     """
     from granitewxc.models.model import get_finetune_model_UNET
 
@@ -206,10 +209,15 @@ def _load_model(
     model.to(device)
     model.eval()
 
-    if data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
+    if data_parallel and device.type == "cuda":
         n_gpu = torch.cuda.device_count()
-        print(f"[inference] wrapping model in DataParallel across {n_gpu} GPUs")
-        model = torch.nn.DataParallel(model, device_ids=list(range(n_gpu)))
+        if max_gpus is not None:
+            n_gpu = min(n_gpu, max_gpus)
+        if n_gpu > 1:
+            print(f"[inference] wrapping model in DataParallel across {n_gpu} GPUs (max_gpus={max_gpus})")
+            model = torch.nn.DataParallel(model, device_ids=list(range(n_gpu)))
+        else:
+            print(f"[inference] running on a single GPU (max_gpus={max_gpus})")
     return model
 
 
@@ -611,6 +619,7 @@ def run_inference(
     date_shard_index: int = 0,
     date_shard_count: int = 1,
     data_parallel: bool = True,
+    max_gpus: int | None = None,
 ) -> Path:
     """Execute inference over the YAML-defined date range and write daily NetCDF outputs.
 
@@ -648,8 +657,10 @@ def run_inference(
 
     # Load model
     print(f"[inference] loading checkpoint: {checkpoint_path}")
-    model = _load_model(config, checkpoint_path, device, data_parallel=data_parallel)
+    model = _load_model(config, checkpoint_path, device, data_parallel=data_parallel, max_gpus=max_gpus)
     n_gpu = torch.cuda.device_count() if device.type == "cuda" else 1
+    if max_gpus is not None:
+        n_gpu = min(n_gpu, max_gpus)
     if n_gpu > 1:
         # Feed each GPU several tiles per forward pass. A microbatch of one
         # tile/GPU makes DataParallel overhead dominate and leaves A100 memory
@@ -1362,6 +1373,8 @@ def main() -> None:
         device_str = "cpu"
     device = torch.device(device_str)
 
+    configured_num_gpus = cfg.get("training", {}).get("num_gpus")
+
     run_inference(
         config_path=str(Path(args.config).resolve()),
         cfg=cfg,
@@ -1373,6 +1386,7 @@ def main() -> None:
         date_shard_index=args.date_shard_index,
         date_shard_count=args.date_shard_count,
         data_parallel=not args.no_data_parallel,
+        max_gpus=configured_num_gpus,
     )
 
 

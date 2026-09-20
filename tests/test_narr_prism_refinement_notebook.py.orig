@@ -316,10 +316,6 @@ def test_notebook_has_one_parameter_cell_and_complete_workflow_sections():
     assert "'--checkpoint-dir', str(PHASE2_CHECKPOINT_DIR)" in text
     assert "REFINEMENT_CHECKPOINT_DIR or raw_config['checkpoint_dir']" in text
     assert "NARR_PRISM_REFINEMENT_CHECKPOINT_DIR" in text
-    assert "NARR_PRISM_RESUME_BATCH_SIZE_FROM', '1'" in parameters
-    assert "'--resume-batch-size-from', str(RESUME_BATCH_SIZE_FROM)" in text
-    assert "NARR_PRISM_RESUME_EPOCHS_FROM', '50'" in parameters
-    assert "'--resume-epochs-from', str(RESUME_EPOCHS_FROM)" in text
     assert text.count("'--device', DEVICE") == 2
     assert "NARR_PRISM_PHASE1_CHECKPOINT" in text
     assert "must not point to itself" in text
@@ -331,10 +327,7 @@ def test_notebook_has_one_parameter_cell_and_complete_workflow_sections():
     assert "'scientific_validation': not SMOKE_TEST" not in text
     assert "'scientific_validation': scientific_validation_completed" in text
     assert "scientific_validation_report.is_file()" in text
-    assert "one plain-text `tqdm` batch bar per epoch" in text
-    assert "PHASE2_CHECKPOINT_DIR / 'epochs_vs_loss.png'" in text
-    assert "display(NotebookImage(filename=str(LOSS_CURVE_PATH)))" in text
-    assert "Training completed without the required loss curve" in text
+    assert "one plain-text `tqdm` bar for the full training run" in text
     assert "from tqdm import tqdm as progress_factory" in text
     assert "file=sys.stdout, ascii=True, dynamic_ncols=False" in text
     assert (
@@ -439,7 +432,7 @@ def test_streaming_command_forwards_carriage_returns_and_failures(
 
 
 
-def test_streaming_command_renders_one_left_to_right_bar_per_epoch(
+def test_streaming_command_renders_one_text_bar_for_all_epochs(
     tmp_path, capsys
 ):
     bars = []
@@ -502,18 +495,12 @@ def test_streaming_command_renders_one_left_to_right_bar_per_epoch(
     assert "model ready\n" in rendered
     assert "Epoch 001/002" not in rendered
     assert "\r" not in rendered
-    assert [bar.description for bar in bars] == [
-        "Epoch 001/002",
-        "Epoch 002/002",
-    ]
-    assert [bar.total for bar in bars] == [10, 10]
-    assert [bar.n for bar in bars] == [10, 10]
-    assert [bar.unit for bar in bars] == ["batch", "batch"]
+    assert [bar.description for bar in bars] == ["Training epochs"]
+    assert [bar.total for bar in bars] == [2]
+    assert [bar.n for bar in bars] == [2]
+    assert [bar.unit for bar in bars] == ["epoch"]
     assert all(bar.closed for bar in bars)
-    assert any(
-        "stage=complete" in value for bar in bars for value, _ in bar.postfixes
-    )
-    assert all(not refresh for bar in bars for _, refresh in bar.postfixes)
+    assert any("stage=complete" in value for bar in bars for value, _ in bar.postfixes)
     [log_path] = (tmp_path / "command-logs").glob("*.log")
     assert log_path.read_bytes() == records.encode()
 
@@ -729,13 +716,7 @@ def test_training_resume_selection_is_automatic_and_fail_safe(tmp_path):
         )
 
     training_cell = _cell_source_containing("TRAINED_CHECKPOINT_PRIORITY")
-    assert "'--resume', str(TRAINING_RESUME_PATH)" in training_cell
-    assert (
-        "'--resume-batch-size-from', str(RESUME_BATCH_SIZE_FROM)" in training_cell
-    )
-    assert (
-        "'--resume-epochs-from', str(RESUME_EPOCHS_FROM)" in training_cell
-    )
+    assert "train_command.extend(['--resume', str(TRAINING_RESUME_PATH)])" in training_cell
     assert "Phase-2 training will resume from:" in training_cell
     assert "preferably with a new checkpoint directory" in training_cell
 

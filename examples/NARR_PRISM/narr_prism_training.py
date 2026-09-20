@@ -370,12 +370,14 @@ def _build_dataloader(
     rank: int,
     world_size: int,
     phase1_cache_reader: Any | None = None,
+    log_alignment: bool = True,
 ) -> DataLoader:
     base = NarrPrismDataset(
         config_path,
         mode=mode,
         cache_predictor_days=phase1_cache_reader is not None,
         cache_target_days=phase1_cache_reader is not None,
+        log_alignment=log_alignment,
     )
     num_static = int(getattr(getattr(config, "model", object()), "num_static_channels", 0))
     # Compute required padding multiple: mask_unit_size × patch_size
@@ -435,6 +437,7 @@ def get_dataloaders(
     rank: int = 0,
     world_size: int = 1,
     phase1_cache_reader: Any | None = None,
+    log_alignment: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     distributed = world_size > 1
     dates_cfg = getattr(config, "dates", {}) or {}
@@ -461,11 +464,13 @@ def get_dataloaders(
         config_path, config, "training",
         shuffle=True, distributed=distributed, rank=rank, world_size=world_size,
         phase1_cache_reader=phase1_cache_reader,
+        log_alignment=log_alignment,
     )
     val_loader = _build_dataloader(
         config_path, config, validation_mode,
         shuffle=False, distributed=distributed, rank=rank, world_size=world_size,
         phase1_cache_reader=phase1_cache_reader,
+        log_alignment=log_alignment,
     )
     return train_loader, val_loader
 

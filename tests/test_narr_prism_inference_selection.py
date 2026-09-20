@@ -476,6 +476,15 @@ def test_main_inference_notebook_has_no_spatial_mean_section() -> None:
     assert "spatial_mean" not in source
 
 
+def test_main_inference_notebook_uses_canonical_refinement_resolution() -> None:
+    notebook = _notebook(NOTEBOOK_DIR / "narr_prism_inference.ipynb")
+    source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
+
+    assert "resolve_refinement_config(config)" in source
+    assert "refinement_type = refinement.type" in source
+    assert "if refinement_type !=" not in source
+
+
 def test_random_ten_notebook_is_cpu_only_and_plots_all_targets() -> None:
     notebook = _notebook(NOTEBOOK_DIR / "narr_prism_inference_random10_cpu.ipynb")
     source = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])

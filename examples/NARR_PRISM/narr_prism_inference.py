@@ -468,6 +468,8 @@ def _sanity_check_outputs(
     prediction: np.ndarray,
     target_variables: Sequence[str],
     date_string: str,
+    *,
+    report_crossings: bool = True,
 ) -> None:
     """Validate that the (already physical-unit) model output is reasonable.
 
@@ -500,7 +502,7 @@ def _sanity_check_outputs(
         valid = np.isfinite(tmax) & np.isfinite(tmin)
         crossings = int(np.sum((tmax < tmin) & valid))
         total = int(np.sum(valid))
-        if crossings:
+        if crossings and report_crossings:
             pct = 100.0 * crossings / max(total, 1)
             print(
                 f"[inference] {date_string}: tmax < tmin at {crossings}/{total} "
