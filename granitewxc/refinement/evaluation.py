@@ -232,6 +232,34 @@ def _distribution_distances(
     return wasserstein, ks
 
 
+def _nanquantile_axis0(sorted_values: np.ndarray, counts: np.ndarray, q: float) -> np.ndarray:
+    """``np.nanquantile(values, q, axis=0)`` (linear method) from columns already
+    sorted ascending with NaNs last and their finite ``counts``.
+
+    ``np.nanquantile`` along an axis loops over every column in Python, which is
+    prohibitively slow for (members, grid cells) matrices with ~1e6 columns.
+    """
+    result = np.full(sorted_values.shape[1], np.nan, dtype=np.float64)
+    has_values = counts > 0
+    if not bool(has_values.any()):
+        return result
+    position = q * (counts[has_values] - 1).astype(np.float64)
+    lower = np.floor(position).astype(np.int64)
+    upper = np.minimum(lower + 1, counts[has_values] - 1)
+    columns = np.flatnonzero(has_values)
+    lower_values = sorted_values[lower, columns].astype(np.float64)
+    upper_values = sorted_values[upper, columns].astype(np.float64)
+    # Same lerp as numpy's linear method (exact at both ends).
+    gamma = position - lower
+    diff = upper_values - lower_values
+    result[has_values] = np.where(
+        gamma >= 0.5,
+        upper_values - diff * (1.0 - gamma),
+        lower_values + diff * gamma,
+    )
+    return result
+
+
 def _safe_ratio(numerator: float | int, denominator: float | int) -> float:
     if denominator == 0:
         return float("nan")
@@ -852,13 +880,14 @@ def ensemble_metrics(
         "ensemble_member_diversity": _mean_finite(point_diversity),
     }
 
-    quantile_matrix = np.where(member_finite, matrix, np.nan)
+    # Sort once per call; np.sort places NaNs (missing members) last.
+    sorted_members = np.sort(np.where(member_finite, matrix, np.nan), axis=0)
     absolute_coverage_errors: list[float] = []
     for level in levels:
         lower_probability = (1.0 - level) / 2.0
         upper_probability = 1.0 - lower_probability
-        lower = np.nanquantile(quantile_matrix, lower_probability, axis=0)
-        upper = np.nanquantile(quantile_matrix, upper_probability, axis=0)
+        lower = _nanquantile_axis0(sorted_members, member_count, lower_probability)
+        upper = _nanquantile_axis0(sorted_members, member_count, upper_probability)
         covered = (target_values >= lower) & (target_values <= upper)
         label = _quantile_label(level)
         coverage = float(np.mean(covered))

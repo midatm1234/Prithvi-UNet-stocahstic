@@ -28,7 +28,7 @@ import json
 import math
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -2306,6 +2306,13 @@ def run_evaluation(  # noqa: C901
         for name in method_directories
     }
     target_valid_mask_tracker = TargetValidMaskTracker()
+    # Gap between the independently written Phase-1 product and the Phase-1
+    # baseline embedded in the refined products (diagnostic only; see below).
+    phase1_product_parity = {
+        variable: {"max_abs_diff": 0.0, "sum_abs_diff": 0.0, "cells": 0,
+                   "cells_over_tolerance": 0, "nan_pattern_mismatches": 0}
+        for variable in VARIABLES
+    }
 
     for day_index, sample_date in enumerate(dates, start=1):
         baseline = _read_product_day(
@@ -2324,9 +2331,7 @@ def run_evaluation(  # noqa: C901
         target_valid_mask_tracker.update(
             baseline, path=baseline_files[sample_date]
         )
-        daily_methods = {
-            "phase1": baseline,
-            **{
+        refined_days = {
                 name: _read_product_day(
                     method_files[name][sample_date],
                     grid,
@@ -2338,8 +2343,35 @@ def run_evaluation(  # noqa: C901
                     configured_split_end=configured_split_end,
                 )
                 for name in method_directories
-            },
         }
+        # Score Phase 1 with the baseline embedded in the refined products: it is
+        # exactly the y_hat each refinement adds its residual to, computed under
+        # the refinement precision policy (FP32, TF32 off).  The independently
+        # written Phase-1 product may use bf16/TF32 inference, so it is compared
+        # as a reported diagnostic instead of a hard parity requirement.
+        reference_name = next(iter(refined_days), None)
+        phase1_day = baseline
+        if reference_name is not None:
+            phase1_day = replace(
+                baseline, fields=dict(refined_days[reference_name].phase1_fields)
+            )
+            for variable in VARIABLES:
+                embedded = phase1_day.fields[variable]
+                independent = baseline.fields[variable]
+                both = np.isfinite(embedded) & np.isfinite(independent)
+                diff = np.abs(embedded[both] - independent[both])
+                stats = phase1_product_parity[variable]
+                stats["nan_pattern_mismatches"] += int(
+                    (np.isfinite(embedded) != np.isfinite(independent)).sum()
+                )
+                stats["cells"] += int(diff.size)
+                if diff.size:
+                    stats["max_abs_diff"] = max(stats["max_abs_diff"], float(diff.max()))
+                    stats["sum_abs_diff"] += float(diff.sum())
+                    stats["cells_over_tolerance"] += int(
+                        (diff > 2.0e-5 + 2.0e-5 * np.abs(independent[both])).sum()
+                    )
+        daily_methods = {"phase1": phase1_day, **refined_days}
         for name in method_directories:
             target_valid_mask_tracker.update(
                 daily_methods[name], path=method_files[name][sample_date]
@@ -2349,17 +2381,18 @@ def run_evaluation(  # noqa: C901
                 path=method_files[name][sample_date],
             )
             for variable in VARIABLES:
+                # Every method must refine the same Phase-1 field.
                 if not np.allclose(
                     daily_methods[name].phase1_fields[variable],
-                    baseline.fields[variable],
+                    phase1_day.fields[variable],
                     rtol=2.0e-5,
                     atol=2.0e-5,
                     equal_nan=True,
                 ):
                     raise ValueError(
                         f"{method_files[name][sample_date]}: embedded "
-                        f"{variable} Phase-1 baseline does not match the "
-                        "independently evaluated Phase-1 daily product"
+                        f"{variable} Phase-1 baseline does not match the one "
+                        f"embedded by method {reference_name!r}"
                     )
         truth = {
             variable: _read_truth_day(
@@ -2755,6 +2788,25 @@ def run_evaluation(  # noqa: C901
             "methods": {
                 name: str(directory)
                 for name, directory in method_directories.items()
+            },
+        },
+        "phase1_baseline": {
+            "source": (
+                "embedded *_phase1 fields of the refined products"
+                if method_directories else "independent Phase-1 daily product"
+            ),
+            "independent_product_parity": {
+                variable: {
+                    "max_abs_diff": stats["max_abs_diff"],
+                    "mean_abs_diff": (
+                        stats["sum_abs_diff"] / stats["cells"] if stats["cells"] else 0.0
+                    ),
+                    "cells": stats["cells"],
+                    "cells_over_tolerance": stats["cells_over_tolerance"],
+                    "nan_pattern_mismatches": stats["nan_pattern_mismatches"],
+                    "tolerance": {"rtol": 2.0e-5, "atol": 2.0e-5},
+                }
+                for variable, stats in phase1_product_parity.items()
             },
         },
         "provenance": {
