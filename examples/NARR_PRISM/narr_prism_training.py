@@ -283,6 +283,10 @@ class _WrappedDataset(torch.utils.data.Dataset):
             )
             if key in sample
         }
+        # Dates are a list after collation, which the Phase-1 trainer cannot move to
+        # the device; only cached Phase-2 batches need them.
+        if self.phase1_cache_reader is None:
+            tile_metadata.pop("date", None)
 
         if self.num_static_channels > 0 and self._static_y is not None:
             x_dyn = x_full[: -self.num_static_channels]
